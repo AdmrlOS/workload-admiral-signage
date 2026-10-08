@@ -141,6 +141,21 @@ its runtime directory on every start and supervises both required services.
 Either required service exiting causes the root process to stop so Admiral can
 restart it. Docker `HEALTHCHECK` instructions are not Admiral liveness probes.
 
+The image starts `/signage-init`, a static copy of Debian's Tini, which forwards
+signals to the workload process group and reaps orphaned children. The build
+executes it in an otherwise empty root filesystem to verify it needs no dynamic
+loader or shared libraries. CI also checks the complete entrypoint, HTTP startup
+and SIGTERM shutdown with `/` as the working directory and fresh `/run` and `/tmp`.
+
+If Admiral reports a startup executable as missing, record the exact error and
+image digest. Linux can report `no such file or directory` for an existing
+dynamic executable when its ELF loader is missing. The static init avoids that
+ambiguity for PID 1; Python, WPE and the other programs still require an intact
+image filesystem. Deploy the newly published commit tag or digest with Command
+empty. An error still naming `/usr/bin/tini` means the old entrypoint or a command
+override is being used. If the error instead names the child entrypoint, shell
+or Python, inspect the extracted filesystem and any mounts covering its paths.
+
 The workload does not hardcode the Admiral console's VT layout. Admiral owns
 the display handoff; the browser uses DRM/KMS after that handoff. Ordinary
 rootfs edits survive service restarts but are replaced on image/configuration

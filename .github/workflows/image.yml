@@ -50,7 +50,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Verify image without GPU devices
-        run: docker run --rm admiral-signage:ci smoke
+        run: |
+          python3 tests/check_image_startup.py admiral-signage:ci
+          docker run --rm --workdir / --tmpfs /run --tmpfs /tmp admiral-signage:ci smoke
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
         with:

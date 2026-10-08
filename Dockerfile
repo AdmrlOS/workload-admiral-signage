@@ -17,6 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 FROM toolchain AS workload
+# Keep PID 1 independent of the distribution's ELF loader and /usr layout.
+# Execute it in an empty root to prove it has no shared-library dependencies.
+RUN install -m 0755 /usr/bin/tini-static /signage-init && \
+    mkdir -p /tmp/init-check && cp /signage-init /tmp/init-check/signage-init && \
+    chroot /tmp/init-check /signage-init --version && rm -rf /tmp/init-check
 ARG VERSION=dev
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="Admiral Signage Development" \
@@ -52,5 +57,5 @@ ENV PYTHONUNBUFFERED=1 \
     EGL_LOG_LEVEL=debug
 EXPOSE 8080
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/signage-entrypoint"]
+ENTRYPOINT ["/signage-init", "-g", "--", "/usr/local/bin/signage-entrypoint"]
 CMD ["run"]
