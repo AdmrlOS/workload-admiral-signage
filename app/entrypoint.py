@@ -37,6 +37,19 @@ def decoder_config(environ):
     return decoder, ",".join(f"{name}:{rank}" for name, rank in ranks.items())
 
 
+PAGES = {"": "", "displaylab": "", "menuboard": "menuboard/"}
+
+
+def start_url(environ):
+    """Browser start URL: SIGNAGE_URL wins, else SIGNAGE_PAGE picks a bundled page."""
+    if environ.get("SIGNAGE_URL"):
+        return environ["SIGNAGE_URL"]
+    page = environ.get("SIGNAGE_PAGE", "").strip().lower()
+    if page not in PAGES:
+        raise ValueError(f"SIGNAGE_PAGE must be one of: {', '.join(k for k in PAGES if k)}")
+    return f"http://127.0.0.1:{environ.get('SIGNAGE_HTTP_PORT', '8080')}/{PAGES[page]}"
+
+
 def writable_dir(*candidates):
     for candidate in candidates:
         try:
@@ -98,7 +111,7 @@ def configure():
     decoder, ranks = decoder_config(os.environ)
     os.environ.setdefault("SIGNAGE_DECODER", decoder)
     os.environ.setdefault("GST_PLUGIN_FEATURE_RANK", ranks)
-    os.environ.setdefault("SIGNAGE_URL", f"http://127.0.0.1:{os.environ.get('SIGNAGE_HTTP_PORT', '8080')}/")
+    os.environ["SIGNAGE_URL"] = start_url(os.environ)
     return data
 
 

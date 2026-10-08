@@ -65,6 +65,16 @@ class ServerTests(unittest.TestCase):
         finally:
             override.unlink()
 
+    def test_subdirectory_index(self):
+        (server.APP_ROOT / "www/sub").mkdir()
+        (server.APP_ROOT / "www/sub/index.html").write_text("sub page")
+        for path in ("/sub/", "/sub/index.html"):
+            with urlopen(self.base + path) as response:
+                self.assertEqual(response.read(), b"sub page")
+        with self.assertRaises(HTTPError) as error:
+            urlopen(self.base + "/missing/")
+        self.assertEqual(error.exception.code, 404)
+
     def test_traversal_and_symlink_escape(self):
         for path in ("/%2e%2e/secret.txt", "/escape.txt", "/media/%2e%2e/%2e%2e/secret.txt"):
             with self.assertRaises(HTTPError) as error:

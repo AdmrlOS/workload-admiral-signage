@@ -50,5 +50,19 @@ class CacheTests(unittest.TestCase):
             os.environ.update(saved)
 
 
+class StartUrlTests(unittest.TestCase):
+    def test_default_is_display_lab(self):
+        self.assertEqual(entrypoint.start_url({}), "http://127.0.0.1:8080/")
+
+    def test_menuboard_page(self):
+        self.assertEqual(entrypoint.start_url({"SIGNAGE_PAGE": "menuboard", "SIGNAGE_HTTP_PORT": "9000"}),
+                         "http://127.0.0.1:9000/menuboard/")
+
+    def test_explicit_url_wins_and_unknown_page_rejected(self):
+        self.assertEqual(entrypoint.start_url({"SIGNAGE_URL": "http://x/", "SIGNAGE_PAGE": "menuboard"}), "http://x/")
+        with self.assertRaises(ValueError):
+            entrypoint.start_url({"SIGNAGE_PAGE": "nope"})
+
+
 if __name__ == "__main__":
     unittest.main()
