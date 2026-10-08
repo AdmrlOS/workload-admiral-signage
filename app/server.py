@@ -87,7 +87,9 @@ class Handler(BaseHTTPRequestHandler):
             name = path.removeprefix("/media/")
             roots = [DATA_ROOT / "media", APP_ROOT / "media"]
         else:
-            name = path.lstrip("/") or "index.html"
+            name = path.lstrip("/")
+            if not name or name.endswith("/"):
+                name += "index.html"
             roots = [DATA_ROOT / "www", APP_ROOT / "www"]
         file = next((found for root in roots if (found := safe_file(root, name))), None)
         if file is None:

@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
     gstreamer1.0-gl gstreamer1.0-alsa libgl1-mesa-dri libegl-mesa0 libgbm1 \
-    mesa-utils drm-info libdrm-tests v4l-utils ffmpeg graphviz fonts-dejavu-core \
+    mesa-utils drm-info libdrm-tests v4l-utils ffmpeg graphviz fonts-dejavu-core fonts-dejavu-extra \
     && rm -rf /var/lib/apt/lists/*
 
 FROM toolchain AS workload
@@ -40,6 +40,7 @@ RUN test -x /usr/bin/bwrap && \
     install -m 0755 /usr/local/libexec/signage/signage-bwrap /usr/bin/bwrap
 COPY app/ /opt/signage/app/
 COPY www/ /opt/signage/www/
+COPY media/ /opt/signage/media/
 COPY bin/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/signage-* && \
     mkdir -p /opt/signage/media /var/lib/admiral-signage && \

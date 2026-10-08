@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SUBSTATION · Menuboard demo</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="menuboard.css">
+  <script src="menuboard.js" defer></script>
+</head>
+<body>
+  <!-- Shared SVG gradients (kept rendered, 0x0, so url(#id) works from every inline SVG). -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <linearGradient id="gBreadTop" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F9D58C"/><stop offset=".55" stop-color="#E5A74E"/><stop offset="1" stop-color="#C98430"/></linearGradient>
+      <linearGradient id="gBreadBot" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDBB72"/><stop offset="1" stop-color="#C58231"/></linearGradient>
+      <linearGradient id="gLettuce" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#A9DB5C"/><stop offset="1" stop-color="#6DB32C"/></linearGradient>
+      <radialGradient id="gCookie" cx=".4" cy=".35" r=".7"><stop offset="0" stop-color="#E0A765"/><stop offset="1" stop-color="#B2713A"/></radialGradient>
+    </defs>
+  </svg>
+
+  <section id="sceneA" class="scene"></section>
+  <section id="sceneB" class="scene">
+    <div id="videoHostB" class="video-host-b"></div>
+    <div class="bug"><span id="bugMark"></span></div>
+    <div class="progress"><i id="progressB"></i></div>
+  </section>
+  <section id="sceneC" class="scene"></section>
+
+  <div id="curtain" aria-hidden="true">
+    <div class="curtain-inner"><span id="curtainMark"></span><em>FRESH · FILLED · YOUR WAY</em></div>
+  </div>
+</body>
+</html>

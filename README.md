@@ -238,6 +238,7 @@ See Admiral's [launch contract](https://docs.admrl.co/core-concepts/configuratio
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SIGNAGE_URL` | `http://127.0.0.1:8080/` | Browser startup URL. |
+| `SIGNAGE_PAGE` | Unset (Display Lab) | `menuboard` starts the SUBSTATION menuboard demo; ignored when `SIGNAGE_URL` is set. |
 | `SIGNAGE_VIDEO_URL` | Local `/media/test-h264.mp4` URL | HTML video source on the information screen. |
 | `SIGNAGE_VIDEO_MODE` | `holepunch` | `holepunch` or `composited` comparison. |
 | `SIGNAGE_DECODER` | `v4l2slh264dec,v4l2slh265dec,v4l2slvp9dec` | Comma-separated allowed decoders; any one of the stateless H.264/HEVC/VP9 decoders, or `avdec_h264` with software opt-in (then the default is `avdec_h264`). |
@@ -338,6 +339,45 @@ clip. Missing override files fall back to the bundled assets. Refresh the page
 after edits. Native live evidence is in `/run/admiral-signage/drm-status.json`,
 `browser-status.json` and `video/video-status.json`; `/api/status` exposes the current snapshot and
 `/api/config` exposes page configuration. `/healthz` checks only the HTTP server.
+
+## Menuboard demo (SUBSTATION)
+
+`www/menuboard/` is a second start page: a fake sandwich-shop menuboard ("SUBSTATION",
+original CSS/SVG artwork, AUD prices) designed for exactly 1920×1080 CSS pixels. The Display
+Lab page stays the default. Select the menuboard with either:
+
+```text
+SIGNAGE_PAGE=menuboard                          # entrypoint maps it to http://127.0.0.1:8080/menuboard/
+SIGNAGE_URL=http://127.0.0.1:8080/menuboard/    # explicit URL (wins over SIGNAGE_PAGE)
+```
+
+The scene controller loops forever: **A** main menu (18 s) → **B** full-screen
+`/media/promo-a.mp4` (until `ended`, 10 s) → **A** (18 s) → **C** meal deals with
+`/media/promo-b.mp4` in the bottom-right 640×360 box (20 s) → repeat. Each hop is a
+page-only green wipe. Scene C plays its clip once, then fades a page-drawn poster over the
+box and releases the video so the rest of the scene holds a still.
+
+Holepunch constraints honoured: one `<video>` exists at a time (created while the wipe covers
+the screen, `src` removed and element deleted before the next scene); nothing transforms or
+fades the video or its ancestors; the video box is axis-aligned; a video `error` or stall
+skips to the next scene after 1.5 s. The first ~0.5 s of each clip plays behind the wipe.
+
+QA parameters: `?scene=A|B|C&freeze=1[&t=3]` shows one scene statically (video seeked to `t`
+and paused), `?adur=15..20`, `?cdur=`, `?srca=`/`?srcb=` override clips, `?log=1` mirrors
+the transition log to the console (`window.__menuLog` always holds it).
+
+The type is DejaVu Sans Condensed Bold, which comes from `fonts-dejavu-extra` (added to the
+image; `fonts-dejavu-core` has no condensed face). Clips live in `media/` and are copied into
+`/opt/signage/media`. Regenerate them from the source files (audio stripped, video remuxed,
+faststart) with:
+
+```sh
+scripts/make-menuboard-media.sh SOURCE_A.mp4 SOURCE_B.mp4
+# = ffmpeg -i SRC -an -c:v copy -movflags +faststart media/promo-{a,b}.mp4
+```
+
+Both clips must be H.264 (the allowed stateless decoders also take HEVC/VP9). Files in the Custom
+Volume (`/var/lib/admiral-signage/media/promo-a.mp4`) override the bundled ones.
 
 ## Board acceptance runbook
 
