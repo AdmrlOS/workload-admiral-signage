@@ -1,7 +1,12 @@
 /* SPDX-License-Identifier: MIT
  * Experimental adapter for the WPE 2.48 Westeros holepunch ABI. This is not
- * Westeros: WebKit owns playback and geometry; kmssink owns the video plane.
+ * Westeros: WebKit owns playback and geometry. Decoded frames go to the
+ * browser, which commits the video plane together with its UI frames
+ * (gst-admiral-videoplane.c); kmssink, committing the plane by itself, remains
+ * for software decoders, older brokers and SIGNAGE_VIDEO_SINK=kmssink.
  */
+#include "drm-broker.h"
+#include "gst-admiral-videoplane.h"
 #include <gst/gst.h>
 #include <gst/video/videooverlay.h>
 #include <gst/allocators/gstdmabuf.h>
@@ -20,9 +25,8 @@
 #include <unistd.h>
 
 #define PACKAGE "admiral-signage"
-/* Must match SIGNAGE_VIDEO_RUNTIME_DIR in drm-broker.h: the browser binds this
- * directory into the WebKit sandbox, where this sink runs. */
-#define RUN_DIR "/run/admiral-signage/video"
+/* The browser binds this directory into the WebKit sandbox, where this sink runs. */
+#define RUN_DIR SIGNAGE_VIDEO_RUNTIME_DIR
 #define BROKER_PATH RUN_DIR "/drm.sock"
 #define STATUS_PATH RUN_DIR "/video-status.json"
 /* Stateless V4L2 decoders; SIGNAGE_DECODER takes a comma-separated subset. */
@@ -41,7 +45,9 @@ typedef struct {
     GstBus *bus;
     gulong bus_error_handler, bus_eos_handler;
     GMutex lock;
-    gint fd, lock_fd;
+    gint fd, lock_fd, broker_socket; /* broker_socket: kept open for browser-committed frames */
+    gboolean browser_commits, broker_video_frames;
+    gint crtc_width, crtc_height;
     gint connector_id, crtc_id, browser_plane_id, video_plane_id;
     gint x, y, width, height, decoded_width, decoded_height;
     gint ui_width, ui_height, mode_width, mode_height;
@@ -93,6 +99,7 @@ write_status(AdmiralSink *self, gboolean force)
     INT_FIELD("connector_id", self->connector_id); INT_FIELD("crtc_id", self->crtc_id);
     INT_FIELD("browser_plane_id", self->browser_plane_id); INT_FIELD("video_plane_id", self->video_plane_id);
     BOOL_FIELD("dmabuf_seen", self->dmabuf_seen);
+    STRING_FIELD("video_sink", self->kms ? (self->browser_commits ? "browser-commit" : "kmssink") : "");
     json_builder_set_member_name(b, "hardware_decode"); json_builder_begin_object(b);
     BOOL_FIELD("verified", self->decoder_verified && !self->failed &&
                g_strcmp0(self->state, "playing") == 0 && self->decoder && g_str_has_prefix(self->decoder, "v4l2sl"));
@@ -137,8 +144,10 @@ fail_sink(AdmiralSink *self, const gchar *message)
     GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("%s", message), ("Admiral holepunch failed closed"));
 }
 
+/* Receives the browser's DRM descriptor. When keep_socket is set and the browser
+ * accepts frames, the connection stays open as self->broker_socket. */
 static gboolean
-get_drm_fd(AdmiralSink *self)
+get_drm_fd(AdmiralSink *self, gboolean keep_socket)
 {
     gint sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0)
@@ -174,7 +183,6 @@ get_drm_fd(AdmiralSink *self)
         if (part <= 0) break;
         received += part;
     }
-    close(sock);
     JsonParser *parser = json_parser_new();
     gboolean ok = json_parser_load_from_data(parser, payload, received, NULL);
     JsonNode *root = ok ? json_parser_get_root(parser) : NULL;
@@ -189,6 +197,8 @@ get_drm_fd(AdmiralSink *self)
             self->browser_plane_id = (gint)json_object_get_int_member(obj, "browser_plane_id");
             self->video_plane_id = (gint)json_object_get_int_member(obj, "video_plane_id");
             self->blend_configured = json_object_get_boolean_member(obj, "blend_configured");
+            self->broker_video_frames = json_object_has_member(obj, "video_frames") &&
+                                        json_object_get_boolean_member(obj, "video_frames");
             /* Older brokers send neither size: treat the UI as mode-sized. */
             self->ui_width = self->mode_width = self->ui_height = self->mode_height = 0;
             if (json_object_has_member(obj, "ui_width") && json_object_has_member(obj, "ui_height") &&
@@ -205,6 +215,8 @@ get_drm_fd(AdmiralSink *self)
     } else
         ok = FALSE;
     g_object_unref(parser);
+    if (ok && keep_socket && self->broker_video_frames) self->broker_socket = sock;
+    else close(sock);
     if (!ok) { close(received_fd); return FALSE; }
     if (drmIsMaster(received_fd) != 1) { close(received_fd); return FALSE; }
     /* kmssink can modeset an inactive CRTC even with force-modesetting=false.
@@ -212,6 +224,7 @@ get_drm_fd(AdmiralSink *self)
      */
     drmModeCrtc *crtc = drmModeGetCrtc(received_fd, (guint32)self->crtc_id);
     ok = crtc && crtc->mode_valid && crtc->buffer_id != 0;
+    if (ok) { self->crtc_width = crtc->mode.hdisplay; self->crtc_height = crtc->mode.vdisplay; }
     if (crtc) drmModeFreeCrtc(crtc);
     if (!ok) { close(received_fd); return FALSE; }
     self->fd = received_fd;
@@ -414,13 +427,16 @@ release_resources(AdmiralSink *self)
         gst_object_unref(self->pipeline); self->pipeline = NULL;
     }
     if (self->fd >= 0) { close(self->fd); self->fd = -1; }
+    if (self->broker_socket >= 0) { close(self->broker_socket); self->broker_socket = -1; }
     if (self->lock_fd >= 0) { flock(self->lock_fd, LOCK_UN); close(self->lock_fd); self->lock_fd = -1; }
 }
 
 static gboolean
-create_kms_child(AdmiralSink *self)
+create_kms_child(AdmiralSink *self, gboolean browser_commits)
 {
-    self->kms = gst_element_factory_make("kmssink", "admiral-video-plane");
+    self->kms = browser_commits ? g_object_new(admiral_plane_sink_get_type(), "name", "admiral-video-plane", NULL)
+                                : gst_element_factory_make("kmssink", "admiral-video-plane");
+    self->browser_commits = browser_commits && self->kms;
     if (!self->kms) return FALSE;
     self->filter = gst_element_factory_make("capsfilter", "admiral-video-caps");
     if (!self->filter) { gst_object_unref(self->kms); self->kms = NULL; return FALSE; }
@@ -489,9 +505,6 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
         g_free(self->state); self->state = g_strdup("created");
         write_status(self, TRUE);
         g_mutex_unlock(&self->lock);
-        if (!create_kms_child(self)) {
-            fail_sink(self, "Cannot create kmssink for a new video playback attempt"); return GST_STATE_CHANGE_FAILURE;
-        }
         const gchar *allowed = g_getenv("SIGNAGE_DECODER");
         if (!allowed || !*allowed) allowed = DEFAULT_DECODERS;
         static const gchar *const known[] = { "v4l2slh264dec", "v4l2slh265dec", "v4l2slvp9dec", "avdec_h264", NULL };
@@ -511,20 +524,26 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
         if (software && g_strcmp0(g_getenv("SIGNAGE_ALLOW_SOFTWARE"), "1") != 0) {
             fail_sink(self, "avdec_h264 comparison requires SIGNAGE_ALLOW_SOFTWARE=1"); return GST_STATE_CHANGE_FAILURE;
         }
+        self->lock_fd = open(RUN_DIR "/video.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (self->lock_fd < 0 || flock(self->lock_fd, LOCK_EX | LOCK_NB) < 0) {
+            fail_sink(self, "Only one HTML video plane is supported"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
+        }
+        /* Browser-committed frames need DMA-BUF decoder output; software decoding
+         * and an explicit override keep kmssink. */
+        gboolean want_browser_commits = !software && g_strcmp0(g_getenv("SIGNAGE_VIDEO_SINK"), "kmssink") != 0;
+        if (!get_drm_fd(self, want_browser_commits)) {
+            fail_sink(self, "DRM broker unavailable, browser CRTC inactive, or valid overlay/alpha configuration missing"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
+        }
+        if (!create_kms_child(self, self->broker_socket >= 0)) {
+            fail_sink(self, "Cannot create the video plane sink for a new video playback attempt"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
+        }
         if (hardware) {
             GstCaps *linear = gst_caps_from_string(LINEAR_NV12_CAPS);
             g_object_set(self->filter, "caps", linear, NULL);
             gst_caps_unref(linear);
         }
-        self->lock_fd = open(RUN_DIR "/video.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-        if (self->lock_fd < 0 || flock(self->lock_fd, LOCK_EX | LOCK_NB) < 0) {
-            fail_sink(self, "Only one HTML video plane is supported"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
-        }
-        if (!self->kms || !g_object_class_find_property(G_OBJECT_GET_CLASS(self->kms), "fd")) {
+        if (!self->browser_commits && !g_object_class_find_property(G_OBJECT_GET_CLASS(self->kms), "fd")) {
             fail_sink(self, "kmssink with fd support (GStreamer >= 1.22) is required"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
-        }
-        if (!get_drm_fd(self)) {
-            fail_sink(self, "DRM broker unavailable, browser CRTC inactive, or valid overlay/alpha configuration missing"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
         }
         gboolean any_available = FALSE;
         gchar **names = g_strsplit(allowed, ",", -1);
@@ -546,14 +565,22 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
             gst_plugin_feature_set_rank(feature, decoder_listed(allowed, gst_plugin_feature_get_name(feature)) ? 512 : GST_RANK_NONE);
         }
         gst_plugin_feature_list_free(decoders);
-        g_object_set(self->kms, "fd", self->fd, "connector-id", self->connector_id,
-                     "plane-id", self->video_plane_id, "force-modesetting", FALSE,
-                     "restore-crtc", FALSE, "sync", TRUE, "skip-vsync", TRUE, NULL);
-        gint accepted_fd = -1;
-        g_object_get(self->kms, "fd", &accepted_fd, NULL);
-        if (accepted_fd != self->fd) {
-            fail_sink(self, "kmssink rejected the shared DRM master fd; refusing to open another card");
-            release_resources(self); return GST_STATE_CHANGE_FAILURE;
+        if (self->browser_commits) {
+            gint mode_width = self->mode_width > 0 ? self->mode_width : self->crtc_width;
+            gint mode_height = self->mode_height > 0 ? self->mode_height : self->crtc_height;
+            admiral_plane_sink_configure(self->kms, self->fd, self->broker_socket, mode_width, mode_height);
+            g_message("Holepunch video frames are committed by the browser with the UI on plane %d", self->video_plane_id);
+        } else {
+            g_object_set(self->kms, "fd", self->fd, "connector-id", self->connector_id,
+                         "plane-id", self->video_plane_id, "force-modesetting", FALSE,
+                         "restore-crtc", FALSE, "sync", TRUE, "skip-vsync", TRUE, NULL);
+            gint accepted_fd = -1;
+            g_object_get(self->kms, "fd", &accepted_fd, NULL);
+            if (accepted_fd != self->fd) {
+                fail_sink(self, "kmssink rejected the shared DRM master fd; refusing to open another card");
+                release_resources(self); return GST_STATE_CHANGE_FAILURE;
+            }
+            g_message("Holepunch video plane %d is committed by kmssink (separately from the UI)", self->video_plane_id);
         }
         /* Only the browser consumes DRM events on this shared open file.
          * BaseSink sync still schedules frames against the media clock. */
@@ -673,7 +700,9 @@ admiral_sink_init(AdmiralSink *self)
     self->width = self->height = 1;
     self->state = g_strdup("created");
     GST_OBJECT_FLAG_SET(self, GST_ELEMENT_FLAG_SINK);
-    create_kms_child(self);
+    self->broker_socket = -1;
+    /* A placeholder until NULL->READY knows which sink the broker supports. */
+    create_kms_child(self, FALSE);
 }
 
 static gboolean

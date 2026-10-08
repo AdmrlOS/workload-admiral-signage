@@ -8,8 +8,10 @@ PLUGIN_DIR ?= /usr/local/lib/gstreamer-1.0
 .PHONY: all install clean
 all: libgstadmiralholepunch.so
 
-libgstadmiralholepunch.so: gst-admiral-holepunch.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror -fPIC -shared -o $@ $< $(LDLIBS)
+SOURCES = gst-admiral-holepunch.c gst-admiral-videoplane.c
+
+libgstadmiralholepunch.so: $(SOURCES) gst-admiral-videoplane.h drm-broker.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror -fPIC -shared -o $@ $(SOURCES) $(LDLIBS)
 
 install: all
 	install -d $(DESTDIR)$(PLUGIN_DIR)

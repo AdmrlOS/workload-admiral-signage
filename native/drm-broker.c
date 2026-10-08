@@ -32,9 +32,17 @@ typedef struct {
 typedef struct {
     GSocketService *service;
     int fd;
-    char *metadata;
+    char *metadata; /* without the trailing "}\n"; see send_metadata() */
     ino_t socket_inode;
     dev_t socket_device;
+    guint video_plane;
+    SignageVideoHandler video_handler;
+    gpointer video_data;
+    /* The one sink speaking the frame protocol; a new sink replaces it. */
+    GSocketConnection *client;
+    GSource *client_source;
+    guint8 pending[sizeof(SignageVideoMessage)];
+    gsize pending_length;
 } Broker;
 
 static Broker broker = { .fd = -1 };
@@ -252,6 +260,58 @@ select_video_plane(int fd, uint32_t crtc_index, uint32_t browser_id,
     return found;
 }
 
+static void
+drop_client(gboolean notify)
+{
+    if (!broker.client)
+        return;
+    if (broker.client_source) {
+        g_source_destroy(broker.client_source);
+        g_source_unref(broker.client_source);
+        broker.client_source = NULL;
+    }
+    g_clear_object(&broker.client);
+    broker.pending_length = 0;
+    if (notify && broker.video_handler)
+        broker.video_handler(NULL, broker.video_data);
+}
+
+static gboolean
+client_readable(GSocket *socket, GIOCondition condition G_GNUC_UNUSED, gpointer data G_GNUC_UNUSED)
+{
+    int fd = g_socket_get_fd(socket);
+    for (;;) {
+        ssize_t received = recv(fd, broker.pending + broker.pending_length,
+                                sizeof(broker.pending) - broker.pending_length, MSG_DONTWAIT);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return G_SOURCE_CONTINUE;
+        if (received <= 0) {
+            g_message("Holepunch sink disconnected from the DRM broker%s%s", received < 0 ? ": " : "",
+                      received < 0 ? g_strerror(errno) : "");
+            /* The source is destroyed inside drop_client(); returning REMOVE is then a no-op. */
+            drop_client(TRUE);
+            return G_SOURCE_REMOVE;
+        }
+        broker.pending_length += (gsize) received;
+        if (broker.pending_length < sizeof(broker.pending))
+            continue;
+        SignageVideoMessage message;
+        memcpy(&message, broker.pending, sizeof(message));
+        broker.pending_length = 0;
+        if (message.type != SIGNAGE_VIDEO_SHOW && message.type != SIGNAGE_VIDEO_HIDE) {
+            g_warning("Holepunch sink sent unknown message type %u; disconnecting it", message.type);
+            drop_client(TRUE);
+            return G_SOURCE_REMOVE;
+        }
+        if (broker.video_handler)
+            broker.video_handler(&message, broker.video_data);
+        if (!broker.client)
+            return G_SOURCE_REMOVE;
+    }
+}
+
 static gboolean
 on_incoming(GSocketService *service G_GNUC_UNUSED, GSocketConnection *connection,
             GObject *source G_GNUC_UNUSED, gpointer data G_GNUC_UNUSED)
@@ -266,7 +326,9 @@ on_incoming(GSocketService *service G_GNUC_UNUSED, GSocketConnection *connection
     int fd_copy = fcntl(broker.fd, F_DUPFD_CLOEXEC, 3);
     if (fd_copy < 0)
         return TRUE;
-    struct iovec payload = { .iov_base = broker.metadata, .iov_len = strlen(broker.metadata) };
+    g_autofree char *metadata = g_strdup_printf("%s,\"video_frames\":%s}\n", broker.metadata,
+                                                broker.video_handler ? "true" : "false");
+    struct iovec payload = { .iov_base = metadata, .iov_len = strlen(metadata) };
     union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control = { 0 };
     struct msghdr message = {
         .msg_iov = &payload, .msg_iovlen = 1,
@@ -279,10 +341,57 @@ on_incoming(GSocketService *service G_GNUC_UNUSED, GSocketConnection *connection
     memcpy(CMSG_DATA(rights), &fd_copy, sizeof(fd_copy));
     ssize_t sent = sendmsg(socket_fd, &message, MSG_NOSIGNAL | MSG_DONTWAIT);
     close(fd_copy);
-    if (sent != (ssize_t) payload.iov_len)
+    if (sent != (ssize_t) payload.iov_len) {
         g_warning("DRM broker metadata transfer failed: %s", g_strerror(errno));
-    /* The connection is closed after the one-shot transfer. */
+        return TRUE;
+    }
+    if (!broker.video_handler)
+        return TRUE; /* the connection is closed after the one-shot transfer */
+    /* Keep the connection for frame messages. One video is supported, so a new
+     * sink replaces the previous one (whose frames are hidden). */
+    drop_client(TRUE);
+    GSocket *socket = g_socket_connection_get_socket(connection);
+    g_socket_set_blocking(socket, FALSE);
+    broker.client = g_object_ref(connection);
+    broker.client_source = g_socket_create_source(socket, G_IO_IN | G_IO_HUP | G_IO_ERR, NULL);
+    g_source_set_callback(broker.client_source, (GSourceFunc) G_CALLBACK(client_readable), NULL, NULL);
+    g_source_attach(broker.client_source, NULL);
     return TRUE;
+}
+
+guint
+signage_drm_broker_video_plane(void)
+{
+    return broker.service ? broker.video_plane : 0;
+}
+
+void
+signage_drm_broker_set_video_handler(SignageVideoHandler handler, gpointer data)
+{
+    if (!handler)
+        drop_client(FALSE);
+    broker.video_handler = handler;
+    broker.video_data = data;
+}
+
+gboolean
+signage_drm_broker_video_handler_active(void)
+{
+    return broker.video_handler != NULL;
+}
+
+void
+signage_drm_broker_video_released(uint32_t fb, uint32_t serial)
+{
+    if (!broker.client || !fb)
+        return;
+    SignageVideoMessage message = { .type = SIGNAGE_VIDEO_RELEASED, .fb = fb, .serial = serial };
+    int fd = g_socket_get_fd(g_socket_connection_get_socket(broker.client));
+    ssize_t sent;
+    do sent = send(fd, &message, sizeof(message), MSG_DONTWAIT | MSG_NOSIGNAL);
+    while (sent < 0 && errno == EINTR);
+    if (sent != (ssize_t) sizeof(message))
+        g_warning("Cannot tell the holepunch sink that fb %u is free: %s", fb, sent < 0 ? g_strerror(errno) : "short write");
 }
 
 static gboolean
@@ -353,8 +462,9 @@ signage_drm_broker_start(int fd, guint connector_id, guint crtc_id,
         g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno), "Cannot duplicate browser DRM fd: %s", g_strerror(errno));
         return FALSE;
     }
+    broker.video_plane = video_id;
     broker.metadata = g_strdup_printf("{\"connector_id\":%u,\"crtc_id\":%u,\"crtc_index\":%u,"
-                                    "\"browser_plane_id\":%u,\"video_plane_id\":%u,\"width\":%u,\"height\":%u,\"mode_width\":%u,\"mode_height\":%u,\"ui_width\":%u,\"ui_height\":%u,\"blend_configured\":true}\n",
+                                    "\"browser_plane_id\":%u,\"video_plane_id\":%u,\"width\":%u,\"height\":%u,\"mode_width\":%u,\"mode_height\":%u,\"ui_width\":%u,\"ui_height\":%u,\"blend_configured\":true",
                                     connector_id, crtc_id, crtc_index, browser_plane_id, video_id, mode_width, mode_height,
                                     mode_width, mode_height, ui_width, ui_height);
     broker.service = g_socket_service_new();
@@ -384,13 +494,17 @@ signage_drm_broker_start(int fd, guint connector_id, guint crtc_id,
     }
     g_signal_connect(broker.service, "incoming", G_CALLBACK(on_incoming), NULL);
     g_socket_service_start(broker.service);
-    g_message("Browser DRM broker ready at %s: %s", BROKER_PATH, broker.metadata);
+    g_message("Browser DRM broker ready at %s: %s}", BROKER_PATH, broker.metadata);
     return TRUE;
 }
 
 void
 signage_drm_broker_stop(void)
 {
+    drop_client(FALSE);
+    broker.video_handler = NULL;
+    broker.video_data = NULL;
+    broker.video_plane = 0;
     if (broker.service) {
         g_socket_service_stop(broker.service);
         g_socket_listener_close(G_SOCKET_LISTENER(broker.service));
