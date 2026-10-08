@@ -51,6 +51,7 @@ typedef struct {
     uint32_t handles[4];
     uint8_t n_planes;
     ScanoutBuffer *scanout; /* pool buffer (GPU copy); its fb is owned by the pool */
+    int fence_fd;           /* GPU copy completion (IN_FENCE_FD), or -1 */
 } Frame;
 
 /* A WPE buffer imported as a GLES texture, cached until WPE destroys the buffer. */
@@ -69,11 +70,38 @@ typedef struct {
     ScanoutBuffer pool[SCANOUT_POOL_SIZE];
     GHashTable *imports;
     struct gbm_device *gbm; /* scanout allocator on the KMS fd (may equal Browser.gbm) */
-    gboolean has_modifiers, has_fence, has_external;
+    gboolean has_modifiers, has_fence, has_native_fence, has_external;
     guint64 copied;
     gint64 copy_us, reported_at;
     guint64 reported_frames;
 } GpuCopy;
+
+/* One state of the brokered video overlay; fb == 0 means disabled. */
+typedef struct {
+    uint32_t fb;
+    uint32_t src_x, src_y, src_w, src_h; /* 16.16 */
+    int32_t crtc_x, crtc_y;
+    uint32_t crtc_w, crtc_h;
+} VideoState;
+
+/* The holepunch sink hands decoded frames to the browser instead of committing
+ * them itself, so UI and video share one atomic commit per vblank. */
+typedef struct {
+    uint32_t plane;
+    uint32_t fb, crtc, src_x, src_y, src_w, src_h, crtc_x, crtc_y, crtc_w, crtc_h;
+    VideoState current, pending, next; /* on screen, in flight, waiting for the next commit */
+    gboolean pending_valid, dirty;
+    GHashTable *serials; /* fb -> latest SHOW serial, while the fb is in a slot */
+    guint64 shown, replaced, rejected;
+} VideoPlane;
+
+/* Per reporting interval; reset with the fps line. */
+typedef struct {
+    guint64 commits, ebusy, video_commits;
+    gint64 commit_us, flip_us, max_commit_us, max_flip_us;
+    guint64 replaced, video_rejected;
+    guint64 video_shown_base, video_replaced_base; /* VideoPlane counters at the interval start */
+} CommitStats;
 
 typedef struct {
     int fd;
@@ -86,6 +114,7 @@ typedef struct {
     uint32_t connector_crtc, crtc_mode, crtc_active;
     uint32_t plane_fb, plane_crtc, plane_src_x, plane_src_y, plane_src_w, plane_src_h;
     uint32_t plane_x, plane_y, plane_w, plane_h;
+    uint32_t plane_in_fence; /* optional IN_FENCE_FD on the primary plane */
     struct gbm_device *gbm;
     EGLDisplay egl;
     gboolean copy_mode; /* direct DMA-BUF scanout failed; frames are GPU-copied */
@@ -97,7 +126,12 @@ typedef struct {
     GMainLoop *loop;
     GHashTable *handles;
     Frame *current, *pending, *queued;
+    gboolean commit_pending;
+    gboolean frame_complete_early; /* frame callbacks fire on commit, not on flip */ /* a page flip is outstanding; pending may still be NULL (video-only commit) */
+    VideoPlane video;
+    guint retry_source;
     gint64 submitted_at;
+    CommitStats stats;
     guint fd_source, watchdog_source, sigterm_source, sigint_source;
     guint64 presented;
     gboolean modeset;
@@ -108,6 +142,8 @@ typedef struct {
     char *failure;
     char *holepunch_error;
 } Browser;
+
+static const char *copy_sync_name(const Browser *browser);
 
 static unsigned mode_refresh(const drmModeModeInfo *mode)
 {
@@ -147,6 +183,9 @@ static void write_status(Browser *browser)
     JSON_INT("presented_frames", browser->presented);
     JSON_STRING("scanout_path", browser->presented == 0 ? "pending" : browser->copy_mode ? "gpu-copy" : "direct");
     JSON_INT("copied_frames", browser->copy.copied);
+    JSON_STRING("copy_sync", copy_sync_name(browser));
+    JSON_BOOL("video_in_browser_commit", browser->video.plane && signage_drm_broker_video_handler_active());
+    JSON_INT("video_frames_shown", browser->video.shown);
     JSON_BOOL("direct_scanout", browser->presented > 0 && !browser->copy_mode);
     JSON_BOOL("alpha_preserved", browser->presented > 0 && browser->holepunch);
     JSON_BOOL("broker_ready", browser->broker_started);
@@ -378,6 +417,8 @@ static gboolean open_display(Browser *browser)
     PROPERTY(plane_y, browser->primary, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
     PROPERTY(plane_w, browser->primary, DRM_MODE_OBJECT_PLANE, "CRTC_W");
     PROPERTY(plane_h, browser->primary, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+    /* Optional: lets the kernel wait for the GPU copy instead of the main thread. */
+    browser->plane_in_fence = property_id(browser->fd, browser->primary, DRM_MODE_OBJECT_PLANE, "IN_FENCE_FD", NULL);
     if (!choose_ui_size(browser)) return FALSE;
     if (drmModeCreatePropertyBlob(browser->fd, &browser->mode, sizeof browser->mode, &browser->mode_blob) != 0) return FALSE;
     return TRUE;
@@ -400,9 +441,17 @@ static void handle_unref(Browser *browser, uint32_t handle)
     }
 }
 
+static Frame *frame_new(void)
+{
+    Frame *frame = g_new0(Frame, 1);
+    frame->fence_fd = -1;
+    return frame;
+}
+
 static void release_frame(Browser *browser, Frame *frame)
 {
     if (!frame) return;
+    if (frame->fence_fd >= 0) close(frame->fence_fd);
     if (frame->fb && !frame->scanout) drmModeRmFB(browser->fd, frame->fb);
     for (unsigned i = 0; i < frame->n_planes; i++) {
         gboolean unique = TRUE;
@@ -414,14 +463,9 @@ static void release_frame(Browser *browser, Frame *frame)
     g_free(frame);
 }
 
-static gboolean submit_frame(Browser *browser, Frame *frame)
-{
-    drmModeAtomicReq *request = drmModeAtomicAlloc();
-    if (!request) return FALSE;
-    gboolean valid = TRUE;
-#define ADD(object, property, value) do { if (drmModeAtomicAddProperty(request, object, property, value) < 0) valid = FALSE; } while (0)
 /* The source is the UI-sized buffer; the destination is always the full mode.
  * When they differ the primary plane's scaler stretches the UI over the video. */
+#define ADD(object, property, value) do { if (drmModeAtomicAddProperty(request, object, property, value) < 0) valid = FALSE; } while (0)
 #define ADD_PRIMARY_STATE(fb) do { \
         ADD(browser->primary, browser->plane_fb, fb); \
         ADD(browser->primary, browser->plane_crtc, browser->crtc); \
@@ -434,29 +478,111 @@ static gboolean submit_frame(Browser *browser, Frame *frame)
         ADD(browser->primary, browser->plane_w, browser->mode.hdisplay); \
         ADD(browser->primary, browser->plane_h, browser->mode.vdisplay); \
     } while (0)
-    if (!browser->modeset) {
-        ADD(browser->connector, browser->connector_crtc, browser->crtc);
-        ADD(browser->crtc, browser->crtc_mode, browser->mode_blob);
-        ADD(browser->crtc, browser->crtc_active, 1);
-    }
-    ADD_PRIMARY_STATE(frame->fb);
-    uint32_t mode_flag = browser->modeset ? 0 : DRM_MODE_ATOMIC_ALLOW_MODESET;
-    if (valid && !browser->modeset)
-        valid = drmModeAtomicCommit(browser->fd, request, mode_flag | DRM_MODE_ATOMIC_TEST_ONLY, NULL) == 0;
-    if (valid)
-        valid = drmModeAtomicCommit(browser->fd, request, mode_flag | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, browser) == 0;
-    int saved_errno = errno;
-    drmModeAtomicFree(request);
-    if (!valid) {
+
+/* Tells the sink it may reuse fb once no video state slot refers to it. */
+static void video_release_if_unused(Browser *browser, uint32_t fb)
+{
+    VideoPlane *video = &browser->video;
+    if (!fb || fb == video->current.fb || (video->pending_valid && fb == video->pending.fb) || (video->dirty && fb == video->next.fb)) return;
+    gpointer serial = NULL;
+    if (!video->serials || !g_hash_table_lookup_extended(video->serials, GUINT_TO_POINTER(fb), NULL, &serial)) return;
+    g_hash_table_remove(video->serials, GUINT_TO_POINTER(fb));
+    signage_drm_broker_video_released(fb, GPOINTER_TO_UINT(serial));
+}
+
+static gboolean submit_commit(Browser *browser);
+
+static gboolean retry_commit(gpointer data)
+{
+    Browser *browser = data;
+    browser->retry_source = 0;
+    submit_commit(browser);
+    return G_SOURCE_REMOVE;
+}
+
+/* Puts the queued browser frame and/or the next video state on screen in ONE
+ * nonblocking atomic commit. A CRTC takes one commit per vblank, so the UI and
+ * the video plane must not commit separately: two committers on one CRTC
+ * serialise and each gets every other vblank. Returns FALSE after fail(). */
+static gboolean submit_commit(Browser *browser)
+{
+    VideoPlane *video = &browser->video;
+    if (browser->commit_pending || browser->retry_source || (!browser->queued && !video->dirty)) return TRUE;
+    Frame *frame = browser->queued;
+    for (;;) {
+        gboolean with_video = video->dirty && video->plane;
+        drmModeAtomicReq *request = drmModeAtomicAlloc();
+        if (!request) { fail(browser, "Cannot allocate an atomic request"); return FALSE; }
+        gboolean valid = TRUE;
+        if (frame) {
+            ADD_PRIMARY_STATE(frame->fb);
+            if (frame->fence_fd >= 0 && browser->plane_in_fence) ADD(browser->primary, browser->plane_in_fence, frame->fence_fd);
+        }
+        if (with_video) {
+            const VideoState *next = &video->next;
+            ADD(video->plane, video->fb, next->fb);
+            ADD(video->plane, video->crtc, next->fb ? browser->crtc : 0);
+            ADD(video->plane, video->src_x, next->src_x);
+            ADD(video->plane, video->src_y, next->src_y);
+            ADD(video->plane, video->src_w, next->src_w);
+            ADD(video->plane, video->src_h, next->src_h);
+            ADD(video->plane, video->crtc_x, (uint64_t)(int64_t)next->crtc_x);
+            ADD(video->plane, video->crtc_y, (uint64_t)(int64_t)next->crtc_y);
+            ADD(video->plane, video->crtc_w, next->crtc_w);
+            ADD(video->plane, video->crtc_h, next->crtc_h);
+        }
+        gint64 started = g_get_monotonic_time();
+        int saved_errno = EINVAL;
+        gboolean committed = valid && drmModeAtomicCommit(browser->fd, request, DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, browser) == 0;
+        if (valid && !committed) saved_errno = errno;
+        gint64 elapsed = g_get_monotonic_time() - started;
+        drmModeAtomicFree(request);
+        browser->stats.commit_us += elapsed;
+        browser->stats.max_commit_us = MAX(browser->stats.max_commit_us, elapsed);
+        if (committed) {
+            browser->stats.commits++;
+            if (frame) {
+                if (frame->fence_fd >= 0) { close(frame->fence_fd); frame->fence_fd = -1; }
+                browser->queued = NULL;
+                browser->pending = frame;
+            }
+            browser->commit_pending = TRUE;
+            browser->submitted_at = g_get_monotonic_time();
+            if (with_video) {
+                browser->stats.video_commits++;
+                video->pending = video->next;
+                video->pending_valid = TRUE;
+                video->dirty = FALSE;
+            }
+            /* Let WebKit render the next frame while this one's GPU copy and
+             * flip are in flight. It can then reach us before the next vblank;
+             * it waits in queued until this commit flips. */
+            if (frame && browser->frame_complete_early) wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+            return TRUE;
+        }
+        if (saved_errno == EBUSY) {
+            /* Another commit on this CRTC (cleanup, broker setup, a foreign
+             * client) is still in flight: retry shortly instead of failing. */
+            browser->stats.ebusy++;
+            browser->retry_source = g_timeout_add(1, retry_commit, browser);
+            return TRUE;
+        }
+        if (with_video) {
+            /* A stale or unsupported video framebuffer must not take the UI down. */
+            g_warning("Atomic commit with video fb %u rejected: %s; dropping that video frame", video->next.fb, g_strerror(saved_errno));
+            video->rejected++;
+            uint32_t rejected = video->next.fb;
+            video->dirty = FALSE;
+            browser->stats.video_rejected++;
+            video_release_if_unused(browser, rejected);
+            if (!frame) return TRUE;
+            continue;
+        }
         char *message = g_strdup_printf("Atomic browser plane commit failed: %s; inspect DE35 format/modifier/alpha support", g_strerror(saved_errno));
         fail(browser, message);
         g_free(message);
         return FALSE;
     }
-    browser->modeset = TRUE;
-    browser->pending = frame;
-    browser->submitted_at = g_get_monotonic_time();
-    return TRUE;
 }
 
 /* Dumb buffers are linear, which every primary plane can scan out. */
@@ -466,7 +592,7 @@ static Frame *create_initial_frame(Browser *browser)
         .width = browser->ui_width, .height = browser->ui_height, .bpp = 32
     };
     if (drmIoctl(browser->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) return NULL;
-    Frame *frame = g_new0(Frame, 1);
+    Frame *frame = frame_new();
     frame->n_planes = 1;
     frame->handles[0] = create.handle;
     handle_ref(browser, create.handle);
@@ -523,42 +649,122 @@ static gboolean initial_scanout(Browser *browser)
     return FALSE;
 }
 
+static void report_stats(Browser *browser)
+{
+    gint64 now = g_get_monotonic_time();
+    CommitStats *stats = &browser->stats;
+    if (browser->copy.reported_at) {
+        double seconds = (now - browser->copy.reported_at) / (double)G_USEC_PER_SEC;
+        guint64 copied = browser->copy.copied - browser->copy.reported_frames;
+        g_message("Presented %" G_GUINT64_FORMAT " browser frames (%.1f fps over the last %.0f s, path=%s, GPU copy avg %.2f ms)",
+                  browser->presented, seconds > 0 ? 600 / seconds : 0, seconds, browser->copy_mode ? "gpu-copy" : "direct",
+                  copied ? browser->copy.copy_us / 1000.0 / copied : 0.0);
+        g_message("Commits: %" G_GUINT64_FORMAT " (%" G_GUINT64_FORMAT " with video, %.1f video fps), ioctl avg %.2f max %.2f ms, "
+                  "submit->flip avg %.2f max %.2f ms, EBUSY %" G_GUINT64_FORMAT ", replaced UI frames %" G_GUINT64_FORMAT
+                  ", replaced video frames %" G_GUINT64_FORMAT,
+                  stats->commits, stats->video_commits, seconds > 0 ? (browser->video.shown - stats->video_shown_base) / seconds : 0,
+                  stats->commits ? stats->commit_us / 1000.0 / stats->commits : 0.0, stats->max_commit_us / 1000.0,
+                  stats->commits ? stats->flip_us / 1000.0 / stats->commits : 0.0, stats->max_flip_us / 1000.0,
+                  stats->ebusy, stats->replaced, browser->video.replaced - stats->video_replaced_base);
+    }
+    guint64 shown = browser->video.shown, video_replaced = browser->video.replaced;
+    memset(stats, 0, sizeof *stats);
+    stats->video_shown_base = shown;
+    stats->video_replaced_base = video_replaced;
+    browser->copy.reported_at = now;
+    browser->copy.reported_frames = browser->copy.copied;
+    browser->copy.copy_us = 0;
+}
+
 static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigned microseconds, void *data)
 {
     (void)fd; (void)sequence; (void)seconds; (void)microseconds;
     Browser *browser = data;
-    if (!browser->pending) return;
-    Frame *retired = browser->current;
-    browser->current = browser->pending;
-    browser->pending = NULL;
-    release_frame(browser, retired);
-    browser->presented++;
-    if (browser->presented == 1) {
-        if (browser->copy_mode)
-            g_message("First browser frame scanned out on plane %u via GPU copy into a contiguous KMS buffer; alpha preserved", browser->primary);
-        else
-            g_message("First ARGB DMA-BUF browser frame scanned out directly on plane %u; alpha preserved without GLES copy", browser->primary);
+    if (!browser->commit_pending) return;
+    browser->commit_pending = FALSE;
+    gint64 latency = g_get_monotonic_time() - browser->submitted_at;
+    browser->stats.flip_us += latency;
+    browser->stats.max_flip_us = MAX(browser->stats.max_flip_us, latency);
+    VideoPlane *video = &browser->video;
+    if (video->pending_valid) {
+        uint32_t retired = video->current.fb;
+        video->current = video->pending;
+        video->pending_valid = FALSE;
+        if (video->current.fb) video->shown++;
+        video_release_if_unused(browser, retired);
     }
-    if (browser->presented % 600 == 0) {
-        gint64 now = g_get_monotonic_time();
-        if (browser->copy.reported_at) {
-            double seconds = (now - browser->copy.reported_at) / (double)G_USEC_PER_SEC;
-            guint64 copied = browser->copy.copied - browser->copy.reported_frames;
-            g_message("Presented %" G_GUINT64_FORMAT " browser frames (%.1f fps over the last %.0f s, path=%s, GPU copy avg %.2f ms)",
-                      browser->presented, seconds > 0 ? 600 / seconds : 0, seconds, browser->copy_mode ? "gpu-copy" : "direct",
-                      copied ? browser->copy.copy_us / 1000.0 / copied : 0.0);
+    if (browser->pending) {
+        Frame *retired = browser->current;
+        browser->current = browser->pending;
+        browser->pending = NULL;
+        release_frame(browser, retired);
+        browser->presented++;
+        if (browser->presented == 1) {
+            if (browser->copy_mode)
+                g_message("First browser frame scanned out on plane %u via GPU copy into a contiguous KMS buffer; alpha preserved", browser->primary);
+            else
+                g_message("First ARGB DMA-BUF browser frame scanned out directly on plane %u; alpha preserved without GLES copy", browser->primary);
         }
-        browser->copy.reported_at = now;
-        browser->copy.reported_frames = browser->copy.copied;
-        browser->copy.copy_us = 0;
+        if (browser->presented % 600 == 0) report_stats(browser);
+        if (browser->presented == 1 || browser->presented % 120 == 0) write_status(browser);
     }
-    if (browser->presented == 1 || browser->presented % 120 == 0) write_status(browser);
-    wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
-    if (browser->queued) {
-        Frame *queued = browser->queued;
-        browser->queued = NULL;
-        if (!submit_frame(browser, queued)) release_frame(browser, queued);
+    if (!browser->frame_complete_early) wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+    submit_commit(browser);
+}
+
+/* A frame (or hide request) from the holepunch sink; message == NULL when the
+ * sink disconnected, which hides the video. */
+static void video_message(const SignageVideoMessage *message, gpointer data)
+{
+    Browser *browser = data;
+    VideoPlane *video = &browser->video;
+    if (!video->plane) return;
+    VideoState state = { 0 };
+    if (message && message->type == SIGNAGE_VIDEO_SHOW && message->fb && message->src_w && message->src_h && message->crtc_w && message->crtc_h) {
+        state.fb = message->fb;
+        state.src_x = message->src_x; state.src_y = message->src_y;
+        state.src_w = message->src_w; state.src_h = message->src_h;
+        state.crtc_x = message->crtc_x; state.crtc_y = message->crtc_y;
+        state.crtc_w = message->crtc_w; state.crtc_h = message->crtc_h;
+    } else if (message && message->type == SIGNAGE_VIDEO_SHOW) {
+        g_warning("Ignoring malformed video frame message for fb %u", message->fb);
+        signage_drm_broker_video_released(message->fb, message->serial);
+        return;
     }
+    if (!message) g_hash_table_remove_all(video->serials); /* nobody left to tell */
+    if (state.fb) g_hash_table_insert(video->serials, GUINT_TO_POINTER(state.fb), GUINT_TO_POINTER(message->serial));
+    const VideoState *latest = video->dirty ? &video->next : video->pending_valid ? &video->pending : &video->current;
+    if (!memcmp(latest, &state, sizeof state)) return;
+    uint32_t replaced = video->dirty ? video->next.fb : 0;
+    video->next = state;
+    video->dirty = TRUE;
+    if (replaced && replaced != state.fb) {
+        video->replaced++;
+        video_release_if_unused(browser, replaced);
+    }
+    submit_commit(browser);
+}
+
+static void setup_video_plane(Browser *browser)
+{
+    VideoPlane *video = &browser->video;
+    uint32_t plane = signage_drm_broker_video_plane();
+    if (!plane) return;
+    struct { uint32_t *field; const char *name; } properties[] = {
+        { &video->fb, "FB_ID" }, { &video->crtc, "CRTC_ID" },
+        { &video->src_x, "SRC_X" }, { &video->src_y, "SRC_Y" }, { &video->src_w, "SRC_W" }, { &video->src_h, "SRC_H" },
+        { &video->crtc_x, "CRTC_X" }, { &video->crtc_y, "CRTC_Y" }, { &video->crtc_w, "CRTC_W" }, { &video->crtc_h, "CRTC_H" },
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(properties); i++) {
+        *properties[i].field = property_id(browser->fd, plane, DRM_MODE_OBJECT_PLANE, properties[i].name, NULL);
+        if (!*properties[i].field) {
+            g_warning("Video plane %u lacks atomic property %s; the holepunch sink will commit video itself", plane, properties[i].name);
+            return;
+        }
+    }
+    video->plane = plane;
+    video->serials = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_message("Video plane %u is committed by the browser together with the UI (one atomic commit per vblank)", plane);
 }
 
 static gboolean drm_ready(gint fd, GIOCondition condition, gpointer data)
@@ -583,7 +789,7 @@ static gboolean drm_ready(gint fd, GIOCondition condition, gpointer data)
  * (for example a non-contiguous GPU buffer on a display without an IOMMU). */
 static Frame *import_direct(Browser *browser, struct wpe_view_backend_exportable_fdo_dmabuf_resource *resource, char **reason)
 {
-    Frame *frame = g_new0(Frame, 1);
+    Frame *frame = frame_new();
     frame->n_planes = MIN(resource->n_planes, 4);
     const char *step = "unsupported size/format";
     gboolean valid = resource->width == browser->ui_width && resource->height == browser->ui_height &&
@@ -633,6 +839,7 @@ static PFNEGLDESTROYIMAGEKHRPROC destroy_image;
 static PFNEGLCREATESYNCKHRPROC create_sync;
 static PFNEGLDESTROYSYNCKHRPROC destroy_sync;
 static PFNEGLCLIENTWAITSYNCKHRPROC client_wait_sync;
+static PFNEGLDUPNATIVEFENCEFDANDROIDPROC dup_native_fence;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture;
 
 typedef struct {
@@ -874,6 +1081,12 @@ static void destroy_copy(Browser *browser)
     copy->gbm = NULL;
 }
 
+static const char *copy_sync_name(const Browser *browser)
+{
+    if (browser->copy.context == EGL_NO_CONTEXT) return "";
+    return browser->copy.has_native_fence ? "in-fence" : browser->copy.has_fence ? "client-wait" : "finish";
+}
+
 static gboolean setup_copy(Browser *browser, char **error)
 {
     GpuCopy *copy = &browser->copy;
@@ -896,6 +1109,11 @@ static gboolean setup_copy(Browser *browser, char **error)
         return FALSE;
     }
     if (!create_sync || !destroy_sync || !client_wait_sync) copy->has_fence = FALSE;
+    /* With a native fence the kernel waits for the copy (primary-plane IN_FENCE_FD)
+     * and the main thread only flushes; otherwise it waits on the CPU. */
+    dup_native_fence = (PFNEGLDUPNATIVEFENCEFDANDROIDPROC)eglGetProcAddress("eglDupNativeFenceFDANDROID");
+    copy->has_native_fence = copy->has_fence && dup_native_fence && browser->plane_in_fence &&
+        has_extension(extensions, "EGL_ANDROID_native_fence_sync");
     /* Scanout buffers must come from the KMS device so they are contiguous (kmsro/CMA). */
     copy->gbm = browser->render_fd >= 0 ? gbm_create_device(browser->fd) : browser->gbm;
     if (!copy->gbm) { *error = g_strdup("Cannot create a GBM device on the KMS display for scanout buffers"); return FALSE; }
@@ -938,9 +1156,9 @@ static gboolean setup_copy(Browser *browser, char **error)
         if (!create_scanout_buffer(browser, &copy->pool[i], error)) goto out;
     glFinish();
     copy->imports = g_hash_table_new(g_direct_hash, g_direct_equal);
-    g_message("GPU copy ready: renderer=%s, %u contiguous %ux%u ARGB8888 KMS buffers (fb %u/%u/%u), modifiers=%s fence=%s",
+    g_message("GPU copy ready: renderer=%s, %u contiguous %ux%u ARGB8888 KMS buffers (fb %u/%u/%u), modifiers=%s sync=%s",
               (const char *)glGetString(GL_RENDERER), SCANOUT_POOL_SIZE, browser->ui_width, browser->ui_height,
-              copy->pool[0].fb, copy->pool[1].fb, copy->pool[2].fb, copy->has_modifiers ? "yes" : "no", copy->has_fence ? "yes" : "no");
+              copy->pool[0].fb, copy->pool[1].fb, copy->pool[2].fb, copy->has_modifiers ? "yes" : "no", copy_sync_name(browser));
     ok = TRUE;
 out:
     copy_context_leave(browser, &saved);
@@ -1022,6 +1240,7 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
     if (!target && browser->queued && browser->queued->scanout) target = browser->queued->scanout;
     char *error = NULL;
     SavedContext saved;
+    int fence_fd = -1;
     gint64 started = g_get_monotonic_time();
     if (!target) error = g_strdup("no free scanout buffer");
     else if (!copy_context_enter(browser, &saved)) error = g_strdup_printf("eglMakeCurrent failed: 0x%04x", eglGetError());
@@ -1047,9 +1266,25 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             GLenum gl_error = glGetError();
             if (gl_error != GL_NO_ERROR) error = g_strdup_printf("GPU copy draw failed: GL error 0x%04x", gl_error);
-            /* KMS must not scan out a half-written buffer. */
-            EGLSyncKHR sync = copy->has_fence ? create_sync(browser->egl, EGL_SYNC_FENCE_KHR, NULL) : EGL_NO_SYNC_KHR;
-            if (sync != EGL_NO_SYNC_KHR) {
+            /* KMS must not scan out a half-written buffer: hand the kernel a fence
+             * for the copy, or wait for it here when that is unavailable. */
+            if (copy->has_native_fence && !error) {
+                static const EGLint fence_attributes[] = { EGL_SYNC_NATIVE_FENCE_FD_ANDROID, EGL_NO_NATIVE_FENCE_FD_ANDROID, EGL_NONE };
+                EGLSyncKHR native = create_sync(browser->egl, EGL_SYNC_NATIVE_FENCE_ANDROID, fence_attributes);
+                if (native != EGL_NO_SYNC_KHR) {
+                    glFlush(); /* the fence fd exists only once the commands are submitted */
+                    fence_fd = dup_native_fence(browser->egl, native);
+                    destroy_sync(browser->egl, native);
+                }
+                if (fence_fd < 0) {
+                    g_warning("EGL native fence unavailable (0x%04x); waiting for GPU copies on the CPU from now on", eglGetError());
+                    copy->has_native_fence = FALSE;
+                }
+            }
+            EGLSyncKHR sync = fence_fd < 0 && copy->has_fence ? create_sync(browser->egl, EGL_SYNC_FENCE_KHR, NULL) : EGL_NO_SYNC_KHR;
+            if (fence_fd >= 0) {
+                /* The kernel waits on the fence before the flip. */
+            } else if (sync != EGL_NO_SYNC_KHR) {
                 EGLint result = client_wait_sync(browser->egl, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 2000000000ull);
                 destroy_sync(browser->egl, sync);
                 if (result != EGL_CONDITION_SATISFIED_KHR && !error)
@@ -1061,6 +1296,7 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
     /* The pixels are ours now (or the copy failed): hand the buffer straight back to WebKit. */
     wpe_view_backend_exportable_fdo_dispatch_release_buffer(browser->exportable, resource->buffer_resource);
     if (error) {
+        if (fence_fd >= 0) close(fence_fd);
         char *message = g_strdup_printf("GPU copy of the WPE frame into a contiguous scanout buffer failed: %s", error);
         fail(browser, message);
         g_free(message);
@@ -1070,12 +1306,14 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
     copy->copied++;
     copy->copy_us += g_get_monotonic_time() - started;
     if (browser->queued && browser->queued->scanout == target) {
-        g_free(browser->queued);
+        browser->stats.replaced++;
+        release_frame(browser, browser->queued);
         browser->queued = NULL;
     }
-    Frame *frame = g_new0(Frame, 1);
+    Frame *frame = frame_new();
     frame->scanout = target;
     frame->fb = target->fb;
+    frame->fence_fd = fence_fd;
     return frame;
 }
 
@@ -1104,10 +1342,12 @@ static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dma
         }
     }
     if (!frame && !(frame = copy_frame(browser, resource))) return;
-    if (browser->pending) {
+    if (browser->queued) {
+        browser->stats.replaced++;
         release_frame(browser, browser->queued);
-        browser->queued = frame;
-    } else if (!submit_frame(browser, frame)) release_frame(browser, frame);
+    }
+    browser->queued = frame;
+    submit_commit(browser);
 }
 
 static void export_legacy(void *data, struct wl_resource *resource)
@@ -1127,7 +1367,7 @@ static void export_shm(void *data, struct wpe_fdo_shm_exported_buffer *buffer)
 static gboolean watchdog(gpointer data)
 {
     Browser *browser = data;
-    if (browser->pending && g_get_monotonic_time() - browser->submitted_at > 5 * G_USEC_PER_SEC) {
+    if (browser->commit_pending && g_get_monotonic_time() - browser->submitted_at > 5 * G_USEC_PER_SEC) {
         fail(browser, "No DRM pageflip completion within five seconds; buffers retained until scanout is disabled");
         browser->watchdog_source = 0;
         return G_SOURCE_REMOVE;
@@ -1276,6 +1516,7 @@ static void cleanup(Browser *browser)
 {
     if (browser->fd_source) g_source_remove(browser->fd_source);
     if (browser->watchdog_source) g_source_remove(browser->watchdog_source);
+    if (browser->retry_source) g_source_remove(browser->retry_source);
     if (browser->sigterm_source) g_source_remove(browser->sigterm_source);
     if (browser->sigint_source) g_source_remove(browser->sigint_source);
     signage_input_stop(browser->input);
@@ -1329,6 +1570,7 @@ static void cleanup(Browser *browser)
     if (browser->mode_blob) drmModeDestroyPropertyBlob(browser->fd, browser->mode_blob);
     if (browser->fd >= 0) { drmDropMaster(browser->fd); close(browser->fd); }
     if (browser->handles) g_hash_table_unref(browser->handles);
+    if (browser->video.serials) g_hash_table_unref(browser->video.serials);
     if (browser->loop) g_main_loop_unref(browser->loop);
     g_free(browser->device);
     g_free(browser->failure);
@@ -1348,6 +1590,8 @@ static void help(void)
          "SIGNAGE_UI_SIZE            WIDTHxHEIGHT of the web view, scaled to the mode by the primary plane\n"
          "                            (default: mode size, or the largest <=1920x1080 size of the mode's aspect ratio)\n"
          "SIGNAGE_VIDEO_MODE          holepunch (default) or composited\n"
+         "SIGNAGE_VIDEO_SINK          kmssink lets kmssink commit the video plane itself (default: the browser commits it with the UI)\n"
+         "SIGNAGE_FRAME_CALLBACK      flip releases WebKit's frame callback at the page flip (default: when the commit is accepted)\n"
          "SIGNAGE_INPUT               0 disables native keyboard/pointer input\n"
          "SIGNAGE_INPUT_SEAT          udev input seat (default seat0)\n"
          "SIGNAGE_KEYBOARD_LAYOUT     XKB layout (default system/us)\n"
@@ -1368,6 +1612,7 @@ int main(int argc, char **argv)
     if (argc > 2 || (argc == 2 && argv[1][0] == '-')) { help(); return 2; }
     Browser browser = { .fd = -1, .render_fd = -1, .egl = EGL_NO_DISPLAY, .copy = { .context = EGL_NO_CONTEXT }, .uri = argc == 2 ? argv[1] : "http://127.0.0.1:8080/" };
     browser.holepunch = signage_drm_holepunch_enabled();
+    browser.frame_complete_early = g_strcmp0(g_getenv("SIGNAGE_FRAME_CALLBACK"), "flip") != 0;
     browser.handles = g_hash_table_new(g_direct_hash, g_direct_equal);
     browser.loop = g_main_loop_new(NULL, FALSE);
     if (!open_display(&browser)) {
@@ -1388,7 +1633,13 @@ int main(int argc, char **argv)
             browser.holepunch_error = g_strdup(error ? error->message : "DRM holepunch broker initialization failed");
             g_warning("Holepunch unavailable: %s; continuing the browser diagnostic screen", browser.holepunch_error);
             g_clear_error(&error);
-        } else browser.broker_started = TRUE;
+        } else {
+            browser.broker_started = TRUE;
+            if (g_strcmp0(g_getenv("SIGNAGE_VIDEO_SINK"), "kmssink") != 0) {
+                setup_video_plane(&browser);
+                if (browser.video.plane) signage_drm_broker_set_video_handler(video_message, &browser);
+            } else g_message("SIGNAGE_VIDEO_SINK=kmssink: the holepunch sink commits the video plane itself");
+        }
     }
     browser.fd_source = g_unix_fd_add(browser.fd, G_IO_IN | G_IO_ERR | G_IO_HUP, drm_ready, &browser);
     browser.watchdog_source = g_timeout_add_seconds(1, watchdog, &browser);

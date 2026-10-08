@@ -76,7 +76,7 @@ def snapshot(probe=False):
         "input": read_json(RUNTIME / "input-status.json"),
         "runtime": {name: os.environ.get(name) for name in (
             "SIGNAGE_VIDEO_MODE", "SIGNAGE_ALLOW_SOFTWARE", "SIGNAGE_DECODER",
-            "SIGNAGE_VIDEO_PLANE_ID", "SIGNAGE_DRM_DEVICE", "SIGNAGE_RENDER_DEVICE", "SIGNAGE_DRM_MODE", "SIGNAGE_UI_SIZE", "PAN_MESA_DEBUG", "XDG_CACHE_HOME", "GST_REGISTRY",
+            "SIGNAGE_VIDEO_PLANE_ID", "SIGNAGE_VIDEO_SINK", "SIGNAGE_FRAME_CALLBACK", "SIGNAGE_DRM_DEVICE", "SIGNAGE_RENDER_DEVICE", "SIGNAGE_DRM_MODE", "SIGNAGE_UI_SIZE", "PAN_MESA_DEBUG", "XDG_CACHE_HOME", "GST_REGISTRY",
             "WEBKIT_GST_HOLE_PUNCH_QUIRK",
             "WEBKIT_GST_QUIRKS", "GST_PLUGIN_FEATURE_RANK", "GST_DEBUG", "GST_DEBUG_DUMP_DOT_DIR")},
         "versions": command(["dpkg-query", "-W", "-f=${Package} ${Version}\n", "libwpewebkit-2.0-1",

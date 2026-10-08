@@ -34,8 +34,16 @@ once and switches to a GPU copy: each frame is drawn by GLES, as an exact RGBA
 copy without blending, into one of three contiguous linear ARGB8888 buffers
 allocated from the display device, and that buffer is scanned out. Premultiplied
 alpha is preserved, so holepunch video still shows through, and Panfrost may keep
-its faster AFBC buffers. The browser status file reports `scanout_path`
-(`direct` or `gpu-copy`). Mesa's Panfrost path is intended to provide
+its faster AFBC buffers. The main thread does not wait for the copy: with
+`EGL_ANDROID_native_fence_sync` and the primary plane's `IN_FENCE_FD` the shell
+flushes, passes the copy's fence fd with the atomic commit and the kernel waits
+for it before the flip (about 0.7 ms of main-thread time per frame instead of
+7.6 ms on the T527). Without either it falls back to an `EGL_KHR_fence_sync`
+client wait or `glFinish`. WebKit's frame callback fires when a commit is
+accepted, so the next frame renders while the previous one is copied and
+flipped (`SIGNAGE_FRAME_CALLBACK=flip` restores firing at the flip). The
+browser status file reports `scanout_path` (`direct` or `gpu-copy`) and
+`copy_sync` (`in-fence`, `client-wait` or `finish`). Mesa's Panfrost path is intended to provide
 OpenGL ES on the T527's Mali-G57. OpenGL ES 3.1 is the target; this workload does
 not depend on Vulkan. The browser's WebGL renderer and the native EGL/DRM logs
 must agree before calling the rendering path accelerated.
@@ -43,9 +51,9 @@ must agree before calling the rendering path accelerated.
 In the default `holepunch` mode, WebKit manages the real HTML `<video>` element,
 playback and its window rectangle. The entrypoint enables WebKit's existing
 Westeros holepunch quirk. Our `westerossink` compatibility adapter implements the
-properties that this WebKit path expects and delegates video scanout to
-GStreamer's `kmssink`. This is an owned compatibility adapter, not the Westeros
-compositor. No external compositor is involved.
+properties that this WebKit path expects and hands decoded frames to the
+browser, which scans them out on the video plane. This is an owned compatibility
+adapter, not the Westeros compositor. No external compositor is involved.
 
 The web view does not render at the display mode. `SIGNAGE_UI_SIZE` sets the view
 and framebuffer size; by default a mode larger than 1920×1080 renders at the
@@ -59,9 +67,9 @@ status JSON reports `width`/`height` (mode) and `ui_width`/`ui_height`.
 WebKit reports the video rectangle in web-view (UI) coordinates, while the NV12
 overlay is positioned in CRTC coordinates. The broker passes the UI and mode sizes
 to the adapter, which scales the rectangle by mode/UI per axis, rounding outward
-to even pixels (NV12 chroma is subsampled), before setting `kmssink`'s
-`render-rectangle`. With equal sizes the rectangle passes through unchanged.
-The adapter also constrains decoder output to linear `NV12` before `kmssink`;
+to even pixels (NV12 chroma is subsampled), before setting the video sink's
+render rectangle. With equal sizes the rectangle passes through unchanged.
+The adapter also constrains decoder output to linear `NV12` before the sink;
 without it a stateless decoder can negotiate the tiled `NV12_32L32`, which the
 display shows as garbage.
 
@@ -72,6 +80,24 @@ configures and checks `zpos` and blend properties, then the video sink puts the
 decoded video on that lower plane. WebKit makes the matching browser rectangle
 transparent. This keeps video outside the browser's GPU texture-composition
 path while allowing page content around it.
+
+A CRTC accepts one commit per vblank. When `kmssink` updated the video plane
+with its own (legacy, blocking `SETPLANE`) commit, the browser's commits and
+the video's alternated vblanks: a 30 fps video left the UI at about 29 fps of
+the 60 Hz mode, and the browser's commit ioctl blocked for up to 15 ms behind
+the video's. The adapter therefore uses its own sink: it imports each decoded
+DMA-BUF frame once as an NV12 framebuffer on the brokered descriptor, fits it
+into the rectangle (aspect preserved, clipped to the CRTC) and sends the
+framebuffer and plane coordinates over the broker connection, which stays
+open. The browser adds the video plane to its next atomic commit, together with
+a UI frame when one is ready, and tells the sink when a framebuffer is no
+longer on screen so the decoder can reuse it. Measured on the T527 at
+3840×2160@60 with the bundled 30 fps clip: UI 57.5 fps with video at 30 fps
+(previously 28.7 fps), 57.5 fps without video (previously 55). Software
+decoding (`avdec_h264`) and `SIGNAGE_VIDEO_SINK=kmssink` keep `kmssink`. The
+browser logs commit statistics (`Commits: ... ioctl avg ..., submit->flip
+avg ..., EBUSY ...`) next to each frame-rate line; `video-status.json` reports
+`video_sink` (`browser-commit` or `kmssink`).
 
 The current adapter supports one active video sink. Multiple simultaneous HTML
 videos, CSS transforms, rotated output, HDR and arbitrary crop effects are
@@ -223,6 +249,8 @@ See Admiral's [launch contract](https://docs.admrl.co/core-concepts/configuratio
 | `SIGNAGE_DRM_CONNECTOR` | Auto-select | Display connector ID or name. |
 | `SIGNAGE_DRM_PRIMARY_PLANE` | Auto-select | Browser primary-plane ID. |
 | `SIGNAGE_VIDEO_PLANE_ID` | Auto-select | Compatible NV12 video-overlay ID. |
+| `SIGNAGE_VIDEO_SINK` | Browser commit | Set `kmssink` to let `kmssink` commit the video plane separately (comparison; halves the UI frame rate while video plays). |
+| `SIGNAGE_FRAME_CALLBACK` | On commit | Set `flip` to release WebKit's frame callback only after the page flip. |
 | `SIGNAGE_INPUT` | Enabled | Set `0` to disable native keyboard/pointer input and metadata preparation. |
 | `SIGNAGE_INPUT_SEAT` | `seat0` | Input seat for initial event-device classification and libinput. |
 | `SIGNAGE_KEYBOARD_LAYOUT` | System/US | XKB keyboard layout. |
