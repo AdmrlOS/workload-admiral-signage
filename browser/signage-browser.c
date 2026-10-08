@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: MIT
- * Admiral's small WPE WebKit shell. DMA-BUF frames are scanned out directly;
- * there is no GLES texture copy that could discard holepunch alpha.
- * Written against the public libwpe, WPEBackend-fdo, WebKit and libdrm APIs.
+ * Admiral's small WPE WebKit shell. DMA-BUF frames are scanned out directly
+ * when the display can import them. Displays without an IOMMU (the T527's
+ * sun4i-drm) can only scan out physically contiguous buffers, so the shell then
+ * copies each frame with GLES into a small pool of contiguous KMS buffers.
+ * The copy is an exact RGBA blit (no blending), so holepunch alpha survives.
+ * Written against the public libwpe, WPEBackend-fdo, WebKit, EGL/GLES and libdrm APIs.
  */
 #define _GNU_SOURCE
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
@@ -17,6 +22,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <wayland-server-core.h>
 #include <wpe/fdo.h>
 #include <wpe/fdo-egl.h>
 #include <wpe/webkit.h>
@@ -29,12 +35,45 @@
 
 #define VERSION "0.1.0"
 
+#define SCANOUT_POOL_SIZE 3
+
+/* A contiguous KMS buffer that GPU-copied browser frames are rendered into. */
+typedef struct {
+    struct gbm_bo *bo;
+    uint32_t fb;
+    EGLImageKHR image;
+    GLuint texture, framebuffer;
+} ScanoutBuffer;
+
 typedef struct {
     struct wl_resource *resource;
     uint32_t fb;
     uint32_t handles[4];
     uint8_t n_planes;
+    ScanoutBuffer *scanout; /* pool buffer (GPU copy); its fb is owned by the pool */
 } Frame;
+
+/* A WPE buffer imported as a GLES texture, cached until WPE destroys the buffer. */
+typedef struct {
+    struct wl_listener destroy;
+    void *browser;
+    struct wl_resource *resource;
+    EGLImageKHR image;
+    GLuint texture;
+    GLenum target;
+} ImportedBuffer;
+
+typedef struct {
+    EGLContext context;
+    GLuint program_2d, program_external;
+    ScanoutBuffer pool[SCANOUT_POOL_SIZE];
+    GHashTable *imports;
+    struct gbm_device *gbm; /* scanout allocator on the KMS fd (may equal Browser.gbm) */
+    gboolean has_modifiers, has_fence, has_external;
+    guint64 copied;
+    gint64 copy_us, reported_at;
+    guint64 reported_frames;
+} GpuCopy;
 
 typedef struct {
     int fd;
@@ -42,12 +81,15 @@ typedef struct {
     char *device;
     uint32_t connector, crtc, crtc_index, primary;
     drmModeModeInfo mode;
+    unsigned ui_width, ui_height; /* WPE view and framebuffer size; the primary plane scales it to mode */
     uint32_t mode_blob;
     uint32_t connector_crtc, crtc_mode, crtc_active;
     uint32_t plane_fb, plane_crtc, plane_src_x, plane_src_y, plane_src_w, plane_src_h;
     uint32_t plane_x, plane_y, plane_w, plane_h;
     struct gbm_device *gbm;
     EGLDisplay egl;
+    gboolean copy_mode; /* direct DMA-BUF scanout failed; frames are GPU-copied */
+    GpuCopy copy;
     struct wpe_view_backend_exportable_fdo *exportable;
     struct wpe_view_backend *backend;
     WebKitWebView *view;
@@ -99,9 +141,13 @@ static void write_status(Browser *browser)
     JSON_INT("primary_plane_id", browser->primary);
     JSON_INT("width", browser->mode.hdisplay);
     JSON_INT("height", browser->mode.vdisplay);
+    JSON_INT("ui_width", browser->ui_width);
+    JSON_INT("ui_height", browser->ui_height);
     JSON_INT("refresh", mode_refresh(&browser->mode));
     JSON_INT("presented_frames", browser->presented);
-    JSON_BOOL("direct_scanout", browser->presented > 0);
+    JSON_STRING("scanout_path", browser->presented == 0 ? "pending" : browser->copy_mode ? "gpu-copy" : "direct");
+    JSON_INT("copied_frames", browser->copy.copied);
+    JSON_BOOL("direct_scanout", browser->presented > 0 && !browser->copy_mode);
     JSON_BOOL("alpha_preserved", browser->presented > 0 && browser->holepunch);
     JSON_BOOL("broker_ready", browser->broker_started);
     json_builder_end_object(builder);
@@ -268,6 +314,43 @@ static gboolean try_device(Browser *browser, const char *path)
     return TRUE;
 }
 
+static unsigned gcd_unsigned(unsigned a, unsigned b)
+{
+    while (b) { unsigned t = a % b; a = b; b = t; }
+    return a;
+}
+
+/* GPU rendering cost scales with pixels: modes above 1080p render the UI at the
+ * largest size within 1920x1080 that keeps the mode's aspect ratio. */
+static gboolean choose_ui_size(Browser *browser)
+{
+    unsigned mode_w = browser->mode.hdisplay, mode_h = browser->mode.vdisplay;
+    browser->ui_width = mode_w;
+    browser->ui_height = mode_h;
+    const char *wanted = g_getenv("SIGNAGE_UI_SIZE");
+    if (wanted && *wanted) {
+        unsigned width = 0, height = 0;
+        char trailing;
+        if (sscanf(wanted, "%ux%u%c", &width, &height, &trailing) != 2 || !width || !height || width > mode_w || height > mode_h) {
+            g_printerr("Invalid SIGNAGE_UI_SIZE '%s'; expected WIDTHxHEIGHT no larger than the %ux%u mode\n", wanted, mode_w, mode_h);
+            return FALSE;
+        }
+        browser->ui_width = width;
+        browser->ui_height = height;
+    } else if (mode_w > 1920 || mode_h > 1080) {
+        unsigned divisor = gcd_unsigned(mode_w, mode_h);
+        unsigned ratio_w = mode_w / divisor, ratio_h = mode_h / divisor;
+        unsigned factor = MIN(1920 / ratio_w, 1080 / ratio_h);
+        if (factor) {
+            browser->ui_width = ratio_w * factor;
+            browser->ui_height = ratio_h * factor;
+        }
+    }
+    g_message("Browser UI %ux%u, display mode %ux%u%s", browser->ui_width, browser->ui_height, mode_w, mode_h,
+              browser->ui_width == mode_w && browser->ui_height == mode_h ? "" : " (scaled by the primary plane)");
+    return TRUE;
+}
+
 static gboolean open_display(Browser *browser)
 {
     const char *device = g_getenv("SIGNAGE_DRM_DEVICE");
@@ -295,6 +378,7 @@ static gboolean open_display(Browser *browser)
     PROPERTY(plane_y, browser->primary, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
     PROPERTY(plane_w, browser->primary, DRM_MODE_OBJECT_PLANE, "CRTC_W");
     PROPERTY(plane_h, browser->primary, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+    if (!choose_ui_size(browser)) return FALSE;
     if (drmModeCreatePropertyBlob(browser->fd, &browser->mode, sizeof browser->mode, &browser->mode_blob) != 0) return FALSE;
     return TRUE;
 }
@@ -319,7 +403,7 @@ static void handle_unref(Browser *browser, uint32_t handle)
 static void release_frame(Browser *browser, Frame *frame)
 {
     if (!frame) return;
-    if (frame->fb) drmModeRmFB(browser->fd, frame->fb);
+    if (frame->fb && !frame->scanout) drmModeRmFB(browser->fd, frame->fb);
     for (unsigned i = 0; i < frame->n_planes; i++) {
         gboolean unique = TRUE;
         for (unsigned j = 0; j < i; j++) if (frame->handles[j] == frame->handles[i]) unique = FALSE;
@@ -336,21 +420,26 @@ static gboolean submit_frame(Browser *browser, Frame *frame)
     if (!request) return FALSE;
     gboolean valid = TRUE;
 #define ADD(object, property, value) do { if (drmModeAtomicAddProperty(request, object, property, value) < 0) valid = FALSE; } while (0)
+/* The source is the UI-sized buffer; the destination is always the full mode.
+ * When they differ the primary plane's scaler stretches the UI over the video. */
+#define ADD_PRIMARY_STATE(fb) do { \
+        ADD(browser->primary, browser->plane_fb, fb); \
+        ADD(browser->primary, browser->plane_crtc, browser->crtc); \
+        ADD(browser->primary, browser->plane_src_x, 0); \
+        ADD(browser->primary, browser->plane_src_y, 0); \
+        ADD(browser->primary, browser->plane_src_w, (uint64_t)browser->ui_width << 16); \
+        ADD(browser->primary, browser->plane_src_h, (uint64_t)browser->ui_height << 16); \
+        ADD(browser->primary, browser->plane_x, 0); \
+        ADD(browser->primary, browser->plane_y, 0); \
+        ADD(browser->primary, browser->plane_w, browser->mode.hdisplay); \
+        ADD(browser->primary, browser->plane_h, browser->mode.vdisplay); \
+    } while (0)
     if (!browser->modeset) {
         ADD(browser->connector, browser->connector_crtc, browser->crtc);
         ADD(browser->crtc, browser->crtc_mode, browser->mode_blob);
         ADD(browser->crtc, browser->crtc_active, 1);
     }
-    ADD(browser->primary, browser->plane_fb, frame->fb);
-    ADD(browser->primary, browser->plane_crtc, browser->crtc);
-    ADD(browser->primary, browser->plane_src_x, 0);
-    ADD(browser->primary, browser->plane_src_y, 0);
-    ADD(browser->primary, browser->plane_src_w, (uint64_t)browser->mode.hdisplay << 16);
-    ADD(browser->primary, browser->plane_src_h, (uint64_t)browser->mode.vdisplay << 16);
-    ADD(browser->primary, browser->plane_x, 0);
-    ADD(browser->primary, browser->plane_y, 0);
-    ADD(browser->primary, browser->plane_w, browser->mode.hdisplay);
-    ADD(browser->primary, browser->plane_h, browser->mode.vdisplay);
+    ADD_PRIMARY_STATE(frame->fb);
     uint32_t mode_flag = browser->modeset ? 0 : DRM_MODE_ATOMIC_ALLOW_MODESET;
     if (valid && !browser->modeset)
         valid = drmModeAtomicCommit(browser->fd, request, mode_flag | DRM_MODE_ATOMIC_TEST_ONLY, NULL) == 0;
@@ -370,13 +459,13 @@ static gboolean submit_frame(Browser *browser, Frame *frame)
     return TRUE;
 }
 
-/* Activate the selected CRTC before WebKit can preroll its video sink. */
-static gboolean initial_scanout(Browser *browser)
+/* Dumb buffers are linear, which every primary plane can scan out. */
+static Frame *create_initial_frame(Browser *browser)
 {
     struct drm_mode_create_dumb create = {
-        .width = browser->mode.hdisplay, .height = browser->mode.vdisplay, .bpp = 32
+        .width = browser->ui_width, .height = browser->ui_height, .bpp = 32
     };
-    if (drmIoctl(browser->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) return FALSE;
+    if (drmIoctl(browser->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) return NULL;
     Frame *frame = g_new0(Frame, 1);
     frame->n_planes = 1;
     frame->handles[0] = create.handle;
@@ -392,33 +481,46 @@ static gboolean initial_scanout(Browser *browser)
         }
     }
     uint32_t strides[4] = { create.pitch, 0, 0, 0 }, offsets[4] = { 0, 0, 0, 0 };
-    if (valid) valid = drmModeAddFB2(browser->fd, browser->mode.hdisplay, browser->mode.vdisplay,
+    if (valid) valid = drmModeAddFB2(browser->fd, browser->ui_width, browser->ui_height,
                                     DRM_FORMAT_ARGB8888, frame->handles, strides, offsets, &frame->fb, 0) == 0;
-    drmModeAtomicReq *request = valid ? drmModeAtomicAlloc() : NULL;
-    if (!request) valid = FALSE;
-    if (valid) {
-        ADD(browser->connector, browser->connector_crtc, browser->crtc);
-        ADD(browser->crtc, browser->crtc_mode, browser->mode_blob);
-        ADD(browser->crtc, browser->crtc_active, 1);
-        ADD(browser->primary, browser->plane_fb, frame->fb);
-        ADD(browser->primary, browser->plane_crtc, browser->crtc);
-        ADD(browser->primary, browser->plane_src_x, 0);
-        ADD(browser->primary, browser->plane_src_y, 0);
-        ADD(browser->primary, browser->plane_src_w, (uint64_t)browser->mode.hdisplay << 16);
-        ADD(browser->primary, browser->plane_src_h, (uint64_t)browser->mode.vdisplay << 16);
-        ADD(browser->primary, browser->plane_x, 0);
-        ADD(browser->primary, browser->plane_y, 0);
-        ADD(browser->primary, browser->plane_w, browser->mode.hdisplay);
-        ADD(browser->primary, browser->plane_h, browser->mode.vdisplay);
-        if (valid) valid = drmModeAtomicCommit(browser->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY, NULL) == 0;
-        if (valid) valid = drmModeAtomicCommit(browser->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) == 0;
+    if (!valid) { release_frame(browser, frame); return NULL; }
+    return frame;
+}
+
+/* Activate the selected CRTC before WebKit can preroll its video sink. */
+static gboolean initial_scanout(Browser *browser)
+{
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        Frame *frame = create_initial_frame(browser);
+        if (!frame) return FALSE;
+        drmModeAtomicReq *request = drmModeAtomicAlloc();
+        gboolean valid = request != NULL;
+        if (valid) {
+            ADD(browser->connector, browser->connector_crtc, browser->crtc);
+            ADD(browser->crtc, browser->crtc_mode, browser->mode_blob);
+            ADD(browser->crtc, browser->crtc_active, 1);
+            ADD_PRIMARY_STATE(frame->fb);
+            /* Prove the kernel accepts the scaled configuration before WPE renders for it. */
+            errno = EINVAL;
+            if (valid) valid = drmModeAtomicCommit(browser->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY, NULL) == 0;
+            if (valid) valid = drmModeAtomicCommit(browser->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) == 0;
+        }
+        int saved_errno = errno;
+        if (request) drmModeAtomicFree(request);
+        if (valid) {
+            browser->current = frame;
+            browser->modeset = TRUE;
+            g_message("Initial ARGB browser mode active before video broker starts");
+            return TRUE;
+        }
+        release_frame(browser, frame);
+        if (browser->ui_width == browser->mode.hdisplay && browser->ui_height == browser->mode.vdisplay) return FALSE;
+        g_warning("Kernel rejected primary-plane scaling %ux%u -> %ux%u (%s); falling back to UI size = mode size",
+                  browser->ui_width, browser->ui_height, browser->mode.hdisplay, browser->mode.vdisplay, g_strerror(saved_errno));
+        browser->ui_width = browser->mode.hdisplay;
+        browser->ui_height = browser->mode.vdisplay;
     }
-    if (request) drmModeAtomicFree(request);
-    if (!valid) { release_frame(browser, frame); return FALSE; }
-    browser->current = frame;
-    browser->modeset = TRUE;
-    g_message("Initial ARGB browser mode active before video broker starts");
-    return TRUE;
+    return FALSE;
 }
 
 static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigned microseconds, void *data)
@@ -431,8 +533,25 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
     browser->pending = NULL;
     release_frame(browser, retired);
     browser->presented++;
-    if (browser->presented == 1)
-        g_message("First ARGB DMA-BUF browser frame scanned out on plane %u; alpha preserved without GLES copy", browser->primary);
+    if (browser->presented == 1) {
+        if (browser->copy_mode)
+            g_message("First browser frame scanned out on plane %u via GPU copy into a contiguous KMS buffer; alpha preserved", browser->primary);
+        else
+            g_message("First ARGB DMA-BUF browser frame scanned out directly on plane %u; alpha preserved without GLES copy", browser->primary);
+    }
+    if (browser->presented % 600 == 0) {
+        gint64 now = g_get_monotonic_time();
+        if (browser->copy.reported_at) {
+            double seconds = (now - browser->copy.reported_at) / (double)G_USEC_PER_SEC;
+            guint64 copied = browser->copy.copied - browser->copy.reported_frames;
+            g_message("Presented %" G_GUINT64_FORMAT " browser frames (%.1f fps over the last %.0f s, path=%s, GPU copy avg %.2f ms)",
+                      browser->presented, seconds > 0 ? 600 / seconds : 0, seconds, browser->copy_mode ? "gpu-copy" : "direct",
+                      copied ? browser->copy.copy_us / 1000.0 / copied : 0.0);
+        }
+        browser->copy.reported_at = now;
+        browser->copy.reported_frames = browser->copy.copied;
+        browser->copy.copy_us = 0;
+    }
     if (browser->presented == 1 || browser->presented % 120 == 0) write_status(browser);
     wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
     if (browser->queued) {
@@ -459,17 +578,21 @@ static gboolean drm_ready(gint fd, GIOCondition condition, gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dmabuf_resource *resource)
+/* Zero-copy path: import the WPE buffer into the KMS device and wrap it in a
+ * framebuffer. Returns NULL with a reason when the display cannot scan it out
+ * (for example a non-contiguous GPU buffer on a display without an IOMMU). */
+static Frame *import_direct(Browser *browser, struct wpe_view_backend_exportable_fdo_dmabuf_resource *resource, char **reason)
 {
-    Browser *browser = data;
     Frame *frame = g_new0(Frame, 1);
-    frame->resource = resource->buffer_resource;
     frame->n_planes = MIN(resource->n_planes, 4);
-    gboolean valid = resource->width == browser->mode.hdisplay && resource->height == browser->mode.vdisplay &&
+    const char *step = "unsupported size/format";
+    gboolean valid = resource->width == browser->ui_width && resource->height == browser->ui_height &&
         resource->n_planes > 0 && resource->n_planes <= 4 && resource->format == DRM_FORMAT_ARGB8888;
+    int saved_errno = EINVAL;
     gboolean explicit_modifiers = FALSE, all_linear_or_implicit = TRUE;
+    if (valid) step = "drmPrimeFDToHandle";
     for (unsigned i = 0; valid && i < resource->n_planes; i++) {
-        if (drmPrimeFDToHandle(browser->fd, resource->fds[i], &frame->handles[i]) != 0) { valid = FALSE; break; }
+        if (drmPrimeFDToHandle(browser->fd, resource->fds[i], &frame->handles[i]) != 0) { saved_errno = errno; valid = FALSE; break; }
         gboolean unique = TRUE;
         for (unsigned j = 0; j < i; j++) if (frame->handles[j] == frame->handles[i]) unique = FALSE;
         if (unique) handle_ref(browser, frame->handles[i]);
@@ -478,6 +601,7 @@ static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dma
     }
     /* Only a fully imported, validated buffer may reach the linear fallback. */
     if (valid) {
+        step = "drmModeAddFB2";
         if (explicit_modifiers) {
             valid = drmModeAddFB2WithModifiers(browser->fd, resource->width, resource->height, resource->format,
                 frame->handles, resource->strides, resource->offsets, resource->modifiers, &frame->fb, DRM_MODE_FB_MODIFIERS) == 0;
@@ -488,14 +612,498 @@ static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dma
             valid = drmModeAddFB2(browser->fd, resource->width, resource->height, resource->format,
                 frame->handles, resource->strides, resource->offsets, &frame->fb, 0) == 0;
         }
+        if (!valid) saved_errno = errno;
     }
-    if (!valid) {
-        char *message = g_strdup_printf("Cannot scan out WPE DMA-BUF: size=%ux%u format=0x%08x planes=%u modifier=0x%016" PRIx64 " (%s). ARGB8888 alpha and a display-compatible modifier are required", resource->width, resource->height, resource->format, resource->n_planes, resource->modifiers[0], g_strerror(errno));
-        release_frame(browser, frame);
-        fail(browser, message);
-        g_free(message);
+    if (valid) {
+        frame->resource = resource->buffer_resource;
+        return frame;
+    }
+    *reason = g_strdup_printf("%s failed: %s; size=%ux%u (UI %ux%u) format=0x%08x planes=%u modifier=0x%016" PRIx64,
+                              step, g_strerror(saved_errno), resource->width, resource->height, browser->ui_width, browser->ui_height,
+                              resource->format, resource->n_planes, resource->modifiers[0]);
+    /* The WPE buffer is not owned by this frame yet: the copy path still needs it. */
+    release_frame(browser, frame);
+    return NULL;
+}
+
+/* ---- GPU copy into contiguous KMS buffers ---- */
+
+static PFNEGLCREATEIMAGEKHRPROC create_image;
+static PFNEGLDESTROYIMAGEKHRPROC destroy_image;
+static PFNEGLCREATESYNCKHRPROC create_sync;
+static PFNEGLDESTROYSYNCKHRPROC destroy_sync;
+static PFNEGLCLIENTWAITSYNCKHRPROC client_wait_sync;
+static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture;
+
+typedef struct {
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface draw, read;
+} SavedContext;
+
+/* WebKit's UI process does not normally hold a GL context on this thread, but
+ * restore whatever was current so the copy never disturbs another user. */
+static gboolean copy_context_enter(Browser *browser, SavedContext *saved)
+{
+    saved->display = eglGetCurrentDisplay();
+    saved->context = eglGetCurrentContext();
+    saved->draw = eglGetCurrentSurface(EGL_DRAW);
+    saved->read = eglGetCurrentSurface(EGL_READ);
+    if (saved->context == browser->copy.context) return TRUE;
+    return eglMakeCurrent(browser->egl, EGL_NO_SURFACE, EGL_NO_SURFACE, browser->copy.context);
+}
+
+static void copy_context_leave(Browser *browser, const SavedContext *saved)
+{
+    if (saved->context == browser->copy.context) return;
+    if (saved->context != EGL_NO_CONTEXT && saved->display != EGL_NO_DISPLAY)
+        eglMakeCurrent(saved->display, saved->draw, saved->read, saved->context);
+    else
+        eglMakeCurrent(browser->egl, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+}
+
+static gboolean has_extension(const char *list, const char *name)
+{
+    size_t length = strlen(name);
+    for (const char *at = list; at && (at = strstr(at, name)); at += length)
+        if ((at == list || at[-1] == ' ') && (at[length] == ' ' || at[length] == '\0')) return TRUE;
+    return FALSE;
+}
+
+static GLuint compile_program(gboolean external, char **error)
+{
+    /* highp: 1920-pixel texture coordinates are not exact in mediump. */
+    static const char *vertex_source =
+        "attribute vec2 position;\n"
+        "varying highp vec2 coordinate;\n"
+        "void main() { coordinate = position * 0.5 + 0.5; gl_Position = vec4(position, 0.0, 1.0); }\n";
+    static const char *fragment_2d =
+        "precision highp float;\n"
+        "uniform sampler2D source;\n"
+        "varying highp vec2 coordinate;\n"
+        "void main() { gl_FragColor = texture2D(source, coordinate); }\n";
+    static const char *fragment_external =
+        "#extension GL_OES_EGL_image_external : require\n"
+        "precision highp float;\n"
+        "uniform samplerExternalOES source;\n"
+        "varying highp vec2 coordinate;\n"
+        "void main() { gl_FragColor = texture2D(source, coordinate); }\n";
+    const char *sources[2] = { vertex_source, external ? fragment_external : fragment_2d };
+    GLenum types[2] = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER };
+    GLuint program = glCreateProgram();
+    for (unsigned i = 0; i < 2; i++) {
+        GLuint shader = glCreateShader(types[i]);
+        GLint ok = 0;
+        glShaderSource(shader, 1, &sources[i], NULL);
+        glCompileShader(shader);
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char log[512] = "";
+            glGetShaderInfoLog(shader, sizeof log, NULL, log);
+            *error = g_strdup_printf("shader compile failed: %s", log);
+            glDeleteShader(shader);
+            glDeleteProgram(program);
+            return 0;
+        }
+        glAttachShader(program, shader);
+        glDeleteShader(shader);
+    }
+    glBindAttribLocation(program, 0, "position");
+    glLinkProgram(program);
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[512] = "";
+        glGetProgramInfoLog(program, sizeof log, NULL, log);
+        *error = g_strdup_printf("program link failed: %s", log);
+        glDeleteProgram(program);
+        return 0;
+    }
+    glUseProgram(program);
+    glUniform1i(glGetUniformLocation(program, "source"), 0);
+    return program;
+}
+
+/* Builds an EGL_LINUX_DMA_BUF_EXT attribute list for up to four planes. */
+static gboolean dmabuf_attributes(Browser *browser, EGLint *attributes, unsigned width, unsigned height, uint32_t format,
+                                  unsigned n_planes, const int *fds, const uint32_t *strides, const uint32_t *offsets,
+                                  const uint64_t *modifiers)
+{
+    static const EGLint plane_attributes[4][5] = {
+        { EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT },
+        { EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT },
+        { EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT, EGL_DMA_BUF_PLANE2_PITCH_EXT, EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT },
+        { EGL_DMA_BUF_PLANE3_FD_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT, EGL_DMA_BUF_PLANE3_PITCH_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT },
+    };
+    unsigned n = 0;
+    attributes[n++] = EGL_WIDTH; attributes[n++] = width;
+    attributes[n++] = EGL_HEIGHT; attributes[n++] = height;
+    attributes[n++] = EGL_LINUX_DRM_FOURCC_EXT; attributes[n++] = format;
+    for (unsigned i = 0; i < n_planes && i < 4; i++) {
+        attributes[n++] = plane_attributes[i][0]; attributes[n++] = fds[i];
+        attributes[n++] = plane_attributes[i][1]; attributes[n++] = offsets[i];
+        attributes[n++] = plane_attributes[i][2]; attributes[n++] = strides[i];
+        if (modifiers[i] != DRM_FORMAT_MOD_INVALID) {
+            if (!browser->copy.has_modifiers) return FALSE;
+            attributes[n++] = plane_attributes[i][3]; attributes[n++] = (EGLint)(modifiers[i] & 0xffffffff);
+            attributes[n++] = plane_attributes[i][4]; attributes[n++] = (EGLint)(modifiers[i] >> 32);
+        }
+    }
+    attributes[n++] = EGL_IMAGE_PRESERVED_KHR; attributes[n++] = EGL_TRUE;
+    attributes[n] = EGL_NONE;
+    return TRUE;
+}
+
+static void destroy_scanout_buffer(Browser *browser, ScanoutBuffer *buffer)
+{
+    if (buffer->framebuffer) glDeleteFramebuffers(1, &buffer->framebuffer);
+    if (buffer->texture) glDeleteTextures(1, &buffer->texture);
+    if (buffer->image != EGL_NO_IMAGE_KHR && destroy_image) destroy_image(browser->egl, buffer->image);
+    if (buffer->fb) drmModeRmFB(browser->fd, buffer->fb);
+    if (buffer->bo) gbm_bo_destroy(buffer->bo);
+    memset(buffer, 0, sizeof *buffer);
+    buffer->image = EGL_NO_IMAGE_KHR;
+}
+
+static gboolean create_scanout_buffer(Browser *browser, ScanoutBuffer *buffer, char **error)
+{
+    buffer->image = EGL_NO_IMAGE_KHR;
+    buffer->bo = gbm_bo_create(browser->copy.gbm, browser->ui_width, browser->ui_height, GBM_FORMAT_ARGB8888,
+                               GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+    if (!buffer->bo) {
+        *error = g_strdup_printf("gbm_bo_create(%ux%u ARGB8888 SCANOUT|RENDERING|LINEAR) on the KMS device failed: %s",
+                                 browser->ui_width, browser->ui_height, g_strerror(errno));
+        return FALSE;
+    }
+    uint32_t handles[4] = { gbm_bo_get_handle(buffer->bo).u32 }, strides[4] = { gbm_bo_get_stride(buffer->bo) }, offsets[4] = { 0 };
+    if (drmModeAddFB2(browser->fd, browser->ui_width, browser->ui_height, DRM_FORMAT_ARGB8888, handles, strides, offsets, &buffer->fb, 0) != 0) {
+        *error = g_strdup_printf("drmModeAddFB2 for the contiguous scanout buffer failed: %s", g_strerror(errno));
+        return FALSE;
+    }
+    int fd = gbm_bo_get_fd(buffer->bo);
+    if (fd < 0) { *error = g_strdup("gbm_bo_get_fd for the scanout buffer failed"); return FALSE; }
+    EGLint attributes[64];
+    int fds[1] = { fd };
+    uint64_t modifiers[1] = { browser->copy.has_modifiers ? DRM_FORMAT_MOD_LINEAR : DRM_FORMAT_MOD_INVALID };
+    dmabuf_attributes(browser, attributes, browser->ui_width, browser->ui_height, DRM_FORMAT_ARGB8888, 1, fds, strides, offsets, modifiers);
+    buffer->image = create_image(browser->egl, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
+    close(fd);
+    if (buffer->image == EGL_NO_IMAGE_KHR) {
+        *error = g_strdup_printf("eglCreateImageKHR for the scanout buffer failed: 0x%04x", eglGetError());
+        return FALSE;
+    }
+    glGenTextures(1, &buffer->texture);
+    glBindTexture(GL_TEXTURE_2D, buffer->texture);
+    image_target_texture(GL_TEXTURE_2D, buffer->image);
+    glGenFramebuffers(1, &buffer->framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, buffer->framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, buffer->texture, 0);
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        *error = g_strdup_printf("scanout framebuffer incomplete: 0x%04x (GL error 0x%04x)", status, glGetError());
+        return FALSE;
+    }
+    /* Same opaque dark background (0xff09131c) as the initial dumb buffer. */
+    glViewport(0, 0, browser->ui_width, browser->ui_height);
+    glClearColor(0x09 / 255.0f, 0x13 / 255.0f, 0x1c / 255.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    return TRUE;
+}
+
+static void destroy_import(Browser *browser, ImportedBuffer *import)
+{
+    if (import->texture) glDeleteTextures(1, &import->texture);
+    if (import->image != EGL_NO_IMAGE_KHR) destroy_image(browser->egl, import->image);
+    g_free(import);
+}
+
+static void import_destroyed(struct wl_listener *listener, void *data)
+{
+    (void)data;
+    ImportedBuffer *import = wl_container_of(listener, import, destroy);
+    Browser *browser = import->browser;
+    wl_list_remove(&import->destroy.link);
+    g_hash_table_remove(browser->copy.imports, import->resource);
+    SavedContext saved;
+    if (copy_context_enter(browser, &saved)) {
+        destroy_import(browser, import);
+        copy_context_leave(browser, &saved);
+    } else g_free(import);
+}
+
+static void destroy_copy(Browser *browser)
+{
+    GpuCopy *copy = &browser->copy;
+    if (copy->context == EGL_NO_CONTEXT) {
+        if (copy->gbm && copy->gbm != browser->gbm) gbm_device_destroy(copy->gbm);
+        copy->gbm = NULL;
         return;
     }
+    SavedContext saved;
+    gboolean current = copy_context_enter(browser, &saved);
+    if (copy->imports) {
+        GHashTableIter iter;
+        gpointer value;
+        g_hash_table_iter_init(&iter, copy->imports);
+        while (g_hash_table_iter_next(&iter, NULL, &value)) {
+            ImportedBuffer *import = value;
+            wl_list_remove(&import->destroy.link);
+            if (current) destroy_import(browser, import); else g_free(import);
+            g_hash_table_iter_remove(&iter);
+        }
+        g_hash_table_unref(copy->imports);
+        copy->imports = NULL;
+    }
+    for (unsigned i = 0; i < SCANOUT_POOL_SIZE; i++) {
+        if (current) destroy_scanout_buffer(browser, &copy->pool[i]);
+        else {
+            if (copy->pool[i].fb) drmModeRmFB(browser->fd, copy->pool[i].fb);
+            if (copy->pool[i].bo) gbm_bo_destroy(copy->pool[i].bo);
+            memset(&copy->pool[i], 0, sizeof copy->pool[i]);
+        }
+    }
+    if (current) {
+        if (copy->program_2d) glDeleteProgram(copy->program_2d);
+        if (copy->program_external) glDeleteProgram(copy->program_external);
+    }
+    copy->program_2d = copy->program_external = 0;
+    eglMakeCurrent(browser->egl, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(browser->egl, copy->context);
+    copy->context = EGL_NO_CONTEXT;
+    if (copy->gbm && copy->gbm != browser->gbm) gbm_device_destroy(copy->gbm);
+    copy->gbm = NULL;
+}
+
+static gboolean setup_copy(Browser *browser, char **error)
+{
+    GpuCopy *copy = &browser->copy;
+    const char *extensions = eglQueryString(browser->egl, EGL_EXTENSIONS);
+    if (!has_extension(extensions, "EGL_EXT_image_dma_buf_import") || !has_extension(extensions, "EGL_KHR_image_base") ||
+        !has_extension(extensions, "EGL_KHR_surfaceless_context")) {
+        *error = g_strdup("EGL lacks EGL_EXT_image_dma_buf_import, EGL_KHR_image_base or EGL_KHR_surfaceless_context");
+        return FALSE;
+    }
+    copy->has_modifiers = has_extension(extensions, "EGL_EXT_image_dma_buf_import_modifiers");
+    copy->has_fence = has_extension(extensions, "EGL_KHR_fence_sync");
+    create_image = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+    destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+    create_sync = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+    destroy_sync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+    client_wait_sync = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
+    image_target_texture = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    if (!create_image || !destroy_image || !image_target_texture) {
+        *error = g_strdup("EGL image entry points are unavailable");
+        return FALSE;
+    }
+    if (!create_sync || !destroy_sync || !client_wait_sync) copy->has_fence = FALSE;
+    /* Scanout buffers must come from the KMS device so they are contiguous (kmsro/CMA). */
+    copy->gbm = browser->render_fd >= 0 ? gbm_create_device(browser->fd) : browser->gbm;
+    if (!copy->gbm) { *error = g_strdup("Cannot create a GBM device on the KMS display for scanout buffers"); return FALSE; }
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) { *error = g_strdup("eglBindAPI(EGL_OPENGL_ES_API) failed"); return FALSE; }
+    EGLConfig config = EGL_NO_CONFIG_KHR;
+    if (!has_extension(extensions, "EGL_KHR_no_config_context")) {
+        static const EGLint config_attributes[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE, EGL_DONT_CARE, EGL_NONE };
+        EGLint count = 0;
+        if (!eglChooseConfig(browser->egl, config_attributes, &config, 1, &count) || count < 1) {
+            *error = g_strdup("No EGL config for an OpenGL ES 2 copy context");
+            return FALSE;
+        }
+    }
+    static const EGLint context_attributes[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    copy->context = eglCreateContext(browser->egl, config, EGL_NO_CONTEXT, context_attributes);
+    if (copy->context == EGL_NO_CONTEXT) {
+        *error = g_strdup_printf("eglCreateContext for the GPU copy failed: 0x%04x", eglGetError());
+        return FALSE;
+    }
+    SavedContext saved;
+    if (!copy_context_enter(browser, &saved)) {
+        *error = g_strdup_printf("eglMakeCurrent (surfaceless) for the GPU copy failed: 0x%04x", eglGetError());
+        return FALSE;
+    }
+    gboolean ok = FALSE;
+    const char *gl_extensions = (const char *)glGetString(GL_EXTENSIONS);
+    copy->has_external = has_extension(gl_extensions, "GL_OES_EGL_image_external");
+    if (!has_extension(gl_extensions, "GL_OES_EGL_image")) {
+        *error = g_strdup("GLES lacks GL_OES_EGL_image");
+        goto out;
+    }
+    if (!(copy->program_2d = compile_program(FALSE, error))) goto out;
+    if (copy->has_external) {
+        char *ignored = NULL;
+        copy->program_external = compile_program(TRUE, &ignored);
+        if (!copy->program_external) { g_warning("External-texture copy program unavailable: %s", ignored); copy->has_external = FALSE; }
+        g_free(ignored);
+    }
+    for (unsigned i = 0; i < SCANOUT_POOL_SIZE; i++)
+        if (!create_scanout_buffer(browser, &copy->pool[i], error)) goto out;
+    glFinish();
+    copy->imports = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_message("GPU copy ready: renderer=%s, %u contiguous %ux%u ARGB8888 KMS buffers (fb %u/%u/%u), modifiers=%s fence=%s",
+              (const char *)glGetString(GL_RENDERER), SCANOUT_POOL_SIZE, browser->ui_width, browser->ui_height,
+              copy->pool[0].fb, copy->pool[1].fb, copy->pool[2].fb, copy->has_modifiers ? "yes" : "no", copy->has_fence ? "yes" : "no");
+    ok = TRUE;
+out:
+    copy_context_leave(browser, &saved);
+    return ok;
+}
+
+static ImportedBuffer *import_texture(Browser *browser, struct wpe_view_backend_exportable_fdo_dmabuf_resource *resource, char **error)
+{
+    ImportedBuffer *import = g_hash_table_lookup(browser->copy.imports, resource->buffer_resource);
+    if (import) return import;
+    EGLint attributes[64];
+    if (!dmabuf_attributes(browser, attributes, resource->width, resource->height, resource->format, resource->n_planes,
+                           resource->fds, resource->strides, resource->offsets, resource->modifiers)) {
+        *error = g_strdup_printf("WPE buffer has modifier 0x%016" PRIx64 " but EGL lacks EGL_EXT_image_dma_buf_import_modifiers", resource->modifiers[0]);
+        return NULL;
+    }
+    EGLImageKHR image = create_image(browser->egl, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
+    if (image == EGL_NO_IMAGE_KHR) {
+        *error = g_strdup_printf("eglCreateImageKHR for the WPE buffer failed: 0x%04x (size=%ux%u format=0x%08x planes=%u modifier=0x%016" PRIx64 ")",
+                                 eglGetError(), resource->width, resource->height, resource->format, resource->n_planes, resource->modifiers[0]);
+        return NULL;
+    }
+    import = g_new0(ImportedBuffer, 1);
+    import->browser = browser;
+    import->resource = resource->buffer_resource;
+    import->image = image;
+    import->target = GL_TEXTURE_2D;
+    while (glGetError() != GL_NO_ERROR) {}
+    glGenTextures(1, &import->texture);
+    glBindTexture(GL_TEXTURE_2D, import->texture);
+    image_target_texture(GL_TEXTURE_2D, image);
+    if (glGetError() != GL_NO_ERROR) {
+        /* Some modifiers (YUV-like or external-only) can only be sampled externally. */
+        glDeleteTextures(1, &import->texture);
+        import->texture = 0;
+        if (browser->copy.has_external) {
+            import->target = GL_TEXTURE_EXTERNAL_OES;
+            glGenTextures(1, &import->texture);
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, import->texture);
+            image_target_texture(GL_TEXTURE_EXTERNAL_OES, image);
+        }
+        GLenum gl_error = glGetError();
+        if (!import->texture || gl_error != GL_NO_ERROR) {
+            *error = g_strdup_printf("Cannot bind the WPE buffer as a texture (GL error 0x%04x, modifier 0x%016" PRIx64 ")", gl_error, resource->modifiers[0]);
+            destroy_import(browser, import);
+            return NULL;
+        }
+    }
+    glTexParameteri(import->target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(import->target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(import->target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(import->target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    import->destroy.notify = import_destroyed;
+    wl_resource_add_destroy_listener(resource->buffer_resource, &import->destroy);
+    g_hash_table_insert(browser->copy.imports, import->resource, import);
+    g_debug("Imported WPE buffer %p as %s texture (%ux%u modifier 0x%016" PRIx64 ", %u cached)", (void *)import->resource,
+            import->target == GL_TEXTURE_2D ? "2D" : "external", resource->width, resource->height, resource->modifiers[0],
+            g_hash_table_size(browser->copy.imports));
+    return import;
+}
+
+static gboolean frame_uses(const Frame *frame, const ScanoutBuffer *buffer)
+{
+    return frame && frame->scanout == buffer;
+}
+
+/* Copies the WPE frame into a free contiguous buffer and returns the WPE buffer
+ * at once. Returns NULL after fail(). */
+static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fdo_dmabuf_resource *resource)
+{
+    GpuCopy *copy = &browser->copy;
+    ScanoutBuffer *target = NULL;
+    for (unsigned i = 0; i < SCANOUT_POOL_SIZE && !target; i++) {
+        ScanoutBuffer *buffer = &copy->pool[i];
+        if (!frame_uses(browser->current, buffer) && !frame_uses(browser->pending, buffer) && !frame_uses(browser->queued, buffer))
+            target = buffer;
+    }
+    /* All buffers busy: the queued frame was never submitted, so overwrite it. */
+    if (!target && browser->queued && browser->queued->scanout) target = browser->queued->scanout;
+    char *error = NULL;
+    SavedContext saved;
+    gint64 started = g_get_monotonic_time();
+    if (!target) error = g_strdup("no free scanout buffer");
+    else if (!copy_context_enter(browser, &saved)) error = g_strdup_printf("eglMakeCurrent failed: 0x%04x", eglGetError());
+    else {
+        ImportedBuffer *import = import_texture(browser, resource, &error);
+        if (import) {
+            static const GLfloat quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+            glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffer);
+            glViewport(0, 0, browser->ui_width, browser->ui_height);
+            glDisable(GL_BLEND);
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_DITHER);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glUseProgram(import->target == GL_TEXTURE_2D ? copy->program_2d : copy->program_external);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(import->target, import->texture);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+            glEnableVertexAttribArray(0);
+            /* Memory row 0 of the source lands on memory row 0 of the target:
+             * both images are top-down, so no flip is applied. */
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            GLenum gl_error = glGetError();
+            if (gl_error != GL_NO_ERROR) error = g_strdup_printf("GPU copy draw failed: GL error 0x%04x", gl_error);
+            /* KMS must not scan out a half-written buffer. */
+            EGLSyncKHR sync = copy->has_fence ? create_sync(browser->egl, EGL_SYNC_FENCE_KHR, NULL) : EGL_NO_SYNC_KHR;
+            if (sync != EGL_NO_SYNC_KHR) {
+                EGLint result = client_wait_sync(browser->egl, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 2000000000ull);
+                destroy_sync(browser->egl, sync);
+                if (result != EGL_CONDITION_SATISFIED_KHR && !error)
+                    error = g_strdup_printf("GPU copy fence wait failed: 0x%04x", result == EGL_FALSE ? eglGetError() : result);
+            } else glFinish();
+        }
+        copy_context_leave(browser, &saved);
+    }
+    /* The pixels are ours now (or the copy failed): hand the buffer straight back to WebKit. */
+    wpe_view_backend_exportable_fdo_dispatch_release_buffer(browser->exportable, resource->buffer_resource);
+    if (error) {
+        char *message = g_strdup_printf("GPU copy of the WPE frame into a contiguous scanout buffer failed: %s", error);
+        fail(browser, message);
+        g_free(message);
+        g_free(error);
+        return NULL;
+    }
+    copy->copied++;
+    copy->copy_us += g_get_monotonic_time() - started;
+    if (browser->queued && browser->queued->scanout == target) {
+        g_free(browser->queued);
+        browser->queued = NULL;
+    }
+    Frame *frame = g_new0(Frame, 1);
+    frame->scanout = target;
+    frame->fb = target->fb;
+    return frame;
+}
+
+static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dmabuf_resource *resource)
+{
+    Browser *browser = data;
+    Frame *frame = NULL;
+    if (!browser->copy_mode) {
+        char *reason = NULL;
+        frame = import_direct(browser, resource, &reason);
+        if (!frame) {
+            char *error = NULL;
+            g_message("Direct scanout of the WPE DMA-BUF is not possible (%s); switching permanently to GPU copy into contiguous KMS buffers", reason);
+            if (!setup_copy(browser, &error)) {
+                char *message = g_strdup_printf("Cannot scan out WPE DMA-BUF directly (%s) and the GPU-copy fallback could not be set up: %s", reason, error);
+                wpe_view_backend_exportable_fdo_dispatch_release_buffer(browser->exportable, resource->buffer_resource);
+                fail(browser, message);
+                g_free(message);
+                g_free(reason);
+                g_free(error);
+                return;
+            }
+            g_free(reason);
+            browser->copy_mode = TRUE;
+            write_status(browser);
+        }
+    }
+    if (!frame && !(frame = copy_frame(browser, resource))) return;
     if (browser->pending) {
         release_frame(browser, browser->queued);
         browser->queued = frame;
@@ -564,6 +1172,48 @@ static void process_terminated(WebKitWebView *view, WebKitWebProcessTerminationR
     g_free(message);
 }
 
+/* WebKit's bubblewrap sandbox device-binds only /dev/video0-2 and /dev/media0,
+ * and webkit_web_context_add_path_to_sandbox() rejects /dev paths (its binds
+ * are nodev as well). The image therefore installs signage-bwrap as
+ * /usr/bin/bwrap, which device-binds every V4L2/media node before running the
+ * real bwrap. Log what the web process will see so a missing decoder is
+ * diagnosable from the browser log.
+ *
+ * The holepunch sink also runs in the web process and needs the DRM broker
+ * socket; WebKit gives the sandbox an empty XDG_RUNTIME_DIR, so the broker's
+ * own directory is bound read-write. Must run before the first web process. */
+static void configure_sandbox(void)
+{
+    if (g_file_test(SIGNAGE_VIDEO_RUNTIME_DIR, G_FILE_TEST_IS_DIR)) {
+        webkit_web_context_add_path_to_sandbox(webkit_web_context_get_default(), SIGNAGE_VIDEO_RUNTIME_DIR, FALSE);
+        g_message("WebKit sandbox: bound %s (DRM broker socket, video status)", SIGNAGE_VIDEO_RUNTIME_DIR);
+    }
+
+    GString *nodes = g_string_new(NULL);
+    const char *dirs[] = { "/sys/bus/media/devices", "/sys/class/video4linux" };
+    for (size_t i = 0; i < G_N_ELEMENTS(dirs); i++) {
+        GDir *dir = g_dir_open(dirs[i], 0, NULL);
+        if (!dir) continue;
+        const char *name;
+        while ((name = g_dir_read_name(dir))) {
+            char *label_path = g_build_filename(dirs[i], name, i ? "name" : "model", NULL);
+            char *label = NULL;
+            if (g_file_get_contents(label_path, &label, NULL, NULL)) g_strstrip(label);
+            g_string_append_printf(nodes, " /dev/%s(%s)", name, label ? label : "?");
+            g_free(label);
+            g_free(label_path);
+        }
+        g_dir_close(dir);
+    }
+    gboolean shim = g_file_test("/usr/bin/bwrap.real", G_FILE_TEST_IS_EXECUTABLE);
+    if (shim)
+        g_message("WebKit sandbox: signage-bwrap device-binds V4L2 nodes:%s", nodes->len ? nodes->str : " none");
+    else
+        g_warning("WebKit sandbox: /usr/bin/bwrap is not the signage shim; only /dev/video0-2 and /dev/media0 reach the web process (present:%s)",
+                  nodes->len ? nodes->str : " none");
+    g_string_free(nodes, TRUE);
+}
+
 static gboolean initialize_webkit(Browser *browser)
 {
     const char *render_device = g_getenv("SIGNAGE_RENDER_DEVICE");
@@ -591,9 +1241,10 @@ static gboolean initialize_webkit(Browser *browser)
     static const struct wpe_view_backend_exportable_fdo_client client = {
         .export_buffer_resource = export_legacy, .export_dmabuf_resource = export_dmabuf, .export_shm_buffer = export_shm
     };
-    browser->exportable = wpe_view_backend_exportable_fdo_create(&client, browser, browser->mode.hdisplay, browser->mode.vdisplay);
+    browser->exportable = wpe_view_backend_exportable_fdo_create(&client, browser, browser->ui_width, browser->ui_height);
     if (!browser->exportable) { fail(browser, "Cannot create the WPE exportable backend"); return FALSE; }
     browser->backend = wpe_view_backend_exportable_fdo_get_view_backend(browser->exportable);
+    configure_sandbox();
     WebKitWebViewBackend *backend = webkit_web_view_backend_new(browser->backend, NULL, NULL);
     browser->view = webkit_web_view_new(backend);
     if (!browser->view) { fail(browser, "Cannot create the WebKit web view"); return FALSE; }
@@ -616,7 +1267,7 @@ static gboolean initialize_webkit(Browser *browser)
     wpe_view_backend_set_fullscreen_handler(browser->backend, fullscreen, browser);
     wpe_view_backend_add_activity_state(browser->backend, wpe_view_activity_state_visible | wpe_view_activity_state_focused | wpe_view_activity_state_in_window);
     wpe_view_backend_set_target_refresh_rate(browser->backend, mode_refresh(&browser->mode) * 1000);
-    browser->input = signage_input_start(browser->backend, browser->mode.hdisplay, browser->mode.vdisplay);
+    browser->input = signage_input_start(browser->backend, browser->ui_width, browser->ui_height);
     webkit_web_view_load_uri(browser->view, browser->uri);
     return TRUE;
 }
@@ -667,6 +1318,9 @@ static void cleanup(Browser *browser)
     release_frame(browser, browser->queued);
     release_frame(browser, browser->pending);
     release_frame(browser, browser->current);
+    browser->queued = browser->pending = browser->current = NULL;
+    /* Before the exportable: its buffers' destroy listeners point into the copy cache. */
+    destroy_copy(browser);
     if (browser->view) g_object_unref(browser->view);
     if (browser->exportable) wpe_view_backend_exportable_fdo_destroy(browser->exportable);
     if (browser->egl != EGL_NO_DISPLAY) eglTerminate(browser->egl);
@@ -691,13 +1345,16 @@ static void help(void)
          "SIGNAGE_DRM_CONNECTOR       Connector name (HDMI-A-1) or numeric ID\n"
          "SIGNAGE_DRM_PRIMARY_PLANE   Numeric ARGB8888 primary-plane ID\n"
          "SIGNAGE_DRM_MODE            WIDTHxHEIGHT[@REFRESH] (otherwise preferred connector mode)\n"
+         "SIGNAGE_UI_SIZE            WIDTHxHEIGHT of the web view, scaled to the mode by the primary plane\n"
+         "                            (default: mode size, or the largest <=1920x1080 size of the mode's aspect ratio)\n"
          "SIGNAGE_VIDEO_MODE          holepunch (default) or composited\n"
          "SIGNAGE_INPUT               0 disables native keyboard/pointer input\n"
          "SIGNAGE_INPUT_SEAT          udev input seat (default seat0)\n"
          "SIGNAGE_KEYBOARD_LAYOUT     XKB layout (default system/us)\n"
          "SIGNAGE_BROWSER_STATUS      Native JSON status path (default /run/admiral-signage/browser-status.json)\n"
          "WEBKIT_INSPECTOR_SERVER     Remote inspector listen address\n\n"
-         "Requires atomic DRM master, GBM EGL and ARGB8888 DMA-BUF scanout.\n"
+         "Requires atomic DRM master and GBM EGL. WPE DMA-BUF frames are scanned out directly when the\n"
+         "display can import them, otherwise GPU-copied into contiguous ARGB8888 KMS buffers.\n"
          "No window manager or Cog dependency. Native touchscreen input is not implemented.");
 }
 
@@ -709,7 +1366,7 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "--help")) { help(); return 0; }
     if (argc > 2 || (argc == 2 && argv[1][0] == '-')) { help(); return 2; }
-    Browser browser = { .fd = -1, .render_fd = -1, .egl = EGL_NO_DISPLAY, .uri = argc == 2 ? argv[1] : "http://127.0.0.1:8080/" };
+    Browser browser = { .fd = -1, .render_fd = -1, .egl = EGL_NO_DISPLAY, .copy = { .context = EGL_NO_CONTEXT }, .uri = argc == 2 ? argv[1] : "http://127.0.0.1:8080/" };
     browser.holepunch = signage_drm_holepunch_enabled();
     browser.handles = g_hash_table_new(g_direct_hash, g_direct_equal);
     browser.loop = g_main_loop_new(NULL, FALSE);
@@ -726,6 +1383,7 @@ int main(int argc, char **argv)
     if (browser.holepunch) {
         GError *error = NULL;
         if (!signage_drm_broker_start(browser.fd, browser.connector, browser.crtc, browser.crtc_index, browser.primary,
+                                     browser.ui_width, browser.ui_height,
                                      browser.mode.hdisplay, browser.mode.vdisplay, &error)) {
             browser.holepunch_error = g_strdup(error ? error->message : "DRM holepunch broker initialization failed");
             g_warning("Holepunch unavailable: %s; continuing the browser diagnostic screen", browser.holepunch_error);

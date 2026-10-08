@@ -19,7 +19,9 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-#define BROKER_DIR "/run/admiral-signage"
+/* Its own directory: the browser binds it into the WebKit sandbox, where the
+ * holepunch sink runs, without exposing the rest of the runtime directory. */
+#define BROKER_DIR SIGNAGE_VIDEO_RUNTIME_DIR
 #define BROKER_PATH BROKER_DIR "/drm.sock"
 
 typedef struct {
@@ -334,11 +336,12 @@ prepare_socket(GError **error)
 
 gboolean
 signage_drm_broker_start(int fd, guint connector_id, guint crtc_id,
-                       guint crtc_index, guint browser_plane_id, guint width, guint height, GError **error)
+                       guint crtc_index, guint browser_plane_id,
+                       guint ui_width, guint ui_height, guint mode_width, guint mode_height, GError **error)
 {
     if (!signage_drm_holepunch_enabled())
         return TRUE;
-    if (broker.service || fd < 0 || drmIsMaster(fd) != 1 || !width || !height) {
+    if (broker.service || fd < 0 || drmIsMaster(fd) != 1 || !ui_width || !ui_height || !mode_width || !mode_height) {
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Holepunch requires the browser's existing DRM master descriptor and valid mode dimensions");
         return FALSE;
     }
@@ -351,8 +354,9 @@ signage_drm_broker_start(int fd, guint connector_id, guint crtc_id,
         return FALSE;
     }
     broker.metadata = g_strdup_printf("{\"connector_id\":%u,\"crtc_id\":%u,\"crtc_index\":%u,"
-                                    "\"browser_plane_id\":%u,\"video_plane_id\":%u,\"width\":%u,\"height\":%u,\"blend_configured\":true}\n",
-                                    connector_id, crtc_id, crtc_index, browser_plane_id, video_id, width, height);
+                                    "\"browser_plane_id\":%u,\"video_plane_id\":%u,\"width\":%u,\"height\":%u,\"mode_width\":%u,\"mode_height\":%u,\"ui_width\":%u,\"ui_height\":%u,\"blend_configured\":true}\n",
+                                    connector_id, crtc_id, crtc_index, browser_plane_id, video_id, mode_width, mode_height,
+                                    mode_width, mode_height, ui_width, ui_height);
     broker.service = g_socket_service_new();
     g_autoptr(GSocketAddress) address = g_unix_socket_address_new(BROKER_PATH);
     /* Bind with owner-only access from the outset, before starting service. */

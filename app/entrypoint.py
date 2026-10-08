@@ -1,13 +1,75 @@
 """Supervise the browser and diagnostics for Admiral's root-process contract."""
+import hashlib
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 from urllib.request import urlopen
-from diagnostics import APP_ROOT, RUNTIME, snapshot
+from diagnostics import APP_ROOT, RUNTIME, VIDEO_RUNTIME, snapshot
+
+# Stateless V4L2 decoders cedrus exposes; SIGNAGE_DECODER takes a comma-separated subset.
+HARDWARE_DECODERS = ("v4l2slh264dec", "v4l2slh265dec", "v4l2slvp9dec")
+SOFTWARE_DECODER = "avdec_h264"
+DISABLED_DECODERS = ("openh264dec", "v4l2h264dec")
+
+
+def decoder_config(environ):
+    """Return (SIGNAGE_DECODER, GST_PLUGIN_FEATURE_RANK) for the environment."""
+    software = environ.get("SIGNAGE_ALLOW_SOFTWARE", "0") == "1"
+    default = SOFTWARE_DECODER if software else ",".join(HARDWARE_DECODERS)
+    decoder = environ.get("SIGNAGE_DECODER") or default
+    listed = [name.strip() for name in decoder.split(",")]
+    unknown = [name for name in listed if name not in HARDWARE_DECODERS + (SOFTWARE_DECODER,)]
+    if unknown:
+        raise ValueError(f"Unsupported SIGNAGE_DECODER entries: {', '.join(unknown)}")
+    if SOFTWARE_DECODER in listed and not software:
+        raise ValueError("Software decoder requires SIGNAGE_ALLOW_SOFTWARE=1")
+    ranks = {name: 512 for name in listed}
+    for name in HARDWARE_DECODERS:
+        ranks.setdefault(name, 0)
+    ranks.setdefault(SOFTWARE_DECODER, 256 if software else 0)
+    for name in DISABLED_DECODERS:
+        ranks.setdefault(name, 0)
+    return decoder, ",".join(f"{name}:{rank}" for name, rank in ranks.items())
+
+
+def writable_dir(*candidates):
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / f".write-test-{os.getpid()}"
+            probe.touch()
+            probe.unlink()
+            return candidate
+        except OSError:
+            continue
+    raise OSError("No writable cache directory")
+
+
+def configure_caches(data):
+    """Keep fontconfig and the GStreamer registry in a writable, persistent place.
+
+    An unwritable HOME makes every GStreamer process rescan all plugins (~14 s)
+    and fontconfig warn about a missing cache.
+    """
+    cache = writable_dir(data / "cache", Path("/tmp/admiral-signage-cache"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(cache))
+    if "GST_REGISTRY" not in os.environ:
+        # v4l2codecs discovers factories from devices when the plugin loads, so a
+        # registry is only valid for the kernel and V4L2/media nodes that built it.
+        nodes = sorted(str(path) for pattern in ("video*", "media*") for path in Path("/dev").glob(pattern))
+        key = hashlib.sha1("\n".join([platform.release(), *nodes]).encode()).hexdigest()[:12]
+        registry = cache / "gstreamer-1.0" / f"registry-{key}.bin"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        for stale in registry.parent.glob("registry-*.bin*"):
+            if not stale.name.startswith(registry.name):
+                stale.unlink(missing_ok=True)
+        os.environ["GST_REGISTRY"] = str(registry)
+    return cache
 
 
 def configure():
@@ -17,12 +79,12 @@ def configure():
     for name in ("logs", "media", "www"):
         (data / name).mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("GST_DEBUG_DUMP_DOT_DIR", str(data / "logs"))
-    # v4l2codecs discovers factories from devices when the plugin loads. Don't
-    # reuse a registry produced before a BSP update exposed the stateless nodes.
-    os.environ.setdefault("GST_REGISTRY", str(RUNTIME / "gstreamer-registry.bin"))
-    Path(os.environ["GST_REGISTRY"]).unlink(missing_ok=True)
-    for name in ("video-status.json", "drm-status.json", "browser-status.json"):
+    configure_caches(data)
+    VIDEO_RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    VIDEO_RUNTIME.chmod(0o700)
+    for name in ("drm-status.json", "browser-status.json"):
         (RUNTIME / name).unlink(missing_ok=True)
+    (VIDEO_RUNTIME / "video-status.json").unlink(missing_ok=True)
     mode = os.environ.get("SIGNAGE_VIDEO_MODE", "holepunch")
     if mode not in ("holepunch", "composited"):
         raise ValueError("SIGNAGE_VIDEO_MODE must be holepunch or composited")
@@ -33,16 +95,8 @@ def configure():
     else:
         os.environ.pop("WEBKIT_GST_HOLE_PUNCH_QUIRK", None)
         os.environ.pop("WEBKIT_GST_QUIRKS", None)
-    software = os.environ.get("SIGNAGE_ALLOW_SOFTWARE", "0") == "1"
-    decoder = os.environ.get("SIGNAGE_DECODER", "avdec_h264" if software else "v4l2slh264dec")
+    decoder, ranks = decoder_config(os.environ)
     os.environ.setdefault("SIGNAGE_DECODER", decoder)
-    ranks = "v4l2slh264dec:512,avdec_h264:0,openh264dec:0,v4l2h264dec:0"
-    if software:
-        ranks = "v4l2slh264dec:512,avdec_h264:256,openh264dec:0,v4l2h264dec:0"
-    if decoder == "avdec_h264":
-        if not software:
-            raise ValueError("Software decoder requires SIGNAGE_ALLOW_SOFTWARE=1")
-        ranks = "v4l2slh264dec:0,avdec_h264:512,openh264dec:0,v4l2h264dec:0"
     os.environ.setdefault("GST_PLUGIN_FEATURE_RANK", ranks)
     os.environ.setdefault("SIGNAGE_URL", f"http://127.0.0.1:{os.environ.get('SIGNAGE_HTTP_PORT', '8080')}/")
     return data

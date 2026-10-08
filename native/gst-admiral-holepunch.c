@@ -20,13 +20,21 @@
 #include <unistd.h>
 
 #define PACKAGE "admiral-signage"
-#define RUN_DIR "/run/admiral-signage"
+/* Must match SIGNAGE_VIDEO_RUNTIME_DIR in drm-broker.h: the browser binds this
+ * directory into the WebKit sandbox, where this sink runs. */
+#define RUN_DIR "/run/admiral-signage/video"
 #define BROKER_PATH RUN_DIR "/drm.sock"
 #define STATUS_PATH RUN_DIR "/video-status.json"
+/* Stateless V4L2 decoders; SIGNAGE_DECODER takes a comma-separated subset. */
+#define DEFAULT_DECODERS "v4l2slh264dec,v4l2slh265dec,v4l2slvp9dec"
+/* kmssink scans out linear NV12 only. Cedrus can also emit tiled NV12_32L32, which
+ * the display shows as garbage, so force the decoder to negotiate linear NV12. */
+#define LINEAR_NV12_CAPS "video/x-raw, format=(string)NV12; " \
+    "video/x-raw(memory:DMABuf), format=(string)DMA_DRM, drm-format=(string)NV12"
 
 typedef struct {
     GstBin parent;
-    GstElement *kms;
+    GstElement *kms, *filter;
     GstPad *ghost;
     GstElement *pipeline;
     gulong element_handler;
@@ -36,6 +44,8 @@ typedef struct {
     gint fd, lock_fd;
     gint connector_id, crtc_id, browser_plane_id, video_plane_id;
     gint x, y, width, height, decoded_width, decoded_height;
+    gint ui_width, ui_height, mode_width, mode_height;
+    gint render_x, render_y, render_width, render_height;
     gboolean blend_configured, failed, decoder_verified, dmabuf_seen;
     gboolean immediate_output;
     gfloat zorder;
@@ -73,6 +83,10 @@ write_status(AdmiralSink *self, gboolean force)
     STRING_FIELD("error", self->error);
     INT_FIELD("position_x", self->x); INT_FIELD("position_y", self->y);
     INT_FIELD("width", self->width); INT_FIELD("height", self->height);
+    INT_FIELD("ui_width", self->ui_width); INT_FIELD("ui_height", self->ui_height);
+    INT_FIELD("mode_width", self->mode_width); INT_FIELD("mode_height", self->mode_height);
+    INT_FIELD("render_x", self->render_x); INT_FIELD("render_y", self->render_y);
+    INT_FIELD("render_width", self->render_width); INT_FIELD("render_height", self->render_height);
     INT_FIELD("decoded_width", self->decoded_width); INT_FIELD("decoded_height", self->decoded_height);
     INT_FIELD("decoded_frames", self->decoded_frames); INT_FIELD("sink_input_frames", self->input_frames);
     INT_FIELD("pid", getpid()); INT_FIELD("updated_at_unix_ms", g_get_real_time() / 1000);
@@ -81,7 +95,7 @@ write_status(AdmiralSink *self, gboolean force)
     BOOL_FIELD("dmabuf_seen", self->dmabuf_seen);
     json_builder_set_member_name(b, "hardware_decode"); json_builder_begin_object(b);
     BOOL_FIELD("verified", self->decoder_verified && !self->failed &&
-               g_strcmp0(self->state, "playing") == 0 && g_strcmp0(self->decoder, "v4l2slh264dec") == 0);
+               g_strcmp0(self->state, "playing") == 0 && self->decoder && g_str_has_prefix(self->decoder, "v4l2sl"));
     STRING_FIELD("evidence", "Allowed decoder output buffer observed; this does not attest display scanout");
     json_builder_end_object(b);
     json_builder_set_member_name(b, "holepunch"); json_builder_begin_object(b);
@@ -95,6 +109,7 @@ write_status(AdmiralSink *self, gboolean force)
     json_generator_set_root(g, node);
     gsize size;
     gchar *data = json_generator_to_data(g, &size);
+    g_mkdir_with_parents(RUN_DIR, 0700);
     gchar *temp = g_strdup_printf(STATUS_PATH ".%ld.%p.tmp", (long)getpid(), (void *)self);
     if (g_file_set_contents(temp, data, (gssize)size, NULL)) {
         if (rename(temp, STATUS_PATH) != 0)
@@ -174,7 +189,18 @@ get_drm_fd(AdmiralSink *self)
             self->browser_plane_id = (gint)json_object_get_int_member(obj, "browser_plane_id");
             self->video_plane_id = (gint)json_object_get_int_member(obj, "video_plane_id");
             self->blend_configured = json_object_get_boolean_member(obj, "blend_configured");
-            ok = self->blend_configured && self->video_plane_id > 0 && self->browser_plane_id != self->video_plane_id;
+            /* Older brokers send neither size: treat the UI as mode-sized. */
+            self->ui_width = self->mode_width = self->ui_height = self->mode_height = 0;
+            if (json_object_has_member(obj, "ui_width") && json_object_has_member(obj, "ui_height") &&
+                json_object_has_member(obj, "mode_width") && json_object_has_member(obj, "mode_height")) {
+                self->ui_width = (gint)json_object_get_int_member(obj, "ui_width");
+                self->ui_height = (gint)json_object_get_int_member(obj, "ui_height");
+                self->mode_width = (gint)json_object_get_int_member(obj, "mode_width");
+                self->mode_height = (gint)json_object_get_int_member(obj, "mode_height");
+            }
+            ok = self->blend_configured && self->video_plane_id > 0 && self->browser_plane_id != self->video_plane_id &&
+                 ((self->ui_width > 0 && self->ui_height > 0 && self->mode_width > 0 && self->mode_height > 0) ||
+                  (!self->ui_width && !self->ui_height && !self->mode_width && !self->mode_height));
         }
     } else
         ok = FALSE;
@@ -192,6 +218,60 @@ get_drm_fd(AdmiralSink *self)
     return TRUE;
 }
 
+/* floor(value * numerator / denominator) for a positive denominator. */
+static gint
+scale_floor(gint64 value, gint64 numerator, gint64 denominator)
+{
+    gint64 product = value * numerator;
+    gint64 result = product / denominator;
+    if (product % denominator < 0) result--;
+    return (gint)result;
+}
+
+/* WebKit reports the video rectangle in web-view (UI) pixels but the NV12 overlay
+ * lives in CRTC (mode) pixels. Scale it, rounding outward to even pixels so the
+ * subsampled NV12 plane covers the whole holepunch. Called with the lock held. */
+static void
+compute_render_rectangle(AdmiralSink *self)
+{
+    gint x = self->x, y = self->y, width = MAX(1, self->width), height = MAX(1, self->height);
+    if (self->ui_width > 0 && self->ui_height > 0 && self->mode_width > 0 && self->mode_height > 0 &&
+        (self->ui_width != self->mode_width || self->ui_height != self->mode_height)) {
+        gint x0 = scale_floor(self->x, self->mode_width, self->ui_width);
+        gint y0 = scale_floor(self->y, self->mode_height, self->ui_height);
+        gint x1 = scale_floor((gint64)self->x + width, self->mode_width, self->ui_width);
+        gint y1 = scale_floor((gint64)self->y + height, self->mode_height, self->ui_height);
+        if ((gint64)(self->x + width) * self->mode_width % self->ui_width) x1++;
+        if ((gint64)(self->y + height) * self->mode_height % self->ui_height) y1++;
+        x0 &= ~1; y0 &= ~1;
+        x1 = (x1 + 1) & ~1; y1 = (y1 + 1) & ~1;
+        x = x0; y = y0; width = MAX(2, x1 - x0); height = MAX(2, y1 - y0);
+    }
+    self->render_x = x; self->render_y = y; self->render_width = width; self->render_height = height;
+}
+
+/* Called with the lock held. */
+static void
+apply_render_rectangle(AdmiralSink *self)
+{
+    compute_render_rectangle(self);
+    if (self->kms)
+        gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(self->kms), self->render_x, self->render_y,
+                                               self->render_width, self->render_height);
+}
+
+/* Is name in the comma-separated SIGNAGE_DECODER list? */
+static gboolean
+decoder_listed(const gchar *list, const gchar *name)
+{
+    gchar **items = g_strsplit(list, ",", -1);
+    gboolean found = FALSE;
+    for (gchar **item = items; *item && !found; item++)
+        found = strcmp(g_strstrip(*item), name) == 0;
+    g_strfreev(items);
+    return found;
+}
+
 static GstPadProbeReturn
 decoder_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer data)
 {
@@ -202,9 +282,9 @@ decoder_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer data)
     GstElementFactory *factory = decoder ? gst_element_get_factory(decoder) : NULL;
     const gchar *name = factory ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)) : "unknown";
     const gchar *allowed = g_getenv("SIGNAGE_DECODER");
-    if (!allowed || !*allowed) allowed = "v4l2slh264dec";
-    if (g_strcmp0(name, allowed) != 0) {
-        gchar *error = g_strdup_printf("Decoder %s is forbidden; expected %s", name, allowed);
+    if (!allowed || !*allowed) allowed = DEFAULT_DECODERS;
+    if (!decoder_listed(allowed, name)) {
+        gchar *error = g_strdup_printf("Decoder %s is forbidden; expected one of %s", name, allowed);
         fail_sink(self, error); g_free(error);
         if (decoder) gst_object_unref(decoder);
         return GST_PAD_PROBE_DROP;
@@ -342,9 +422,14 @@ create_kms_child(AdmiralSink *self)
 {
     self->kms = gst_element_factory_make("kmssink", "admiral-video-plane");
     if (!self->kms) return FALSE;
-    gst_bin_add(GST_BIN(self), self->kms);
+    self->filter = gst_element_factory_make("capsfilter", "admiral-video-caps");
+    if (!self->filter) { gst_object_unref(self->kms); self->kms = NULL; return FALSE; }
+    gst_bin_add_many(GST_BIN(self), self->filter, self->kms, NULL);
+    if (!gst_element_link(self->filter, self->kms)) return FALSE;
     GstPad *pad = gst_element_get_static_pad(self->kms, "sink");
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, sink_buffer, self, NULL);
+    gst_object_unref(pad);
+    pad = gst_element_get_static_pad(self->filter, "sink");
     if (self->ghost)
         gst_ghost_pad_set_target(GST_GHOST_PAD(self->ghost), pad);
     else {
@@ -387,7 +472,9 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
         if (self->kms) {
             gst_element_set_state(self->kms, GST_STATE_NULL);
             gst_ghost_pad_set_target(GST_GHOST_PAD(self->ghost), NULL);
-            gst_bin_remove(GST_BIN(self), self->kms); self->kms = NULL;
+            gst_element_set_state(self->filter, GST_STATE_NULL);
+            gst_bin_remove(GST_BIN(self), self->filter);
+            gst_bin_remove(GST_BIN(self), self->kms); self->kms = self->filter = NULL;
         }
         release_resources(self);
         g_mutex_lock(&self->lock);
@@ -406,12 +493,28 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
             fail_sink(self, "Cannot create kmssink for a new video playback attempt"); return GST_STATE_CHANGE_FAILURE;
         }
         const gchar *allowed = g_getenv("SIGNAGE_DECODER");
-        if (!allowed || !*allowed) allowed = "v4l2slh264dec";
-        if (strcmp(allowed, "v4l2slh264dec") && strcmp(allowed, "avdec_h264")) {
-            fail_sink(self, "SIGNAGE_DECODER must be v4l2slh264dec or avdec_h264"); return GST_STATE_CHANGE_FAILURE;
+        if (!allowed || !*allowed) allowed = DEFAULT_DECODERS;
+        static const gchar *const known[] = { "v4l2slh264dec", "v4l2slh265dec", "v4l2slvp9dec", "avdec_h264", NULL };
+        gchar **requested = g_strsplit(allowed, ",", -1);
+        gboolean valid_list = *requested != NULL, software = FALSE, hardware = FALSE;
+        for (gchar **item = requested; *item; item++) {
+            g_strstrip(*item);
+            gboolean is_known = FALSE;
+            for (const gchar *const *k = known; *k; k++) is_known |= strcmp(*item, *k) == 0;
+            valid_list &= is_known;
+            if (strcmp(*item, "avdec_h264") == 0) software = TRUE; else hardware = TRUE;
         }
-        if (strcmp(allowed, "avdec_h264") == 0 && g_strcmp0(g_getenv("SIGNAGE_ALLOW_SOFTWARE"), "1") != 0) {
+        g_strfreev(requested);
+        if (!valid_list) {
+            fail_sink(self, "SIGNAGE_DECODER must list v4l2slh264dec, v4l2slh265dec, v4l2slvp9dec or avdec_h264"); return GST_STATE_CHANGE_FAILURE;
+        }
+        if (software && g_strcmp0(g_getenv("SIGNAGE_ALLOW_SOFTWARE"), "1") != 0) {
             fail_sink(self, "avdec_h264 comparison requires SIGNAGE_ALLOW_SOFTWARE=1"); return GST_STATE_CHANGE_FAILURE;
+        }
+        if (hardware) {
+            GstCaps *linear = gst_caps_from_string(LINEAR_NV12_CAPS);
+            g_object_set(self->filter, "caps", linear, NULL);
+            gst_caps_unref(linear);
         }
         self->lock_fd = open(RUN_DIR "/video.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
         if (self->lock_fd < 0 || flock(self->lock_fd, LOCK_EX | LOCK_NB) < 0) {
@@ -423,18 +526,24 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
         if (!get_drm_fd(self)) {
             fail_sink(self, "DRM broker unavailable, browser CRTC inactive, or valid overlay/alpha configuration missing"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
         }
-        GstElementFactory *selected = gst_element_factory_find(allowed);
-        if (!selected) {
-            gchar *error = g_strdup_printf("%s unavailable: expose V4L2 video/media devices before GStreamer scans", allowed);
+        gboolean any_available = FALSE;
+        gchar **names = g_strsplit(allowed, ",", -1);
+        for (gchar **name = names; *name; name++) {
+            GstElementFactory *selected = gst_element_factory_find(g_strstrip(*name));
+            any_available |= selected != NULL;
+            if (selected) gst_object_unref(selected);
+        }
+        g_strfreev(names);
+        if (!any_available) {
+            gchar *error = g_strdup_printf("None of %s is available: expose V4L2 video/media devices before GStreamer scans", allowed);
             fail_sink(self, error); g_free(error); release_resources(self); return GST_STATE_CHANGE_FAILURE;
         }
-        gst_object_unref(selected);
         /* Disable all other video decoder factories, including unexpected software fallbacks. */
         GList *decoders = gst_element_factory_list_get_elements(GST_ELEMENT_FACTORY_TYPE_DECODER |
                           GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO, GST_RANK_NONE);
         for (GList *l = decoders; l; l = l->next) {
             GstPluginFeature *feature = l->data;
-            gst_plugin_feature_set_rank(feature, strcmp(gst_plugin_feature_get_name(feature), allowed) == 0 ? 512 : GST_RANK_NONE);
+            gst_plugin_feature_set_rank(feature, decoder_listed(allowed, gst_plugin_feature_get_name(feature)) ? 512 : GST_RANK_NONE);
         }
         gst_plugin_feature_list_free(decoders);
         g_object_set(self->kms, "fd", self->fd, "connector-id", self->connector_id,
@@ -448,8 +557,9 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
         }
         /* Only the browser consumes DRM events on this shared open file.
          * BaseSink sync still schedules frames against the media clock. */
-        gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(self->kms), self->x, self->y,
-                                               MAX(1, self->width), MAX(1, self->height));
+        g_mutex_lock(&self->lock);
+        apply_render_rectangle(self);
+        g_mutex_unlock(&self->lock);
         watch_pipeline(self);
     }
     GstStateChangeReturn result = GST_ELEMENT_CLASS(admiral_sink_parent_class)->change_state(element, transition);
@@ -490,8 +600,8 @@ admiral_sink_set_property(GObject *object, guint property, const GValue *value, 
         }
         g_mutex_lock(&self->lock);
         self->x = x; self->y = y; self->width = width; self->height = height;
-        if (self->kms && width > 0 && height > 0)
-            gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(self->kms), x, y, width, height);
+        if (width > 0 && height > 0)
+            apply_render_rectangle(self);
         write_status(self, FALSE);
         g_mutex_unlock(&self->lock);
     } else if (property == PROP_ZORDER) self->zorder = g_value_get_float(value);
@@ -542,7 +652,7 @@ admiral_sink_class_init(AdmiralSinkClass *klass)
         "Experimental Westeros ABI adapter to a shared DRM kmssink", "Admiral");
     gst_element_class_add_static_pad_template(element, &sink_template);
     g_object_class_install_property(object, PROP_RECTANGLE, g_param_spec_string("rectangle", "Rectangle",
-        "WPE holepunch x,y,width,height in physical display pixels", "0,0,1,1", G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+        "WPE holepunch x,y,width,height in web-view (UI) pixels; scaled to display pixels for the video plane", "0,0,1,1", G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
     g_object_class_install_property(object, PROP_ZORDER, g_param_spec_float("zorder", "Z order",
         "Compatibility property; validated plane order is set by the browser broker", -G_MAXFLOAT, G_MAXFLOAT, 0,
         G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
