@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+native/*.so
+native/*.o
+browser/signage-browser
+output/
+*.oci.tar
+*.env

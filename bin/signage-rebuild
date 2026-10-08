@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+make -C /opt/signage/src/native clean all install
+make -C /opt/signage/src/browser clean all install
+ldconfig
+echo 'Rebuilt adapter and browser. Restart the workload to load the updated libraries.'

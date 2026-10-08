@@ -1,0 +1,24 @@
+# Development on a dedicated Linux T527 board. Requires sole ownership of display.
+services:
+  signage:
+    image: admiral-signage:dev
+    build: .
+    platform: linux/arm64
+    privileged: true
+    network_mode: host
+    shm_size: 512m
+    environment:
+      SIGNAGE_HTTP_HOST: 0.0.0.0
+      SIGNAGE_VIDEO_MODE: ${SIGNAGE_VIDEO_MODE:-holepunch}
+      SIGNAGE_ALLOW_SOFTWARE: ${SIGNAGE_ALLOW_SOFTWARE:-0}
+      SIGNAGE_DRM_DEVICE: ${SIGNAGE_DRM_DEVICE:-}
+      SIGNAGE_RENDER_DEVICE: ${SIGNAGE_RENDER_DEVICE:-}
+      SIGNAGE_VIDEO_PLANE_ID: ${SIGNAGE_VIDEO_PLANE_ID:-}
+    volumes:
+      - /dev:/dev
+      - /run/udev:/run/udev:ro
+      - ./output/data:/var/lib/admiral-signage
+      - ./www:/opt/signage/www:ro
+      - ./app:/opt/signage/app:ro
+      - ./native:/opt/signage/src/native
+      - ./browser:/opt/signage/src/browser

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Admiral · Display Lab</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="app">
+    <header class="masthead">
+      <div class="identity"><span class="mark" aria-hidden="true">A</span><div><p class="eyebrow">ADMIRAL / DEVELOPMENT WORKLOAD</p><h1>Display Lab<span class="title-dot">.</span></h1></div></div>
+      <div class="target"><span class="live-dot"></span><div><strong>Orange Pi 4A</strong><span>Allwinner T527 · DE35 · WPE WebKit</span></div><time id="clock">—</time></div>
+    </header>
+
+    <section class="summary" aria-label="Live capability summary">
+      <article class="summary-card"><span class="card-index">01 / BROWSER</span><div class="summary-row"><h2 id="browser-state">Starting</h2><span id="browser-dot" class="status-dot pending"></span></div><p id="browser-detail">Connecting to workload diagnostics</p></article>
+      <article class="summary-card"><span class="card-index">02 / GPU RENDERING</span><div class="summary-row"><h2 id="gpu-state">Checking WebGL</h2><span id="gpu-dot" class="status-dot pending"></span></div><p id="gpu-detail">Animated scene exercises the active renderer</p></article>
+      <article class="summary-card"><span class="card-index">03 / VIDEO DECODE</span><div class="summary-row"><h2 id="decode-state">Unverified</h2><span id="decode-dot" class="status-dot pending"></span></div><p id="decode-detail">Native decoder evidence is required</p></article>
+      <article class="summary-card"><span class="card-index">04 / VIDEO PLANE</span><div class="summary-row"><h2 id="plane-state">Unverified</h2><span id="plane-dot" class="status-dot pending"></span></div><p id="plane-detail">Holepunch / KMS plane evidence is required</p></article>
+    </section>
+
+    <section class="workspace" aria-label="Video and graphics experiments">
+      <article class="panel video-panel">
+        <div class="panel-heading"><div><p class="eyebrow">MEDIA / OVERLAY EXPERIMENT</p><h2>Video surface</h2></div><span id="video-mode" class="pill">Loading config</span></div>
+        <div id="video-stage" class="video-stage">
+          <div class="stage-guide guide-top">DISPLAY COORDINATES</div><div class="stage-guide guide-bottom">MOVE THE SURFACE TO TEST PLANE PLACEMENT</div>
+          <video id="video" autoplay muted loop playsinline preload="auto" aria-label="H.264 test video"></video>
+          <div id="video-message" class="video-message" aria-live="polite">Loading test video…</div>
+        </div>
+        <div class="video-controls">
+          <div class="control-group"><label for="video-size">Surface size</label><select id="video-size"><option value="320x180">320 × 180</option><option value="480x270" selected>480 × 270</option><option value="640x360">640 × 360</option><option value="stage">Fill stage</option></select></div>
+          <div class="control-group position-control"><label for="video-x">Position X <output id="video-x-value">24</output></label><input id="video-x" type="range" min="0" max="400" value="24" step="1"></div>
+          <div class="control-group position-control"><label for="video-y">Position Y <output id="video-y-value">32</output></label><input id="video-y" type="range" min="0" max="200" value="32" step="1"></div>
+          <button id="play-toggle" class="button compact" type="button">Pause</button><button id="video-fullscreen" class="button compact" type="button">Fullscreen</button>
+        </div>
+        <div class="playback-grid"><div><span>PLAYBACK</span><strong id="video-playback">Waiting</strong></div><div><span>STREAM SIZE</span><strong id="video-resolution">—</strong></div><div><span>FRAME DROPS</span><strong id="video-drops">—</strong></div><div><span>ON-SCREEN RECT</span><strong id="video-rectangle">—</strong></div></div>
+        <div class="media-source"><label for="media-url">Media URL</label><div><input id="media-url" type="text" spellcheck="false" value="/media/test-h264.mp4" aria-label="Media URL"><button id="load-media" class="button" type="button">Load</button></div><p id="media-capabilities">Checking browser decoding hints…</p></div>
+      </article>
+
+      <article class="panel graphics-panel">
+        <div class="panel-heading"><div><p class="eyebrow">WEBGL / CONTINUOUS RENDER</p><h2>3D render test</h2></div><span id="fps" class="pill accent">— FPS</span></div>
+        <div class="graphics-stage"><canvas id="gl-canvas" aria-label="Animated WebGL cube"></canvas><div class="scene-label"><span class="scene-line"></span><span>LIVE GPU SCENE</span></div><div id="webgl-error" class="webgl-error" hidden></div></div>
+        <dl class="renderer-details"><div><dt>Renderer</dt><dd id="gl-renderer">Checking…</dd></div><div><dt>Vendor</dt><dd id="gl-vendor">—</dd></div><div><dt>API / shading language</dt><dd id="gl-version">—</dd></div><div><dt>Acceleration signal</dt><dd id="gl-acceleration">Unverified</dd></div></dl>
+        <details class="small-details"><summary>WebGL extensions <span id="extension-count">0</span></summary><div id="gl-extensions" class="extensions"></div></details>
+      </article>
+    </section>
+
+    <section class="diagnostics panel" aria-label="Native diagnostics">
+      <div class="panel-heading"><div><p class="eyebrow">SYSTEM / LIVE EVIDENCE</p><h2>Native diagnostics</h2></div><div class="diagnostic-tools"><span id="backend-state" class="muted">Connecting…</span><button id="refresh-status" class="button compact" type="button">Refresh</button></div></div>
+      <div class="native-grid"><div><span>GPU DEVICES</span><p id="gpu-nodes">Waiting for diagnostics</p></div><div><span>VIDEO DEVICES</span><p id="video-nodes">Waiting for diagnostics</p></div><div><span>RUNTIME</span><p id="runtime-detail">—</p></div><div><span>DECODE EVIDENCE</span><p id="decode-evidence">No verified native evidence yet</p></div></div>
+      <details class="raw-details"><summary>Inspect diagnostic data <span>Browser + workload JSON</span></summary><pre id="diagnostic-json">{}</pre></details>
+    </section>
+    <footer><span>ADMIRAL DISPLAY LAB</span><p>Playback and WebGL activity are observable. Hardware decode and holepunch remain unverified until native evidence confirms them.</p><span id="status-updated">—</span></footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,10 @@
+.git
+.github
+output
+__pycache__
+*.pyc
+*.oci.tar
+native/*.so
+native/*.o
+browser/signage-browser
+tests
