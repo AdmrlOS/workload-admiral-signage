@@ -9,6 +9,8 @@ from pathlib import Path
 
 APP_ROOT = Path(os.environ.get("SIGNAGE_APP_ROOT", "/opt/signage"))
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/run/admiral-signage"))
+# Fixed path shared with the sandboxed web process (SIGNAGE_VIDEO_RUNTIME_DIR in native/drm-broker.h).
+VIDEO_RUNTIME = Path("/run/admiral-signage/video")
 
 
 def command(args, timeout=8):
@@ -39,7 +41,7 @@ def device_nodes(patterns):
 
 
 def snapshot(probe=False):
-    native = read_json(RUNTIME / "video-status.json")
+    native = read_json(VIDEO_RUNTIME / "video-status.json")
     broker = read_json(RUNTIME / "drm-status.json")
     browser = read_json(RUNTIME / "browser-status.json")
     if browser.get("holepunch_error"):
@@ -74,7 +76,7 @@ def snapshot(probe=False):
         "input": read_json(RUNTIME / "input-status.json"),
         "runtime": {name: os.environ.get(name) for name in (
             "SIGNAGE_VIDEO_MODE", "SIGNAGE_ALLOW_SOFTWARE", "SIGNAGE_DECODER",
-            "SIGNAGE_VIDEO_PLANE_ID", "SIGNAGE_DRM_DEVICE", "SIGNAGE_RENDER_DEVICE", "SIGNAGE_DRM_MODE",
+            "SIGNAGE_VIDEO_PLANE_ID", "SIGNAGE_DRM_DEVICE", "SIGNAGE_RENDER_DEVICE", "SIGNAGE_DRM_MODE", "SIGNAGE_UI_SIZE", "PAN_MESA_DEBUG", "XDG_CACHE_HOME", "GST_REGISTRY",
             "WEBKIT_GST_HOLE_PUNCH_QUIRK",
             "WEBKIT_GST_QUIRKS", "GST_PLUGIN_FEATURE_RANK", "GST_DEBUG", "GST_DEBUG_DUMP_DOT_DIR")},
         "versions": command(["dpkg-query", "-W", "-f=${Package} ${Version}\n", "libwpewebkit-2.0-1",
@@ -86,6 +88,7 @@ def snapshot(probe=False):
             "egl": command(["eglinfo", "-B", "-p", "surfaceless"]),
             "v4l2": command(["v4l2-ctl", "--list-devices"]),
             "stateless_h264": command(["gst-inspect-1.0", "v4l2slh264dec"]),
+            "stateless_h265": command(["gst-inspect-1.0", "v4l2slh265dec"]),
             "adapter": command(["gst-inspect-1.0", "westerossink"]),
             "kms": command(["drm_info"]),
         }

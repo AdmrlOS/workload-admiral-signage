@@ -33,6 +33,11 @@ COPY native/ /opt/signage/src/native/
 COPY browser/ /opt/signage/src/browser/
 RUN make -C /opt/signage/src/native && make -C /opt/signage/src/native install && \
     make -C /opt/signage/src/browser && make -C /opt/signage/src/browser install && ldconfig
+# WebKit's sandbox device-binds only /dev/video0-2 and /dev/media0; the shim adds every
+# V4L2/media node so v4l2codecs finds the stateless decoder wherever the kernel numbered it.
+RUN test -x /usr/bin/bwrap && \
+    dpkg-divert --local --rename --divert /usr/bin/bwrap.real --add /usr/bin/bwrap && \
+    install -m 0755 /usr/local/libexec/signage/signage-bwrap /usr/bin/bwrap
 COPY app/ /opt/signage/app/
 COPY www/ /opt/signage/www/
 COPY bin/ /usr/local/bin/
@@ -52,7 +57,7 @@ ENV PYTHONUNBUFFERED=1 \
     SIGNAGE_ALLOW_SOFTWARE=0 \
     G_MESSAGES_DEBUG=all \
     GST_DEBUG_NO_COLOR=1 \
-    GST_DEBUG="2,v4l2codecs:6,v4l2slh264dec:6,kmssink:6,admiral*:6,webkit*:4" \
+    GST_DEBUG="2,v4l2codecs:6,v4l2slh264dec:6,v4l2slh265dec:6,kmssink:6,admiral*:6,webkit*:4" \
     LIBGL_DEBUG=verbose \
     EGL_LOG_LEVEL=debug
 EXPOSE 8080

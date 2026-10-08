@@ -24,8 +24,18 @@ legacy libwpe API is intentional for this experiment: WPE's newer WPEPlatform
 API [does not yet provide a video-plane equivalent](https://wpewebkit.org/blog/2026-10-06-wpe-platform.html).
 
 `browser/signage-browser.c` owns the browser shell. WPEBackend-fdo exports browser
-DMA-BUF frames; the shell imports them and submits an ARGB browser primary plane
-directly through atomic DRM/KMS. Mesa's Panfrost path is intended to provide
+DMA-BUF frames and the shell presents them on an ARGB browser primary plane through
+atomic DRM/KMS. It first tries direct (zero-copy) scanout: import the frame into
+the display device and add it as a framebuffer. On boards whose display engine
+has no IOMMU, such as the T527 today, the display can only scan out physically
+contiguous buffers, while Panfrost renders into non-contiguous (and normally
+AFBC-compressed) GPU memory, so that import fails. The shell then logs the reason
+once and switches to a GPU copy: each frame is drawn by GLES, as an exact RGBA
+copy without blending, into one of three contiguous linear ARGB8888 buffers
+allocated from the display device, and that buffer is scanned out. Premultiplied
+alpha is preserved, so holepunch video still shows through, and Panfrost may keep
+its faster AFBC buffers. The browser status file reports `scanout_path`
+(`direct` or `gpu-copy`). Mesa's Panfrost path is intended to provide
 OpenGL ES on the T527's Mali-G57. OpenGL ES 3.1 is the target; this workload does
 not depend on Vulkan. The browser's WebGL renderer and the native EGL/DRM logs
 must agree before calling the rendering path accelerated.
@@ -36,6 +46,24 @@ Westeros holepunch quirk. Our `westerossink` compatibility adapter implements th
 properties that this WebKit path expects and delegates video scanout to
 GStreamer's `kmssink`. This is an owned compatibility adapter, not the Westeros
 compositor. No external compositor is involved.
+
+The web view does not render at the display mode. `SIGNAGE_UI_SIZE` sets the view
+and framebuffer size; by default a mode larger than 1920×1080 renders at the
+largest size within 1920×1080 that keeps the mode's aspect ratio (3840×2160 →
+1920×1080) and the primary plane's scaler stretches it over the whole CRTC
+(`SRC_W/H` = UI size, `CRTC_W/H` = mode size). Before committing to scaling the
+browser runs an atomic `TEST_ONLY` commit of the scaled configuration; if the
+kernel rejects it, it logs the failure and falls back to UI size = mode size. The
+status JSON reports `width`/`height` (mode) and `ui_width`/`ui_height`.
+
+WebKit reports the video rectangle in web-view (UI) coordinates, while the NV12
+overlay is positioned in CRTC coordinates. The broker passes the UI and mode sizes
+to the adapter, which scales the rectangle by mode/UI per axis, rounding outward
+to even pixels (NV12 chroma is subsampled), before setting `kmssink`'s
+`render-rectangle`. With equal sizes the rectangle passes through unchanged.
+The adapter also constrains decoder output to linear `NV12` before `kmssink`;
+without it a stateless decoder can negotiate the tiled `NV12_32L32`, which the
+display shows as garbage.
 
 The browser brokers its DRM file descriptor to the adapter so UI and video
 share the same DRM ownership. The broker requires an ARGB primary plane with
@@ -50,7 +78,20 @@ videos, CSS transforms, rotated output, HDR and arbitrary crop effects are
 outside this first implementation. `SIGNAGE_VIDEO_MODE=composited` provides a
 comparison using WebKit's ordinary video composition path.
 The initial codec proof is H.264 through
-[`v4l2slh264dec`](https://gstreamer.freedesktop.org/documentation/v4l2codecs/v4l2slh264dec.html).
+[`v4l2slh264dec`](https://gstreamer.freedesktop.org/documentation/v4l2codecs/v4l2slh264dec.html);
+HEVC (`v4l2slh265dec`) and VP9 (`v4l2slvp9dec`) are allowed too.
+
+Decoding and the holepunch sink run inside WebKit's bubblewrap sandbox, which
+stays enabled. WebKit itself device-binds only `/dev/video0-2` and
+`/dev/media0`, and `webkit_web_context_add_path_to_sandbox()` refuses `/dev`
+paths (its binds are `nodev` anyway). When a USB camera takes `media0`, the
+decoder's media controller falls outside that list. The image therefore
+diverts `/usr/bin/bwrap` to `/usr/bin/bwrap.real` and installs
+`signage-bwrap` in its place: it device-binds every node under
+`/sys/bus/media/devices` and `/sys/class/video4linux` at each web-process
+spawn, then runs the real bwrap. The browser also binds
+`/run/admiral-signage/video` (DRM broker socket, `video-status.json`) into the
+sandbox. The browser log lists the exposed nodes (`WebKit sandbox: ...`).
 The [KMS sink](https://gstreamer.freedesktop.org/documentation/kms/index.html)
 accepts decoded DMA-BUF frames; format/modifier compatibility and zero-copy
 scanout must be established separately on the board.
@@ -173,11 +214,12 @@ See Admiral's [launch contract](https://docs.admrl.co/core-concepts/configuratio
 | `SIGNAGE_URL` | `http://127.0.0.1:8080/` | Browser startup URL. |
 | `SIGNAGE_VIDEO_URL` | Local `/media/test-h264.mp4` URL | HTML video source on the information screen. |
 | `SIGNAGE_VIDEO_MODE` | `holepunch` | `holepunch` or `composited` comparison. |
-| `SIGNAGE_DECODER` | `v4l2slh264dec` | Stateless H.264 decoder; `avdec_h264` requires software opt-in. |
+| `SIGNAGE_DECODER` | `v4l2slh264dec,v4l2slh265dec,v4l2slvp9dec` | Comma-separated allowed decoders; any one of the stateless H.264/HEVC/VP9 decoders, or `avdec_h264` with software opt-in (then the default is `avdec_h264`). |
 | `SIGNAGE_ALLOW_SOFTWARE` | `0` | Set `1` to permit software decoding during experiments. |
 | `SIGNAGE_DRM_DEVICE` | Auto-detect | Display DRM card path, independent of GPU render-node numbering. |
-| `SIGNAGE_RENDER_DEVICE` | Display GBM/kmsro | Optional GPU render node (for example `/dev/dri/renderD128`) for EGL; DMA-BUF frames are imported into the separate display card. |
+| `SIGNAGE_RENDER_DEVICE` | Display GBM/kmsro | Optional GPU render node (for example `/dev/dri/renderD128`) for EGL; frames are imported into the separate display card, or GPU-copied into buffers allocated from it. |
 | `SIGNAGE_DRM_MODE` | Auto-select | Display mode override as `WIDTHxHEIGHT@REFRESH`. |
+| `SIGNAGE_UI_SIZE` | Mode size, or largest ≤1920×1080 of the mode's aspect ratio | Web view size as `WIDTHxHEIGHT`, no larger than the mode; the primary plane scales it to the mode. |
 | `SIGNAGE_DRM_CONNECTOR` | Auto-select | Display connector ID or name. |
 | `SIGNAGE_DRM_PRIMARY_PLANE` | Auto-select | Browser primary-plane ID. |
 | `SIGNAGE_VIDEO_PLANE_ID` | Auto-select | Compatible NV12 video-overlay ID. |
@@ -191,7 +233,8 @@ See Admiral's [launch contract](https://docs.admrl.co/core-concepts/configuratio
 | `GST_DEBUG_DUMP_DOT_DIR` | Data directory `/logs` | Pipeline graphs produced by components that request a dump. |
 | `G_MESSAGES_DEBUG` | `all` | GLib/WebKit/browser messages. |
 | `LIBGL_DEBUG` / `EGL_LOG_LEVEL` | `verbose` / `debug` | Mesa and EGL diagnostics. |
-| `PAN_MESA_DEBUG` | Unset | Optional Panfrost modifier experiments; see below. |
+| `XDG_CACHE_HOME` | `$SIGNAGE_DATA_DIR/cache` (else `/tmp/admiral-signage-cache`) | Fontconfig and other caches; must be writable. |
+| `GST_REGISTRY` | `$XDG_CACHE_HOME/gstreamer-1.0/registry-<hash>.bin` | Plugin registry, keyed by kernel release and `/dev/video*`/`/dev/media*` nodes so a BSP change forces a rescan. |
 
 The broker automatically chooses the available browser/video stacking levels.
 A plane selection override is accepted only if its format, CRTC, alpha and
@@ -207,8 +250,8 @@ WEBKIT_GST_QUIRKS=westeros
 WEBKIT_GST_USE_PLAYBIN3=1
 ```
 
-It ranks stateless H.264 ahead of other decoders and disables software H.264
-fallback by default. Explicit software experiments use both:
+It ranks the allowed stateless decoders (H.264, HEVC, VP9) ahead of others and
+disables software H.264 fallback by default. Explicit software experiments use both:
 
 ```text
 SIGNAGE_ALLOW_SOFTWARE=1
@@ -218,13 +261,6 @@ SIGNAGE_DECODER=avdec_h264
 The holepunch adapter also enforces the requested decoder against actual output
 buffers, so changing ranks cannot silently enable a software fallback. In
 `composited` mode the adapter is bypassed; verify the actual pipeline separately.
-
-For DMA-BUF modifier bring-up, `PAN_MESA_DEBUG=noafbc,linear` is an optional
-comparison: it disables AFBC and forces linear textures in Mesa's Panfrost
-driver. The browser reports the actual modifier and DRM framebuffer import
-failure when DE35 cannot scan out the exported frame. This debug setting is not
-a default or a replacement for matching browser export and plane capabilities.
-The flags are defined in [Mesa's Panfrost driver source](https://gitlab.freedesktop.org/mesa/mesa/-/raw/mesa-25.0.7/src/gallium/drivers/panfrost/pan_screen.c).
 
 Native keyboard, pointer and scrolling events are forwarded to WPE through
 libinput and XKB. Touchscreen forwarding is not implemented. On Admiral, the
@@ -272,7 +308,7 @@ Files in the Custom Volume override bundled files individually:
 Set `SIGNAGE_VIDEO_URL=http://127.0.0.1:8080/media/clip.mp4` for a replacement
 clip. Missing override files fall back to the bundled assets. Refresh the page
 after edits. Native live evidence is in `/run/admiral-signage/drm-status.json`,
-`browser-status.json` and `video-status.json`; `/api/status` exposes the current snapshot and
+`browser-status.json` and `video/video-status.json`; `/api/status` exposes the current snapshot and
 `/api/config` exposes page configuration. `/healthz` checks only the HTTP server.
 
 ## Board acceptance runbook
@@ -284,8 +320,9 @@ independently:
 
 1. **GPU rendering:** inspect the animated WebGL panel and its reported renderer.
    Check native EGL logs for the Panfrost/Mali device, and reject `llvmpipe`,
-   `softpipe` or another software renderer as GPU proof. Ensure browser DMA-BUF
-   imports and repeated primary-plane commits succeed at the selected mode.
+   `softpipe` or another software renderer as GPU proof. Check the browser log for
+   the scanout path (direct, or `GPU copy ready` after the logged direct-import
+   failure) and that repeated primary-plane commits succeed at the selected mode.
 2. **Stateless decode:** inspect `gst-inspect-1.0 v4l2slh264dec`, the media/video
    nodes and V4L2 controls. Then play the bundled H.264 clip inside the browser.
    A decoder factory being listed is only availability. Hardware decode becomes

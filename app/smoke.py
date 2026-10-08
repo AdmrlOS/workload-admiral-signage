@@ -3,7 +3,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from diagnostics import APP_ROOT, RUNTIME
+from diagnostics import APP_ROOT, VIDEO_RUNTIME
 
 
 def check(args, timeout=30):
@@ -32,11 +32,11 @@ def main():
     # Explicit software decode checks the bundled media, not hardware capability.
     check(["gst-launch-1.0", "-q", "filesrc", f"location={clip}", "!", "qtdemux", "!",
            "h264parse", "!", "avdec_h264", "!", "fakesink", "sync=false"])
-    if not (RUNTIME / "drm.sock").exists():
+    if not (VIDEO_RUNTIME / "drm.sock").exists():
         result = subprocess.run(["gst-launch-1.0", "-q", "videotestsrc", "num-buffers=1", "!",
             "video/x-raw,format=NV12", "!", "westerossink"], capture_output=True, text=True, timeout=15)
         assert result.returncode != 0, "Adapter must reject missing DRM broker"
-        status = json.loads((RUNTIME / "video-status.json").read_text())
+        status = json.loads((VIDEO_RUNTIME / "video-status.json").read_text())
         assert status["hardware_decode"]["verified"] is False
         assert status["holepunch"]["verified"] is False
         assert status["error"], "Missing broker must produce diagnostic evidence"
