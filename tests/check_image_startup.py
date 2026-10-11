@@ -1,13 +1,21 @@
 """Exercise the real OCI entrypoint without requiring the board's GPU devices."""
 import json
+import os
 import subprocess
 import sys
 import time
 
+# Defaults suit a native host. Under QEMU user emulation (arm64 image on an
+# x86_64 runner) ffprobe/ffmpeg and Python startup are many times slower, so CI
+# raises these via the environment. The assertions themselves never change.
+DOCKER_TIMEOUT = float(os.environ.get("SIGNAGE_STARTUP_CHECK_DOCKER_TIMEOUT", "60"))
+HEALTH_TIMEOUT = float(os.environ.get("SIGNAGE_STARTUP_CHECK_HEALTH_TIMEOUT", "30"))
+
 
 def docker(*args, check=True):
     return subprocess.run(
-        ["docker", *args], check=check, capture_output=True, text=True, timeout=60
+        ["docker", *args], check=check, capture_output=True, text=True,
+        timeout=DOCKER_TIMEOUT,
     )
 
 
@@ -27,7 +35,8 @@ def main(image):
         image, "server",
     ).stdout.strip()
     try:
-        for _ in range(30):
+        deadline = time.monotonic() + HEALTH_TIMEOUT
+        while True:
             probe = docker(
                 "exec", container, "/usr/bin/python3", "-c",
                 "from urllib.request import urlopen; "
@@ -38,9 +47,11 @@ def main(image):
                 break
             state = json.loads(docker("inspect", container).stdout)[0]["State"]
             assert state["Running"], docker("logs", container).stdout
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"HTTP startup failed after {HEALTH_TIMEOUT:.0f}s: " + probe.stderr
+                )
             time.sleep(0.2)
-        else:
-            raise AssertionError("HTTP startup failed: " + probe.stderr)
 
         docker("stop", "--time", "5", container)
         state = json.loads(docker("inspect", container).stdout)[0]["State"]

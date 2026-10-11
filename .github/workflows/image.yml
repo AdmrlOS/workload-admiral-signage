@@ -15,12 +15,30 @@ concurrency:
 
 jobs:
   image:
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, linux, x64]
+    # arm64 builds and smoke tests run under QEMU user emulation on this x86_64 host, which is much slower than native.
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      # Self-hosted runner (CachyOS x86_64) has no setup-python support: use the system python3.
+      # Tests are stdlib-only, so any python3 >= 3.11 works.
+      - name: Check system python3
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::python3 not found on runner"
+            exit 1
+          fi
+          python3 --version
+          if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+            echo "::error::python3 >= 3.11 required, found $(python3 --version 2>&1)"
+            exit 1
+          fi
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
       - name: Test diagnostics and UI syntax
         run: |
           python3 -m unittest discover -s tests -v
@@ -29,11 +47,47 @@ jobs:
           node --check www/player/player.js
           node --check www/player/bridge.js
           node --test tests/test_player.js tests/test_display_status.js
-      - uses: docker/setup-buildx-action@v3
+      # Rootful Podman: tonistiigi/binfmt registers inside the container, not on the host,
+      # so `docker run` of the arm64 image fails with Exec format error. Install the host
+      # interpreter (F = fix-binary) so the registration survives and containers can use it.
+      # BuildKit's bundled QEMU is enough for the build itself; this is for `docker run`.
+      - name: Ensure arm64 emulation on the host
+        run: |
+          set -euo pipefail
+          if [[ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
+            if command -v pacman >/dev/null 2>&1; then
+              sudo pacman -Sy --needed --noconfirm qemu-user-static qemu-user-static-binfmt
+              sudo systemctl restart systemd-binfmt.service
+            else
+              docker run --rm --privileged docker.io/tonistiigi/binfmt:latest --install arm64
+            fi
+          fi
+          entry=/proc/sys/fs/binfmt_misc/qemu-aarch64
+          if [[ ! -e "$entry" ]]; then
+            echo "::error::qemu-aarch64 binfmt entry missing after install"
+            exit 1
+          fi
+          echo "---- $entry ----"
+          cat "$entry"
+          if ! grep -qx 'enabled' "$entry"; then
+            echo "::error::qemu-aarch64 binfmt entry is not enabled"
+            exit 1
+          fi
+          if ! grep -E '^flags:.*F' "$entry"; then
+            echo "::error::qemu-aarch64 binfmt flags missing F (fix-binary); containers cannot use the host interpreter"
+            exit 1
+          fi
+          arch="$(docker run --rm --platform linux/arm64 docker.io/library/debian:trixie-slim uname -m)"
+          echo "uname -m: ${arch}"
+          if [[ "$arch" != "aarch64" ]]; then
+            echo "::error::expected uname -m aarch64, got: ${arch}"
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@v4
       - name: Image name
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: metadata
         with:
           images: ${{ steps.image.outputs.name }}
@@ -42,7 +96,7 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
       - name: Build test image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/arm64
@@ -54,10 +108,14 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Verify image without GPU devices
+        env:
+          # arm64 under QEMU on x86_64: allow generous startup and per-docker-call budgets.
+          SIGNAGE_STARTUP_CHECK_DOCKER_TIMEOUT: '600'
+          SIGNAGE_STARTUP_CHECK_HEALTH_TIMEOUT: '600'
         run: |
           python3 tests/check_image_startup.py admiral-signage:ci
           docker run --rm --workdir / --tmpfs /run --tmpfs /tmp admiral-signage:ci smoke
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
@@ -65,7 +123,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish checked image
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/arm64
@@ -78,3 +136,11 @@ jobs:
           provenance: true
           sbom: true
           cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Self-hosted runner disk persists between jobs: drop the local test image
+      # and dangling layers. Deliberately no `docker system prune -a` (shared host).
+      - name: Clean up local test image
+        if: always()
+        run: |
+          docker rmi admiral-signage:ci >/dev/null 2>&1 || true
+          docker image prune -f >/dev/null 2>&1 || true
