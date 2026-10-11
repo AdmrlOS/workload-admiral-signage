@@ -37,7 +37,7 @@ def decoder_config(environ):
     return decoder, ",".join(f"{name}:{rank}" for name, rank in ranks.items())
 
 
-PAGES = {"": "", "displaylab": "", "menuboard": "menuboard/"}
+PAGES = {"": "", "displaylab": "", "menuboard": "menuboard/", "player": "player/", "studio": "studio/"}
 
 
 def start_url(environ):
@@ -88,7 +88,7 @@ def configure_caches(data):
 def configure():
     RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
     RUNTIME.chmod(0o700)
-    data = Path(os.environ.get("SIGNAGE_DATA_DIR", "/var/lib/admiral-signage"))
+    data = Path(os.environ.get("SIGNAGE_DATA_DIR", "/data"))
     for name in ("logs", "media", "www"):
         (data / name).mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("GST_DEBUG_DUMP_DOT_DIR", str(data / "logs"))

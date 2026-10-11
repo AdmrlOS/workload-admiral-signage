@@ -25,6 +25,10 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -v
           node --check www/app.js
+          node --check www/studio/studio.js
+          node --check www/player/player.js
+          node --check www/player/bridge.js
+          node --test tests/test_player.js tests/test_display_status.js
       - uses: docker/setup-buildx-action@v3
       - name: Image name
         id: image

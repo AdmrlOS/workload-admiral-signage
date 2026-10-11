@@ -17,7 +17,7 @@ services:
     volumes:
       - /dev:/dev
       - /run/udev:/run/udev:ro
-      - ./output/data:/var/lib/admiral-signage
+      - ./output/data:/data
       - ./www:/opt/signage/www:ro
       - ./app:/opt/signage/app:ro
       - ./native:/opt/signage/src/native

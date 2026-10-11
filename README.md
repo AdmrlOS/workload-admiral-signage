@@ -12,6 +12,88 @@ video/display kernel drivers. A successful image build cannot establish that
 the connected board accelerates rendering, decodes video or blends its planes
 correctly. Those are separate acceptance checks below.
 
+## Signage Studio demo
+
+Open **http://DEVICE-IP:8080/studio/** to upload content and manage the loop.
+The image now boots **/player/** on the display. For an existing deployment, set `SIGNAGE_PAGE=player` and clear any `SIGNAGE_URL`
+override, then apply/restart the workload. The studio reports the native display
+page separately from its browser preview; standalone demos do not follow the schedule.
+
+The original Display Lab at `/`
+and SUBSTATION page at `/menuboard/` remain available.
+
+- The initial published loop includes an Admiral welcome screen, the complete
+  SUBSTATION main menu, a dedicated **menu + picture-in-picture video** slot, and
+  both existing promo videos. The complete original animated demo remains in the
+  library too (80 seconds when added, so its later PiP scene is reached).
+- Add videos (MP4, WebM, MOV), images (PNG, JPEG, WebP, GIF, AVIF), a standalone
+  HTML file, or a ZIP containing `index.html` and its relative assets. A single
+  enclosing ZIP directory is supported. The limit is 512 MB per upload and
+  512 MB / 1,500 files after extraction. MP4/H.264 is the recommended board format;
+  accepted containers do not guarantee the hardware supports every codec.
+- Add library content to the loop, move it up/down, set its duration, and optionally
+  select start/end times. Times are entered in the operator browser's local timezone
+  and saved with a UTC offset. Windows include the start and exclude the end.
+  Outside its window, an item is skipped; an empty active loop shows an Admiral slate.
+- **Publish loop** applies changes to players automatically (normally within two
+  seconds). Each player loops independently. Reload discards unpublished edits.
+  Videos use `0` duration to play to completion; images and HTML need a positive duration.
+- This is a trusted-network demo with no login or multi-user permissions. HTML is
+  sandboxed without same-origin access; packages must be self-contained (no API fetches,
+  forms, local storage, or authenticated services). Same-origin checks protect write
+  endpoints from uploaded packages and cross-site browser requests.
+
+### Persistent storage on Admiral
+
+Mount the Admiral persistent volume at **`/data`**, as in
+`config/admiral.example.json`. The first run copies the bundled media and HTML
+packages there and creates an initial schedule. Later restarts and image updates
+keep the existing library and schedule. A one-time catalog upgrade adds the
+explicit main-menu/PiP library items and corrects an untouched initial demo loop;
+customized schedules and uploaded files are preserved.
+
+```text
+/data/library.json          Library, published loop, schedule and revision
+/data/media/                Persistent copies of the bundled videos and stills
+/data/content/              Bundled and uploaded HTML, images, videos and ZIP assets
+/data/cache/                Runtime caches
+/data/logs/                 Diagnostics
+/data/www/                  Optional page overrides (existing development feature)
+```
+
+An existing volume mounted at the previous `/var/lib/admiral-signage` destination
+should be remounted at `/data`; the image does not move or delete that volume.
+`SIGNAGE_DATA_DIR` can override this location when needed.
+
+### Continuous transitions
+
+The player retains the outgoing surface until the incoming content reports ready.
+Video uploads generate first/last-frame stills ahead of playback, and the player
+warms the upcoming media cache without opening a second hardware decoder. It paints
+an outgoing still before releasing the video plane, then waits for a presented
+incoming video frame before revealing it. HTML packages receive a small lifecycle
+bridge that waits for load/fonts/paint and freezes their timers, animations and media
+before the next item takes over. Failed content is skipped; the last visual is kept
+while trying the remaining loop, and failed loops retry.
+
+This is a **no-blank-frame transition design**, not a claim of frame-accurate seamless
+video concatenation. A still can briefly hold during a decoder handoff. Arbitrary HTML
+with nested media frames, WebGL video textures, or custom renderers may need its own
+lifecycle handling. Only one active video sink is supported by the native adapter.
+Verify a full loop on the target T527 with both video-to-video and HTML transitions
+before promising gapless playback to a customer; desktop tests cannot certify KMS
+plane timing or decoder teardown on that board.
+
+### Local presentation / server-only preview
+
+```sh
+docker run --rm --name admiral-signage-studio -p 8097:8080 \
+  -v admiral-signage-demo:/data admiral-signage:studio server
+```
+
+Then open `http://localhost:8097/studio/`. This uses the same backend, uploaded
+content and schedule as the board; browser video in this preview is desktop playback.
+
 ## Graphics and video paths
 
 The stack uses Debian trixie packages: WPE WebKit 2.48 with the legacy libwpe
@@ -157,7 +239,7 @@ To use only the image and a persistent data volume, run:
 
 ```sh
 docker run --rm --privileged --network host \
-  -v signage-data:/var/lib/admiral-signage \
+  -v signage-data:/data \
   admiral-signage:dev
 ```
 
@@ -183,12 +265,11 @@ wrapper when creating or updating a configuration through the API.
   `/dev/media*`, `/dev/input` and `/dev/snd` through Admiral's normal device path.
 - **Command empty:** uses the image's entrypoint and default `run` command.
 - **Writable rootfs:** permits development builds inside the image.
-- **Custom Volume:** mounts `signage-data` at `/var/lib/admiral-signage` to retain
+- **Custom Volume:** mounts `signage-data` at `/data` to retain
   media, page overrides and logs across image updates.
 
-The sample uses `:latest` intentionally for experimentation. For a repeatable
-test or rollout, replace it with the workflow's unique commit tag or published
-`@sha256:` digest. Admiral treats version/commit tags as immutable and can reuse
+The sample pins `:studio-20261010-live` for this presentation. For subsequent
+rollouts, use a fresh version/commit tag or the published `@sha256:` digest. Admiral treats version/commit tags as immutable and can reuse
 a cached tag; publish a new tag for every change.
 
 The JSON schema uses `env` as a map, `volumes` as a map whose values have a
@@ -196,10 +277,9 @@ The JSON schema uses `env` as a map, `volumes` as a map whose values have a
 is expressed as `options.namespaces: ["network"]`. Private networking is
 sufficient for the default browser and local HTTP server.
 
-The HTTP server binds to loopback by default. To inspect it from another machine,
-set `SIGNAGE_HTTP_HOST=0.0.0.0` and add
-`{"port":8080,"protocol":"tcp"}` to `ports` in bridge mode, or opt into host
-networking. The development endpoints do not authenticate requests, so enable
+The demo image binds HTTP to all interfaces by default. Its sample configuration adds
+`{"port":8080,"protocol":"tcp"}` to `ports` in bridge mode. Set
+`SIGNAGE_HTTP_HOST=127.0.0.1` for local-only access. The development endpoints do not authenticate requests, so enable
 remote access only on your development network.
 
 Admiral starts the process in `/`, mounts `/run` and `/tmp` as private tmpfs and
@@ -238,7 +318,7 @@ See Admiral's [launch contract](https://docs.admrl.co/core-concepts/configuratio
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SIGNAGE_URL` | `http://127.0.0.1:8080/` | Browser startup URL. |
-| `SIGNAGE_PAGE` | Unset (Display Lab) | `menuboard` starts the SUBSTATION menuboard demo; ignored when `SIGNAGE_URL` is set. |
+| `SIGNAGE_PAGE` | `player` in the image | `player` starts the published loop; `studio` opens the manager; `displaylab` and `menuboard` retain the original demos. Ignored when `SIGNAGE_URL` is set. |
 | `SIGNAGE_VIDEO_URL` | Local `/media/test-h264.mp4` URL | HTML video source on the information screen. |
 | `SIGNAGE_VIDEO_MODE` | `holepunch` | `holepunch` or `composited` comparison. |
 | `SIGNAGE_DECODER` | `v4l2slh264dec,v4l2slh265dec,v4l2slvp9dec` | Comma-separated allowed decoders; any one of the stateless H.264/HEVC/VP9 decoders, or `avdec_h264` with software opt-in (then the default is `avdec_h264`). |
@@ -255,8 +335,8 @@ See Admiral's [launch contract](https://docs.admrl.co/core-concepts/configuratio
 | `SIGNAGE_INPUT` | Enabled | Set `0` to disable native keyboard/pointer input and metadata preparation. |
 | `SIGNAGE_INPUT_SEAT` | `seat0` | Input seat for initial event-device classification and libinput. |
 | `SIGNAGE_KEYBOARD_LAYOUT` | System/US | XKB keyboard layout. |
-| `SIGNAGE_HTTP_HOST` / `SIGNAGE_HTTP_PORT` | `127.0.0.1` / `8080` | Local information/diagnostic server. |
-| `SIGNAGE_DATA_DIR` | `/var/lib/admiral-signage` | Durable media, page overrides and diagnostic logs. |
+| `SIGNAGE_HTTP_HOST` / `SIGNAGE_HTTP_PORT` | `0.0.0.0` / `8080` in the image | Local information/diagnostic server. |
+| `SIGNAGE_DATA_DIR` | `/data` | Durable media, page overrides and diagnostic logs. |
 | `WEBKIT_INSPECTOR_SERVER` | Unset | Opt-in WebKit remote inspector address, such as `127.0.0.1:9222`. |
 | `GST_DEBUG` | Detailed V4L2/KMS/adapter categories | GStreamer logging; override to focus a capture. |
 | `GST_DEBUG_DUMP_DOT_DIR` | Data directory `/logs` | Pipeline graphs produced by components that request a dump. |
@@ -327,11 +407,11 @@ retain them through an update. This workload does not install kernel modules.
 Files in the Custom Volume override bundled files individually:
 
 ```text
-/var/lib/admiral-signage/www/index.html   overrides the local page
-/var/lib/admiral-signage/www/app.js       overrides the page script
-/var/lib/admiral-signage/www/style.css    overrides page styles
-/var/lib/admiral-signage/media/clip.mp4   served as /media/clip.mp4
-/var/lib/admiral-signage/logs/startup.json
+/data/www/index.html   overrides the local page
+/data/www/app.js       overrides the page script
+/data/www/style.css    overrides page styles
+/data/media/clip.mp4   served as /media/clip.mp4
+/data/logs/startup.json
 ```
 
 Set `SIGNAGE_VIDEO_URL=http://127.0.0.1:8080/media/clip.mp4` for a replacement
@@ -377,7 +457,7 @@ scripts/make-menuboard-media.sh SOURCE_A.mp4 SOURCE_B.mp4
 ```
 
 Both clips must be H.264 (the allowed stateless decoders also take HEVC/VP9). Files in the Custom
-Volume (`/var/lib/admiral-signage/media/promo-a.mp4`) override the bundled ones.
+Volume (`/data/media/promo-a.mp4`) override the bundled ones.
 
 ## Board acceptance runbook
 

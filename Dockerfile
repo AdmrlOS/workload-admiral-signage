@@ -43,7 +43,7 @@ COPY www/ /opt/signage/www/
 COPY media/ /opt/signage/media/
 COPY bin/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/signage-* && \
-    mkdir -p /opt/signage/media /var/lib/admiral-signage && \
+    mkdir -p /opt/signage/media /data && \
     ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 \
       -t 12 -an -c:v libx264 -profile:v baseline -level 3.1 -pix_fmt yuv420p \
       -preset veryfast -crf 23 -g 60 -movflags +faststart /opt/signage/media/test-h264.mp4 && \
@@ -51,8 +51,9 @@ RUN chmod +x /usr/local/bin/signage-* && \
 ENV PYTHONUNBUFFERED=1 \
     GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
     XDG_RUNTIME_DIR=/run/admiral-signage \
-    SIGNAGE_DATA_DIR=/var/lib/admiral-signage \
-    SIGNAGE_HTTP_HOST=127.0.0.1 \
+    SIGNAGE_DATA_DIR=/data \
+    SIGNAGE_PAGE=player \
+    SIGNAGE_HTTP_HOST=0.0.0.0 \
     SIGNAGE_HTTP_PORT=8080 \
     SIGNAGE_VIDEO_MODE=holepunch \
     SIGNAGE_ALLOW_SOFTWARE=0 \

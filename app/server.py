@@ -7,11 +7,14 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
+
+import content
 
 from diagnostics import APP_ROOT, snapshot
+from entrypoint import start_url
 
-DATA_ROOT = Path(os.environ.get("SIGNAGE_DATA_DIR", "/var/lib/admiral-signage"))
+DATA_ROOT = Path(os.environ.get("SIGNAGE_DATA_DIR", "/data"))
 PORT = int(os.environ.get("SIGNAGE_HTTP_PORT", "8080"))
 STATUS = {"runtime": {}, "video": {}, "holepunch": {"verified": False}}
 
@@ -19,7 +22,8 @@ STATUS = {"runtime": {}, "video": {}, "holepunch": {"verified": False}}
 def configuration():
     return {"video_url": os.environ.get("SIGNAGE_VIDEO_URL", f"http://127.0.0.1:{PORT}/media/test-h264.mp4"),
             "video_mode": os.environ.get("SIGNAGE_VIDEO_MODE", "holepunch"),
-            "browser_url": os.environ.get("SIGNAGE_URL", f"http://127.0.0.1:{PORT}/"),
+            "browser_url": start_url(os.environ),
+            "player_url": f"http://127.0.0.1:{PORT}/player/",
             "quirk": os.environ.get("WEBKIT_GST_HOLE_PUNCH_QUIRK", ""),
             "allow_software": os.environ.get("SIGNAGE_ALLOW_SOFTWARE", "0") == "1"}
 
@@ -65,9 +69,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET(head=True)
 
-    def json_response(self, value, head=False):
+    def json_response(self, value, head=False, status=200):
         body = json.dumps(value).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
@@ -75,15 +79,74 @@ class Handler(BaseHTTPRequestHandler):
         if not head:
             self.wfile.write(body)
 
+    def mutation(self):
+        # Browser requests must originate from the studio, not an uploaded HTML package.
+        origin = self.headers.get('Origin')
+        if (self.headers.get('X-Signage-Request') != 'studio'
+                or self.headers.get('Sec-Fetch-Site') == 'cross-site'
+                or (origin and (urlsplit(origin).scheme not in ('http', 'https')
+                               or urlsplit(origin).netloc != self.headers.get('Host')))):
+            raise content.ContentError('Use the Admiral studio to change content.', 403)
+        if self.headers.get('Transfer-Encoding'):
+            raise content.ContentError('A Content-Length is required.', 411)
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            raise content.ContentError('Invalid Content-Length.') from None
+        path = urlsplit(self.path).path
+        if self.command == 'POST' and path == '/api/assets':
+            name = parse_qs(urlsplit(self.path).query).get('name', [''])[0]
+            return content.upload(DATA_ROOT, APP_ROOT, name, self.rfile, length)
+        if self.command == 'PUT' and path == '/api/playlist':
+            if not 0 < length <= 256 * 1024:
+                raise content.ContentError('Playlist is too large or empty.', 413)
+            try:
+                body = json.loads(self.rfile.read(length))
+            except (ValueError, UnicodeError):
+                raise content.ContentError('Invalid playlist JSON.') from None
+            return content.update(DATA_ROOT, APP_ROOT, body)
+        if self.command == 'DELETE' and path.startswith('/api/assets/'):
+            return content.delete(DATA_ROOT, APP_ROOT, path.rsplit('/', 1)[-1])
+        raise content.ContentError('Endpoint not found.', 404)
+
+    def do_POST(self):
+        self.connection.settimeout(120)
+        try:
+            self.json_response(self.mutation())
+        except content.ContentError as exc:
+            self.json_response({'error': str(exc)}, status=exc.status)
+        except (OSError, ValueError):
+            self.json_response({'error': 'Content could not be saved. Check the data volume and try again.'}, status=500)
+        finally:
+            self.close_connection = True
+
+    do_PUT = do_POST
+    do_DELETE = do_POST
+
     def do_GET(self, head=False):
         path = unquote(urlsplit(self.path).path)
+        if path in ('/studio', '/player'):
+            self.send_response(302)
+            self.send_header('Location', path + '/')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        if path in ('/api/library', '/api/playlist'):
+            try:
+                state = content.read(DATA_ROOT, APP_ROOT)
+                return self.json_response(content.playlist(state) if path == '/api/playlist' else state, head)
+            except (OSError, ValueError, content.ContentError):
+                return self.json_response({'error': 'The content library could not be opened. Check the data volume.'}, head, status=500)
         if path == "/healthz":
             return self.json_response({"ok": True}, head)
         if path == "/api/config":
             return self.json_response(configuration(), head)
         if path == "/api/status":
             return self.json_response(STATUS, head)
-        if path.startswith("/media/"):
+        if path.startswith('/content/'):
+            name = path.removeprefix('/content/')
+            roots = [DATA_ROOT / 'content']
+        elif path.startswith("/media/"):
             name = path.removeprefix("/media/")
             roots = [DATA_ROOT / "media", APP_ROOT / "media"]
         else:
@@ -94,9 +157,19 @@ class Handler(BaseHTTPRequestHandler):
         file = next((found for root in roots if (found := safe_file(root, name))), None)
         if file is None:
             return self.send_error(404)
-        size = file.stat().st_size
+        # Inject the playback handshake into packages without modifying their files.
+        # Opaque-origin sandboxing prevents packages from accessing the studio API.
+        package_html = path.startswith('/content/') and file.suffix.lower() in ('.html', '.htm')
+        html_body = None
+        if package_html:
+            html_body = file.read_bytes()
+            bridge = b'<script src="/player/bridge.js"></script>'
+            match = re.search(br'<head(?:\s[^>]*)?>', html_body, re.IGNORECASE)
+            at = match.end() if match else 0
+            html_body = html_body[:at] + bridge + html_body[at:]
+        size = len(html_body) if html_body is not None else file.stat().st_size
         start, end = 0, size - 1
-        ranged = "Range" in self.headers
+        ranged = "Range" in self.headers and html_body is None
         if ranged:
             try:
                 start, end = parse_range(self.headers["Range"], size)
@@ -108,14 +181,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
         self.send_response(206 if ranged else 200)
         self.send_header("Content-Type", mimetypes.guess_type(file.name)[0] or "application/octet-stream")
-        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Accept-Ranges", "none" if package_html else "bytes")
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        if path.startswith('/content/'):
+            self.send_header('Content-Security-Policy', "sandbox allow-scripts; connect-src 'none'; form-action 'none'; frame-ancestors 'self'")
         self.send_header("Content-Length", str(max(0, end - start + 1)))
-        self.send_header("Cache-Control", "no-store" if file.suffix != ".mp4" else "private, max-age=60")
+        self.send_header("Cache-Control", "private, max-age=3600" if path.startswith(("/media/", "/content/")) and not package_html else "no-store")
         if ranged:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
         if not head:
             try:
+                if html_body is not None:
+                    self.wfile.write(html_body)
+                    return
                 with file.open("rb") as stream:
                     stream.seek(start)
                     remaining = end - start + 1
@@ -134,11 +213,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    content.read(DATA_ROOT, APP_ROOT)
     threading.Thread(target=refresh_status, daemon=True).start()
     host = os.environ.get("SIGNAGE_HTTP_HOST", "127.0.0.1")
     server = ThreadingHTTPServer((host, PORT), Handler)
     server.daemon_threads = True
-    print(f"Diagnostics listening on {host}:{PORT}", flush=True)
+    print(f"Admiral Signage listening on {host}:{PORT}", flush=True)
     server.serve_forever()
 
 

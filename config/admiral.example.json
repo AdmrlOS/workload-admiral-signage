@@ -1,15 +1,16 @@
 {
   "name": "admiral-signage-development",
-  "image": "ghcr.io/admrlos/workload-admiral-signage:latest",
+  "image": "ghcr.io/admrlos/workload-admiral-signage:studio-20261010-live",
   "desiredState": "RUNNING",
   "command": [],
   "env": {
     "SIGNAGE_VIDEO_MODE": "holepunch",
     "SIGNAGE_DECODER": "v4l2slh264dec",
     "SIGNAGE_ALLOW_SOFTWARE": "0",
-    "SIGNAGE_HTTP_HOST": "127.0.0.1",
+    "SIGNAGE_PAGE": "player",
+    "SIGNAGE_HTTP_HOST": "0.0.0.0",
     "SIGNAGE_HTTP_PORT": "8080",
-    "SIGNAGE_DATA_DIR": "/var/lib/admiral-signage"
+    "SIGNAGE_DATA_DIR": "/data"
   },
   "options": {
     "interactive": true,
@@ -19,9 +20,9 @@
   },
   "volumes": {
     "signage-data": {
-      "destination": "/var/lib/admiral-signage",
+      "destination": "/data",
       "options": ["bind", "rw"]
     }
   },
-  "ports": []
+  "ports": [{"port": 8080, "protocol": "tcp"}]
 }

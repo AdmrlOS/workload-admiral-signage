@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Admiral · Signage Studio</title>
+  <link rel="icon" href="/brand/admiral-icon.svg"><link rel="stylesheet" href="studio.css">
+  <script src="display-status.js" defer></script>
+  <script src="studio.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/studio/" aria-label="Admiral Signage home"><img src="/brand/admiral-logo.svg" alt="Admiral"></a>
+    <div class="workspace-label">YOUR WORKSPACE</div>
+    <div class="workspace-name"><span class="workspace-icon">S</span><div>Signage Studio<small>Presentation workspace</small></div></div>
+    <nav aria-label="Workspace"><a class="selected" href="#loop"><span>▤</span> Content & loop</a><a href="#library"><span>▦</span> Media library</a><a href="/player/" target="_blank" rel="noopener"><span>▻</span> Open display <b>↗</b></a></nav>
+    <div class="sidebar-bottom"><div class="small-mark">A</div><div>Powered by Admiral<small>Your content. Every screen.</small></div></div>
+  </aside>
+  <div class="main-shell">
+    <header class="topbar"><span>Workspace <i>/</i> <strong>Content & loop</strong></span><span class="demo-badge">DEMO WORKSPACE</span></header>
+    <main>
+      <section class="page-heading"><div><p class="eyebrow">ADMIRAL SIGNAGE</p><h1>Good content. On repeat.</h1><p>Bring your screen to life. Add content, set the timing, press play.</p></div><button class="primary" id="upload-top"><span>＋</span> Upload content</button></section>
+      <section class="overview" aria-label="Overview">
+        <div><span class="stat-icon">▦</span><p>Content library<strong id="asset-count">—</strong></p></div>
+        <div><span class="stat-icon">↻</span><p>In the loop<strong id="loop-count">—</strong></p></div>
+        <div><span class="stat-icon">◷</span><p>Loop runtime<strong id="loop-runtime">—</strong></p></div>
+        <div><span class="stat-icon blue">▻</span><p>Preview playback<strong id="playback-status">Connecting…</strong></p></div>
+      </section>
+      <section id="display-status" class="display-status" role="status" aria-live="polite"><strong id="display-title">Checking the device display…</strong><p id="display-detail"></p><details id="display-help" hidden><summary>How to connect the display</summary><p>In the Admiral workload settings, set <code>SIGNAGE_PAGE=player</code>, remove any <code>SIGNAGE_URL</code> override, then apply and restart the workload.</p></details></section>
+      <section class="work-grid" id="loop">
+        <div class="panel loop-panel">
+          <div class="panel-heading"><div><p class="eyebrow">YOUR PLAYLIST</p><h2>The presentation loop <span id="entry-count" class="count">0</span></h2></div><button id="reload" class="text-button" title="Reload the published loop">↻ Reload</button></div>
+          <p class="panel-description">Plays in order, then starts again. Schedule an item or leave it always on.</p>
+          <div class="list-label"><span>CONTENT / SCHEDULE</span><span>DURATION</span></div>
+          <div id="entries" class="entries"><p class="empty">Loading your loop…</p></div>
+          <div class="loop-footer"><span id="save-status">Loading…</span><button id="publish" class="primary" disabled>Publish loop <span>↗</span></button></div>
+        </div>
+        <aside class="preview-column">
+          <div class="panel preview-panel"><div class="panel-heading"><h2>Display preview</h2><span class="live-label"><i></i> LIVE LOOP</span></div><div class="preview-viewport"><iframe id="preview" title="Live signage preview" src="/player/?preview=1" allow="autoplay"></iframe></div><div class="preview-footer"><span>16:9 · Muted preview</span><a href="/player/" target="_blank" rel="noopener">Open display ↗</a></div></div>
+          <div class="note"><span>↻</span><div><strong>Ready for the big screen.</strong><p>A display using the scheduled player picks up published changes automatically. Content stays on this device, ready to play.</p></div></div>
+          <div class="schedule-note"><strong>A little timing goes a long way.</strong><p>Set a start and end time for promotions. Only items inside their scheduled window will play.</p><small id="timezone"></small></div>
+        </aside>
+      </section>
+      <section id="library" class="library-section"><div class="section-heading"><div><p class="eyebrow">ALL YOUR CONTENT</p><h2>Media library</h2></div><div class="filters" aria-label="Filter media"><button class="active" data-filter="all">All content</button><button data-filter="video">Videos</button><button data-filter="html">HTML</button><button data-filter="image">Images</button></div></div>
+        <div class="dropzone" id="dropzone"><span class="upload-symbol">↑</span><div><strong>Drop something worth showing.</strong><p>Videos, images, or an HTML package. Up to 512 MB per file.</p></div><button class="secondary" id="browse">Browse files</button><input id="files" type="file" accept=".mp4,.webm,.mov,.png,.jpg,.jpeg,.webp,.gif,.avif,.html,.zip" multiple hidden></div>
+        <div class="upload-progress" id="upload-progress" hidden><span id="upload-label"></span><progress id="progress" max="100" value="0"></progress></div>
+        <div id="assets" class="assets"></div>
+      </section>
+      <footer><span>Admiral Signage Studio</span><span>Simple to manage. Made to be seen.</span></footer>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="editor"><form id="edit-form"><div class="dialog-heading"><div><p class="eyebrow">LOOP ITEM</p><h2 id="edit-title">Schedule content</h2></div><button type="button" id="close-editor" class="icon-button" aria-label="Close schedule">×</button></div><label>Duration in seconds<input id="edit-duration" type="number" min="0" max="86400" step="1" required></label><small id="duration-help"></small><div class="date-fields"><label>Start (optional)<input id="edit-start" type="datetime-local"></label><label>End (optional)<input id="edit-end" type="datetime-local"></label></div><p class="field-note" id="edit-timezone"></p><label class="check-label"><input id="edit-enabled" type="checkbox"> Include in the loop</label><p class="form-error" id="edit-error" role="alert"></p><div class="dialog-actions"><button type="button" id="clear-dates" class="text-button">Clear schedule</button><button class="primary" type="submit">Save item</button></div></form></dialog>
+</body></html>

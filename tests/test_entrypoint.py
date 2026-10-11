@@ -54,6 +54,9 @@ class StartUrlTests(unittest.TestCase):
     def test_default_is_display_lab(self):
         self.assertEqual(entrypoint.start_url({}), "http://127.0.0.1:8080/")
 
+    def test_player_page(self):
+        self.assertEqual(entrypoint.start_url({"SIGNAGE_PAGE": "player"}), "http://127.0.0.1:8080/player/")
+
     def test_menuboard_page(self):
         self.assertEqual(entrypoint.start_url({"SIGNAGE_PAGE": "menuboard", "SIGNAGE_HTTP_PORT": "9000"}),
                          "http://127.0.0.1:9000/menuboard/")

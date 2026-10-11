@@ -1,9 +1,11 @@
 import json
+import os
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -81,6 +83,42 @@ class ServerTests(unittest.TestCase):
                 urlopen(self.base + path)
             self.assertEqual(error.exception.code, 404)
             error.exception.close()
+
+    def test_content_upload_sandbox_and_publish(self):
+        headers = {'X-Signage-Request': 'studio', 'Content-Type': 'application/octet-stream'}
+        request = Request(self.base + '/api/assets?name=hello.html', data=b'<html><head></head><body>Hello</body></html>', headers=headers)
+        with urlopen(request) as response:
+            asset = json.load(response)
+        with urlopen(self.base + asset['url']) as response:
+            body = response.read()
+            self.assertIn(b'/player/bridge.js', body)
+            self.assertIn("sandbox allow-scripts", response.headers['Content-Security-Policy'])
+        with urlopen(self.base + '/api/library') as response:
+            state = json.load(response)
+        state['entries'] = [dict(id='html', asset_id=asset['id'], duration=2, enabled=True, start=None, end=None)]
+        with urlopen(Request(self.base + '/api/playlist', method='PUT', data=json.dumps(state).encode(), headers=headers)) as response:
+            self.assertEqual(response.status, 200)
+        with urlopen(self.base + '/api/playlist') as response:
+            self.assertEqual(json.load(response)['entries'][0]['asset']['id'], asset['id'])
+        with self.assertRaises(HTTPError) as error:
+            urlopen(Request(self.base + '/api/playlist', method='PUT', data=json.dumps(state).encode(), headers=headers))
+        self.assertEqual(error.exception.code, 409)
+        error.exception.close()
+
+    def test_mutations_reject_cross_origin_and_missing_header(self):
+        for headers in ({}, {'Origin':'null','X-Signage-Request':'studio'},
+                        {'Origin':'https://other.test','X-Signage-Request':'studio'}):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(self.base + '/api/assets?name=test.html', data=b'test', headers=headers))
+            self.assertEqual(error.exception.code, 403)
+            error.exception.close()
+
+
+    def test_config_reports_effective_start_page(self):
+        with patch.dict(os.environ, {'SIGNAGE_PAGE': 'player'}, clear=True):
+            self.assertEqual(server.configuration()['browser_url'], 'http://127.0.0.1:8080/player/')
+        with patch.dict(os.environ, {'SIGNAGE_PAGE': 'player', 'SIGNAGE_URL': 'http://127.0.0.1:8080/menuboard/'}, clear=True):
+            self.assertEqual(server.configuration()['browser_url'], 'http://127.0.0.1:8080/menuboard/')
 
     def test_config_and_health(self):
         with urlopen(self.base + "/healthz") as response:
