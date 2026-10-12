@@ -12,7 +12,7 @@
   let mediaCapabilityGeneration = 0;
   let videoSize = [480, 270];
 
-  function setText(id, text) { byId(id).textContent = text; }
+  function setText(id, text) { const node = byId(id); if (node.textContent !== String(text)) node.textContent = text; }
   function summary(kind, label, detail, state) {
     setText(kind + "-state", label);
     setText(kind + "-detail", detail);

@@ -115,6 +115,20 @@ def configure():
     return data
 
 
+def wait_for_server(url, alive, timeout=120):
+    """Never launch a browser on an unready server; supervision retries the workload."""
+    deadline = time.monotonic() + timeout
+    while alive() and time.monotonic() < deadline:
+        try:
+            with urlopen(url, timeout=min(1, max(0.01, deadline - time.monotonic()))) as response:
+                if response.status == 200:
+                    return True
+        except OSError:
+            pass
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    return False
+
+
 def main():
     args = sys.argv[1:] or ["run"]
     operation = args.pop(0)
@@ -143,18 +157,17 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     processes.append(subprocess.Popen([sys.executable, str(APP_ROOT / "app/server.py")]))
-    for _ in range(100):
-        if stopping or processes[0].poll() is not None:
-            break
-        try:
-            with urlopen(f"http://127.0.0.1:{os.environ.get('SIGNAGE_HTTP_PORT', '8080')}/healthz", timeout=0.2):
-                break
-        except OSError:
-            time.sleep(0.1)
-    if not stopping and processes[0].poll() is None:
+    ready = wait_for_server(
+        f"http://127.0.0.1:{os.environ.get('SIGNAGE_HTTP_PORT', '8080')}/healthz",
+        lambda: not stopping and processes[0].poll() is None)
+    code = 0
+    if ready and not stopping and processes[0].poll() is None:
         processes.append(subprocess.Popen(["dbus-run-session", "--", "/usr/local/bin/signage-browser",
                                            os.environ["SIGNAGE_URL"], *args]))
-    code = 0
+    elif not stopping:
+        print("HTTP server readiness failed; refusing browser launch. Admiral should retry workload.", flush=True)
+        code = 1
+        shutdown()
     try:
         while not stopping:
             for process in processes:

@@ -11,6 +11,7 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <poll.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
@@ -85,6 +86,7 @@ typedef struct {
     int32_t crtc_x, crtc_y;
     uint32_t crtc_w, crtc_h;
     gint64 arrived_us; /* monotonic time the SHOW reached video_message */
+    gint64 flipped_us;
 } VideoState;
 
 /* The holepunch sink hands decoded frames to the browser instead of committing
@@ -97,13 +99,14 @@ typedef struct {
     GHashTable *serials; /* fb -> latest SHOW serial, while the fb is in a slot */
     guint64 shown, replaced, rejected;
     gint64 pending_submitted_at; /* monotonic time the in-flight video state was committed */
-    gint64 stage_us[4]; /* video message -> commit ioctl -> flip -> release, summed per shown frame */
+    gint64 stage_us[4]; /* message->submit, submit->callback, callback->release */
+    guint64 released_n;
     guint64 stage_n;
 } VideoPlane;
 
 /* Per reporting interval; reset with the fps line. */
 typedef struct {
-    guint64 commits, ebusy, video_commits;
+    guint64 commits, flips, ebusy, video_commits;
     gint64 commit_us, flip_us, max_commit_us, max_flip_us;
     guint64 replaced, video_rejected;
     guint64 video_shown_base, video_replaced_base; /* VideoPlane counters at the interval start */
@@ -133,11 +136,12 @@ typedef struct {
     SignageInput *input;
     GMainLoop *loop;
     GHashTable *handles;
+    GList *copy_retired; /* WPE sources waiting for GPU-copy completion */
     Frame *current, *pending, *queued;
     gboolean commit_pending;
     gboolean frame_complete_early; /* frame callbacks fire on commit, not on flip */ /* a page flip is outstanding; pending may still be NULL (video-only commit) */
     VideoPlane video;
-    guint retry_source;
+    guint retry_source, fence_source, load_source, load_attempts;
     gint64 submitted_at;
     CommitStats stats;
     guint fd_source, watchdog_source, sigterm_source, sigint_source;
@@ -177,6 +181,10 @@ static void write_status(Browser *browser)
 #define JSON_BOOL(key, value) do { json_builder_set_member_name(builder, key); json_builder_add_boolean_value(builder, value); } while (0)
     JSON_STRING("browser", "signage-browser");
     JSON_STRING("version", VERSION);
+    JSON_INT("ui_presented_total", browser->presented);
+    JSON_INT("video_presented_total", browser->video.shown);
+    JSON_INT("video_replaced_total", browser->video.replaced);
+    JSON_INT("video_rejected_total", browser->video.rejected);
     JSON_STRING("device", browser->device);
     JSON_STRING("uri", browser->uri);
     JSON_STRING("error", browser->failure);
@@ -483,9 +491,15 @@ static Frame *frame_new(void)
     return frame;
 }
 
+static gboolean frame_ready(const Frame *frame);
+
 static void release_frame(Browser *browser, Frame *frame)
 {
     if (!frame) return;
+    if (frame->resource && !frame_ready(frame)) {
+        browser->copy_retired = g_list_prepend(browser->copy_retired, frame);
+        return; /* GPU is still sampling WPE's storage */
+    }
     if (frame->fence_fd >= 0) close(frame->fence_fd);
     if (frame->fb && !frame->scanout) drmModeRmFB(browser->fd, frame->fb);
     for (unsigned i = 0; i < frame->n_planes; i++) {
@@ -535,6 +549,35 @@ static gboolean retry_commit(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+static gboolean retry_fence(gpointer data)
+{
+    Browser *browser = data;
+    browser->fence_source = 0;
+    GList *item = browser->copy_retired;
+    while (item) {
+        GList *next = item->next;
+        Frame *frame = item->data;
+        if (frame_ready(frame)) {
+            browser->copy_retired = g_list_delete_link(browser->copy_retired, item);
+            release_frame(browser, frame);
+        }
+        item = next;
+    }
+    submit_commit(browser);
+    if (browser->copy_retired && !browser->fence_source)
+        browser->fence_source = g_timeout_add(1, retry_fence, browser);
+    return G_SOURCE_REMOVE;
+}
+
+/* Never enqueue an unsignalled UI fence on the CRTC: it would stall video too.
+ * Poll only; retain the queued UI and the last completed primary state. */
+static gboolean frame_ready(const Frame *frame)
+{
+    if (!frame || frame->fence_fd < 0) return TRUE;
+    struct pollfd fence = { .fd = frame->fence_fd, .events = POLLIN };
+    return poll(&fence, 1, 0) > 0 && (fence.revents & POLLIN);
+}
+
 /* Puts the queued browser frame and/or the next video state on screen in ONE
  * nonblocking atomic commit. A CRTC takes one commit per vblank, so the UI and
  * the video plane must not commit separately: two committers on one CRTC
@@ -544,6 +587,13 @@ static gboolean submit_commit(Browser *browser)
     VideoPlane *video = &browser->video;
     if (browser->commit_pending || browser->retry_source || (!browser->queued && !video->dirty)) return TRUE;
     Frame *frame = browser->queued;
+    if (frame && !frame_ready(frame)) {
+        /* Recheck UI even when video is static; do not reserve the committer
+         * while waiting for GPU work. New SHOWs can still commit video-only. */
+        if (!browser->fence_source) browser->fence_source = g_timeout_add(1, retry_fence, browser);
+        frame = NULL;
+        if (!video->dirty) return TRUE;
+    }
     for (;;) {
         gboolean with_video = video->dirty && video->plane;
         drmModeAtomicReq *request = drmModeAtomicAlloc();
@@ -586,7 +636,7 @@ static gboolean submit_commit(Browser *browser)
             if (with_video) {
                 browser->stats.video_commits++;
                 video->pending = video->next;
-                video->pending_submitted_at = g_get_monotonic_time();
+                video->pending_submitted_at = browser->submitted_at;
                 video->pending_valid = TRUE;
                 video->dirty = FALSE;
             }
@@ -691,6 +741,7 @@ static void report_stats(Browser *browser);
 static gboolean report_stats_tick(gpointer data)
 {
     report_stats(data);
+    write_status(data);
     return G_SOURCE_CONTINUE;
 }
 
@@ -709,20 +760,20 @@ static void report_stats(Browser *browser)
                   ", replaced video frames %" G_GUINT64_FORMAT,
                   stats->commits, stats->video_commits, seconds > 0 ? (browser->video.shown - stats->video_shown_base) / seconds : 0,
                   stats->commits ? stats->commit_us / 1000.0 / stats->commits : 0.0, stats->max_commit_us / 1000.0,
-                  stats->commits ? stats->flip_us / 1000.0 / stats->commits : 0.0, stats->max_flip_us / 1000.0,
+                  stats->flips ? stats->flip_us / 1000.0 / stats->flips : 0.0, stats->max_flip_us / 1000.0,
                   stats->ebusy, stats->replaced, browser->video.replaced - stats->video_replaced_base);
         VideoPlane *video = &browser->video;
         if (video->stage_n)
-            g_message("Video stages avg ms: message->commit %.2f, commit->flip %.2f, flip->release %.2f over %" G_GUINT64_FORMAT " frames",
+            g_message("Video stages avg ms: message->commit %.2f, submit->flip-callback %.2f, presented-hold->release %.2f over %" G_GUINT64_FORMAT " frames",
                       video->stage_us[0] / 1000.0 / video->stage_n, video->stage_us[1] / 1000.0 / video->stage_n,
-                      video->stage_us[2] / 1000.0 / video->stage_n, video->stage_n);
+                      video->released_n ? video->stage_us[2] / 1000.0 / video->released_n : 0.0, video->stage_n);
     }
     guint64 shown = browser->video.shown, video_replaced = browser->video.replaced;
     memset(stats, 0, sizeof *stats);
     stats->video_shown_base = shown;
     stats->video_replaced_base = video_replaced;
     memset(browser->video.stage_us, 0, sizeof browser->video.stage_us);
-    browser->video.stage_n = 0;
+    browser->video.stage_n = browser->video.released_n = 0;
     browser->copy.reported_at = now;
     browser->copy.reported_frames = browser->presented;
     browser->copy.copy_us = 0;
@@ -735,23 +786,29 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
     if (!browser->commit_pending) return;
     browser->commit_pending = FALSE;
     gint64 latency = g_get_monotonic_time() - browser->submitted_at;
+    browser->stats.flips++;
     browser->stats.flip_us += latency;
     browser->stats.max_flip_us = MAX(browser->stats.max_flip_us, latency);
     VideoPlane *video = &browser->video;
     if (video->pending_valid) {
-        uint32_t retired = video->current.fb;
+        VideoState retired_state = video->current;
+        uint32_t retired = retired_state.fb;
         video->current = video->pending;
+        video->current.flipped_us = g_get_monotonic_time();
         video->pending_valid = FALSE;
-        if (video->current.fb) {
+        if (video->current.fb && video->current.fb != retired) {
             video->shown++;
             if (video->current.arrived_us) {
                 video->stage_us[0] += video->pending_submitted_at - video->current.arrived_us;
-                video->stage_us[1] += browser->submitted_at - video->pending_submitted_at;
-                video->stage_us[2] += g_get_monotonic_time() - browser->submitted_at;
+                video->stage_us[1] += g_get_monotonic_time() - video->pending_submitted_at;
                 video->stage_n++;
             }
         }
         video_release_if_unused(browser, retired);
+        if (retired && !g_hash_table_contains(video->serials, GUINT_TO_POINTER(retired))) {
+            video->stage_us[2] += g_get_monotonic_time() - retired_state.flipped_us;
+            video->released_n++;
+        }
     }
     if (browser->pending) {
         Frame *retired = browser->current;
@@ -794,7 +851,7 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
     if (!message) g_hash_table_remove_all(video->serials); /* nobody left to tell */
     if (state.fb) g_hash_table_insert(video->serials, GUINT_TO_POINTER(state.fb), GUINT_TO_POINTER(message->serial));
     const VideoState *latest = video->dirty ? &video->next : video->pending_valid ? &video->pending : &video->current;
-    if (!memcmp(latest, &state, sizeof state)) return;
+    if (!state.fb && !latest->fb) return; /* timestamps are diagnostic, not state equality */
     uint32_t replaced = video->dirty ? video->next.fb : 0;
     video->next = state;
     video->dirty = TRUE;
@@ -1355,7 +1412,8 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
         copy_context_leave(browser, &saved);
     }
     /* The pixels are ours now (or the copy failed): hand the buffer straight back to WebKit. */
-    wpe_view_backend_exportable_fdo_dispatch_release_buffer(browser->exportable, resource->buffer_resource);
+    if (fence_fd < 0)
+        wpe_view_backend_exportable_fdo_dispatch_release_buffer(browser->exportable, resource->buffer_resource);
     if (error) {
         if (fence_fd >= 0) close(fence_fd);
         char *message = g_strdup_printf("GPU copy of the WPE frame into a contiguous scanout buffer failed: %s", error);
@@ -1373,6 +1431,7 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
     }
     Frame *frame = frame_new();
     frame->scanout = target;
+    frame->resource = fence_fd >= 0 ? resource->buffer_resource : NULL;
     frame->fb = target->fb;
     frame->fence_fd = fence_fd;
     return frame;
@@ -1408,6 +1467,7 @@ static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dma
         release_frame(browser, browser->queued);
     }
     browser->queued = frame;
+    if (browser->copy_retired && !browser->fence_source) browser->fence_source = g_timeout_add(1, retry_fence, browser);
     submit_commit(browser);
 }
 
@@ -1457,11 +1517,22 @@ static void load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer da
     if (event == WEBKIT_LOAD_FINISHED) g_message("Page loaded: %s", webkit_web_view_get_uri(view));
 }
 
+static gboolean retry_load(gpointer data)
+{
+    Browser *browser = data;
+    browser->load_source = 0;
+    webkit_web_view_load_uri(browser->view, browser->uri);
+    return G_SOURCE_REMOVE;
+}
+
 static gboolean load_failed(WebKitWebView *view, WebKitLoadEvent event, const char *uri, GError *error, gpointer data)
 {
-    (void)view; (void)event; (void)data;
+    (void)view; (void)event;
+    Browser *browser = data;
     g_warning("Page load failed for %s: %s", uri, error->message);
-    return FALSE;
+    if (++browser->load_attempts >= 5) fail(browser, "Page load failed five times; supervisor must restart");
+    else if (!browser->load_source) browser->load_source = g_timeout_add(500 * browser->load_attempts, retry_load, browser);
+    return TRUE; /* suppress WebKit's error page; retain last scanout */
 }
 
 static void process_terminated(WebKitWebView *view, WebKitWebProcessTerminationReason reason, gpointer data)
@@ -1582,6 +1653,8 @@ static void cleanup(Browser *browser)
     if (browser->watchdog_source) g_source_remove(browser->watchdog_source);
     if (browser->stats_source) g_source_remove(browser->stats_source);
     if (browser->retry_source) g_source_remove(browser->retry_source);
+    if (browser->fence_source) g_source_remove(browser->fence_source);
+    if (browser->load_source) g_source_remove(browser->load_source);
     if (browser->sigterm_source) g_source_remove(browser->sigterm_source);
     if (browser->sigint_source) g_source_remove(browser->sigint_source);
     signage_input_stop(browser->input);
@@ -1625,6 +1698,16 @@ static void cleanup(Browser *browser)
     release_frame(browser, browser->pending);
     release_frame(browser, browser->current);
     browser->queued = browser->pending = browser->current = NULL;
+    if (browser->copy_retired) {
+        /* Scanout is off, but a copy may still sample WPE. Drain GPU before returning sources. */
+        SavedContext saved;
+        if (copy_context_enter(browser, &saved)) { glFinish(); copy_context_leave(browser, &saved); }
+        else return; /* retain resources rather than risking reuse */
+        GList *retired = browser->copy_retired;
+        browser->copy_retired = NULL;
+        for (GList *item = retired; item; item = item->next) release_frame(browser, item->data);
+        g_list_free(retired);
+    }
     /* Before the exportable: its buffers' destroy listeners point into the copy cache. */
     destroy_copy(browser);
     if (browser->view) g_object_unref(browser->view);

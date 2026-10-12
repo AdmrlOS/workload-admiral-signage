@@ -501,13 +501,11 @@ Volume (`/data/media/promo-a.mp4`) override the bundled ones.
 
 ### 4K HEVC demo clip
 
-`media/demo-4k-hevc.mp4` is a 10 s, 3840×2160, 50 fps HEVC Main (L5.1) clip with no audio. It backs
+`media/demo-4k-hevc.mp4` is a 10 s, 3840×2160, **60 fps / 600 frames** HEVC Main (L5.1) clip with no audio. It backs
 the built-in library asset "4K HEVC demo" (`/media/demo-4k-hevc.mp4`). It is not in the default loop;
-add it from the library. It is 50 fps because that is what the T527 plays without drops: cedrus at
-528 MHz decodes 4K HEVC at about 86 fps into its tiled format but only about 64 fps (about 55 fps
-while the browser is presenting) into the linear NV12 the display planes accept, so a 4K60 clip
-falls behind and GStreamer drops frames for QoS. Measured on the board: 4K50 and 4K30 play with no
-dropped frames. Regenerate it with:
+add it from the library. Native 4K60 display acceptance remains a hardware test, not an inference
+from decoder-only fakesink throughput. The earlier 50 fps test asset did not meet this requirement.
+Regenerate from the original 60 fps footage (no frame-rate conversion) with:
 
 ```sh
 scripts/make-demo-4k-hevc.sh [SOURCE.mp4]   # with no argument, downloads the source into $TMPDIR

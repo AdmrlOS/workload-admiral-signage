@@ -43,7 +43,7 @@ typedef struct {
     GstElement *pipeline;
     gulong element_handler;
     GstBus *bus;
-    gulong bus_error_handler, bus_eos_handler;
+    gulong bus_error_handler, bus_eos_handler, bus_qos_handler;
     GMutex lock;
     gint fd, lock_fd, broker_socket; /* broker_socket: kept open for browser-committed frames */
     gboolean browser_commits, broker_video_frames;
@@ -56,8 +56,9 @@ typedef struct {
     gboolean immediate_output;
     gfloat zorder;
     guint res_usage;
-    guint64 decoded_frames, input_frames;
+    guint64 decoded_frames, input_frames, decoder_dropped;
     gint64 last_status;
+    GstCaps *observed_caps;
     gchar *decoder, *decoded_caps, *error, *state;
 } AdmiralSink;
 
@@ -95,6 +96,12 @@ write_status(AdmiralSink *self, gboolean force)
     INT_FIELD("render_width", self->render_width); INT_FIELD("render_height", self->render_height);
     INT_FIELD("decoded_width", self->decoded_width); INT_FIELD("decoded_height", self->decoded_height);
     INT_FIELD("decoded_frames", self->decoded_frames); INT_FIELD("sink_input_frames", self->input_frames);
+    INT_FIELD("decoder_qos_dropped", self->decoder_dropped);
+    guint64 rendered = 0, dropped = 0;
+    GstStructure *stats = NULL;
+    if (self->kms) g_object_get(self->kms, "stats", &stats, NULL);
+    if (stats) { gst_structure_get_uint64(stats, "rendered", &rendered); gst_structure_get_uint64(stats, "dropped", &dropped); gst_structure_free(stats); }
+    INT_FIELD("basesink_rendered", rendered); INT_FIELD("basesink_dropped", dropped);
     INT_FIELD("pid", getpid()); INT_FIELD("updated_at_unix_ms", g_get_real_time() / 1000);
     INT_FIELD("connector_id", self->connector_id); INT_FIELD("crtc_id", self->crtc_id);
     INT_FIELD("browser_plane_id", self->browser_plane_id); INT_FIELD("video_plane_id", self->video_plane_id);
@@ -305,14 +312,15 @@ decoder_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer data)
     g_mutex_lock(&self->lock);
     gboolean failed = self->failed;
     if (!failed) {
-        g_free(self->decoder); self->decoder = g_strdup(name);
+        if (g_strcmp0(self->decoder, name)) { g_free(self->decoder); self->decoder = g_strdup(name); }
         self->decoder_verified = TRUE;
         self->decoded_frames++;
         GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
         for (guint i = 0; buffer && i < gst_buffer_n_memory(buffer); i++)
             self->dmabuf_seen |= gst_is_dmabuf_memory(gst_buffer_peek_memory(buffer, i));
         GstCaps *caps = gst_pad_get_current_caps(pad);
-        if (caps && gst_caps_get_size(caps)) {
+        if (caps && gst_caps_get_size(caps) && (!self->observed_caps || !gst_caps_is_equal(caps, self->observed_caps))) {
+            gst_caps_replace(&self->observed_caps, caps);
             g_free(self->decoded_caps); self->decoded_caps = gst_caps_to_string(caps);
             const GstStructure *s = gst_caps_get_structure(caps, 0);
             gst_structure_get_int(s, "width", &self->decoded_width);
@@ -368,6 +376,19 @@ pipeline_message(GstBus *bus, GstMessage *message, gpointer data)
     if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
         gst_message_parse_error(message, &error, &debug);
     g_mutex_lock(&self->lock);
+    if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_QOS) {
+        GstObject *origin = GST_MESSAGE_SRC(message);
+        GstElementFactory *factory = GST_IS_ELEMENT(origin) ? gst_element_get_factory(GST_ELEMENT(origin)) : NULL;
+        const gchar *klass = factory ? gst_element_factory_get_metadata(factory, GST_ELEMENT_METADATA_KLASS) : NULL;
+        if (klass && strstr(klass, "Decoder") && strstr(klass, "Video")) {
+            GstFormat format; guint64 processed, dropped;
+            gst_message_parse_qos_stats(message, &format, &processed, &dropped);
+            if (format == GST_FORMAT_BUFFERS) self->decoder_dropped = dropped;
+            write_status(self, FALSE);
+        }
+        g_mutex_unlock(&self->lock);
+        return;
+    }
     self->decoder_verified = FALSE;
     g_free(self->state);
     self->state = g_strdup(error ? "error" : "ended");
@@ -396,6 +417,7 @@ watch_pipeline(AdmiralSink *self)
         gst_bus_enable_sync_message_emission(self->bus);
         self->bus_error_handler = g_signal_connect(self->bus, "sync-message::error", G_CALLBACK(pipeline_message), self);
         self->bus_eos_handler = g_signal_connect(self->bus, "sync-message::eos", G_CALLBACK(pipeline_message), self);
+        self->bus_qos_handler = g_signal_connect(self->bus, "sync-message::qos", G_CALLBACK(pipeline_message), self);
     }
     GstIterator *iterator = gst_bin_iterate_recurse(GST_BIN(object));
     GValue item = G_VALUE_INIT;
@@ -418,6 +440,7 @@ release_resources(AdmiralSink *self)
     if (self->bus) {
         g_signal_handler_disconnect(self->bus, self->bus_error_handler);
         g_signal_handler_disconnect(self->bus, self->bus_eos_handler);
+        g_signal_handler_disconnect(self->bus, self->bus_qos_handler);
         gst_bus_disable_sync_message_emission(self->bus);
         gst_object_unref(self->bus); self->bus = NULL;
     }
@@ -661,6 +684,7 @@ admiral_sink_finalize(GObject *object)
 {
     AdmiralSink *self = (AdmiralSink *)object;
     release_resources(self);
+    gst_caps_replace(&self->observed_caps, NULL);
     g_free(self->decoder); g_free(self->decoded_caps); g_free(self->error); g_free(self->state);
     g_mutex_clear(&self->lock);
     G_OBJECT_CLASS(admiral_sink_parent_class)->finalize(object);

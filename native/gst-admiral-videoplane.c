@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -42,6 +43,9 @@ typedef struct {
 typedef struct {
     GstVideoSink parent;
     GMutex lock;
+    GCond receiver_wake;
+    GThread *receiver;
+    gboolean receiver_stop;
     gint fd, socket, mode_width, mode_height;
     GstVideoInfo info;
     gboolean have_info, disconnected;
@@ -110,11 +114,10 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
                                 sizeof(self->incoming) - self->incoming_length, MSG_DONTWAIT);
         if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         if (received <= 0) {
-            /* Replaced by a newer sink or the browser exited: nothing we sent is
-             * shown by us any more. */
+            /* Peer went away; this is not proof scanout has retired. */
             GST_WARNING_OBJECT(self, "Browser frame broker closed the connection");
             self->disconnected = TRUE;
-            g_hash_table_remove_all(self->held);
+            /* EOF is not a scanout acknowledgement: browser hide may still be pending. */
             return;
         }
         self->incoming_length += (gsize)received;
@@ -128,6 +131,22 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
         if (held && held->serial == message.serial)
             g_hash_table_remove(self->held, GUINT_TO_POINTER(message.fb));
     }
+}
+
+/* Duplicate descriptors are child-owned and remain open until finalize.
+ * State and the byte-stream parser have one mutex; stop joins before teardown.
+ * Unlike show_frame, this loop runs even when upstream QoS drops all frames. */
+static gpointer release_receiver(gpointer data)
+{
+    AdmiralPlaneSink *self = data;
+    g_mutex_lock(&self->lock);
+    while (!self->receiver_stop) {
+        drain_releases(self, 0);
+        g_cond_wait_until(&self->receiver_wake, &self->lock,
+                          g_get_monotonic_time() + 5000);
+    }
+    g_mutex_unlock(&self->lock);
+    return NULL;
 }
 
 static void
@@ -391,6 +410,10 @@ admiral_plane_sink_start(GstBaseSink *base)
     gboolean ok = self->fd >= 0 && self->socket >= 0 && self->mode_width > 0 && self->mode_height > 0;
     self->disconnected = FALSE;
     self->hidden = TRUE;
+    if (ok && !self->receiver) {
+        self->receiver_stop = FALSE;
+        self->receiver = g_thread_new("video-releases", release_receiver, self);
+    }
     g_mutex_unlock(&self->lock);
     if (!ok) GST_ELEMENT_ERROR(self, RESOURCE, SETTINGS, ("No brokered DRM descriptor for the browser-committed video plane"), (NULL));
     return ok;
@@ -402,6 +425,17 @@ admiral_plane_sink_stop(GstBaseSink *base)
 {
     AdmiralPlaneSink *self = (AdmiralPlaneSink *)base;
     g_mutex_lock(&self->lock);
+    if (!self->receiver && !self->have_info && !g_hash_table_size(self->held)) {
+        g_mutex_unlock(&self->lock);
+        return TRUE;
+    }
+    self->receiver_stop = TRUE;
+    g_cond_signal(&self->receiver_wake);
+    GThread *receiver = self->receiver;
+    self->receiver = NULL;
+    g_mutex_unlock(&self->lock);
+    if (receiver) g_thread_join(receiver);
+    g_mutex_lock(&self->lock);
     if (self->socket >= 0 && !self->disconnected) {
         SignageVideoMessage hide = { .type = SIGNAGE_VIDEO_HIDE };
         if (send_message(self, &hide)) {
@@ -412,10 +446,15 @@ admiral_plane_sink_stop(GstBaseSink *base)
         if (g_hash_table_size(self->held))
             GST_WARNING_OBJECT(self, "%u video framebuffers not released by the browser in time", g_hash_table_size(self->held));
     }
-    g_hash_table_remove_all(self->held);
     gst_buffer_replace(&self->last, NULL);
     self->last_fb = 0;
-    prune_framebuffers(self, TRUE);
+    if (g_hash_table_size(self->held)) {
+        /* Fail safe: preserve decoder storage and FBs until process exit, not
+         * pool reuse while an unacknowledged pending/current plane may read it. */
+        GST_ERROR_OBJECT(self, "Retaining unacknowledged scanout buffers until process exit");
+        self->held = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, held_free);
+        self->framebuffers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    } else prune_framebuffers(self, TRUE);
     self->have_info = FALSE;
     self->incoming_length = 0;
     g_mutex_unlock(&self->lock);
@@ -464,8 +503,14 @@ admiral_plane_sink_configure(GstElement *element, gint drm_fd, gint socket_fd, g
 {
     AdmiralPlaneSink *self = (AdmiralPlaneSink *)element;
     g_mutex_lock(&self->lock);
-    self->fd = drm_fd;
-    self->socket = socket_fd;
+    /* Child owns duplicate descriptors, so parent teardown cannot race recv or
+     * let a reused descriptor number refer to an unrelated connection. */
+    if (self->fd >= 0) close(self->fd);
+    if (self->socket >= 0) close(self->socket);
+    self->fd = dup(drm_fd);
+    self->socket = dup(socket_fd);
+    struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 };
+    if (self->socket >= 0) setsockopt(self->socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     self->mode_width = mode_width;
     self->mode_height = mode_height;
     g_mutex_unlock(&self->lock);
@@ -475,9 +520,14 @@ static void
 admiral_plane_sink_finalize(GObject *object)
 {
     AdmiralPlaneSink *self = (AdmiralPlaneSink *)object;
+    /* Normally stop already joined; also cover failed/partial state transitions. */
+    admiral_plane_sink_stop(GST_BASE_SINK(self));
+    if (self->socket >= 0) close(self->socket);
+    if (self->fd >= 0) close(self->fd);
     g_hash_table_unref(self->held);
     g_hash_table_unref(self->framebuffers);
     gst_buffer_replace(&self->last, NULL);
+    g_cond_clear(&self->receiver_wake);
     g_mutex_clear(&self->lock);
     G_OBJECT_CLASS(admiral_plane_sink_parent_class)->finalize(object);
 }
@@ -502,6 +552,7 @@ static void
 admiral_plane_sink_init(AdmiralPlaneSink *self)
 {
     g_mutex_init(&self->lock);
+    g_cond_init(&self->receiver_wake);
     self->fd = self->socket = -1;
     self->hidden = TRUE;
     self->framebuffers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);

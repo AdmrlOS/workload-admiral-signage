@@ -137,5 +137,5 @@ int main(int argc, char **argv) {
         self.assertLess(source.index('browser->view = webkit_web_view_new(backend)'),
                         source.index('wpe_view_backend_dispatch_set_device_scale_factor('))
         self.assertLess(source.index('wpe_view_backend_dispatch_set_device_scale_factor('),
-                        source.index('webkit_web_view_load_uri(browser->view, browser->uri)'))
+                        source.index('webkit_web_view_load_uri(browser->view, browser->uri)', source.index('static gboolean initialize_webkit(')))
         self.assertIn('browser->ui_height = browser->mode.vdisplay;\n        if (!choose_view_size(browser))', source)

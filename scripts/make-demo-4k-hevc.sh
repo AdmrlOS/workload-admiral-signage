@@ -1,5 +1,5 @@
 #!/bin/sh
-# Reproduce media/demo-4k-hevc.mp4: a 10 s, 3840x2160, 50 fps HEVC Main (L5.1)
+# Reproduce media/demo-4k-hevc.mp4: a 10 s, 3840x2160, 60 fps HEVC Main (L5.1)
 # clip for the built-in "4K HEVC demo" library asset (not in the default loop).
 #
 # Source: "Test Jellyfin 4K HEVC 8bit 40M.mp4" by Gnattu, from the Jellyfin test
@@ -20,9 +20,12 @@ if [ -z "$src" ]; then
       "https://repo.jellyfin.org/test-videos/SDR/HEVC%208bit/Test%20Jellyfin%204K%20HEVC%208bit%2040M.mp4"
   fi
 fi
-ffmpeg -hide_banner -y -ss 8 -i "$src" -t 10 -an -vf fps=50 \
+# Refuse a 50/30 fps or smaller source instead of synthesizing duplicate frames.
+probe=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of csv=p=0 "$src")
+[ "$probe" = "3840,2160,60/1" ] || { printf '%s\n' "Expected native 3840x2160 60/1 source; got $probe" >&2; exit 1; }
+ffmpeg -hide_banner -y -ss 8 -i "$src" -t 10 -an \
   -c:v libx265 -preset medium -profile:v main -pix_fmt yuv420p \
-  -x265-params crf=22:keyint=100:min-keyint=100:vbv-maxrate=25000:vbv-bufsize=50000:level-idc=5.1 \
+  -x265-params crf=22:keyint=120:min-keyint=120:vbv-maxrate=25000:vbv-bufsize=50000:level-idc=5.1 \
   -tag:v hvc1 -movflags +faststart "$out"
 ffprobe -v error -select_streams v:0 \
   -show_entries stream=codec_name,profile,width,height,pix_fmt,r_frame_rate,nb_frames -of compact "$out"
