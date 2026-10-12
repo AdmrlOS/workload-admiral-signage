@@ -33,10 +33,17 @@
     document.getElementById('now-playing').textContent = name;
     window.parent.postMessage({type:'signage-status',empty:!entry,name},location.origin);
   }
+  function cancelProgress(item) {
+    item.generation = (item.generation || 0) + 1;
+    clearTimeout(item.poll); clearTimeout(item.qualityTimer);
+    if (item.frameCallback != null) item.node.cancelVideoFrameCallback?.(item.frameCallback);
+    item.frameCallback = null;
+    item.cancelReady?.();
+  }
   function remove(item) {
     if (!item) return;
-    clearTimeout(item.watchdog); clearTimeout(item.poll);
-    clearTimeout(item.qualityTimer);
+    cancelProgress(item);
+    clearTimeout(item.watchdog);
     if (item.node.tagName === 'VIDEO' && !item.released) { item.released = true; item.node.onended = item.node.onerror = item.node.ontimeupdate = null; item.node.pause(); item.node.removeAttribute('src'); item.node.load(); }
     item.node.remove(); if (item.cover) { item.cover.remove(); dbg('cover removed'); }
   }
@@ -89,18 +96,20 @@
       let ready;
       if (a.kind === 'video') {
         ready = new Promise((resolve,reject) => {
-          const alarm=setTimeout(() => reject(new Error('Video did not start')),15000);
-          node.onerror=() => { clearTimeout(alarm); reject(new Error('Video unavailable')); };
+          let done=false, checkTimer=0, callback=null;
+          const cleanup=() => { clearTimeout(alarm); clearTimeout(checkTimer); if(callback!=null) node.cancelVideoFrameCallback?.(callback); callback=null; node.onplaying=null; };
+          item.cancelReady=() => { done=true; cleanup(); };
+          const alarm=setTimeout(() => { done=true; cleanup(); reject(new Error('Video did not start')); },15000);
+          node.onerror=() => { done=true; cleanup(); reject(new Error('Video unavailable')); };
           node.onplaying=() => {
+            if(done || checkTimer || callback!=null) return;
             dbg('playing', {id:a.id});
-            // Resolve on the first sign of progress: a presented frame (rVFC, when delivered) or
-            // currentTime advancing past its value at 'playing'. Holepunch sinks often never deliver
-            // rVFC callbacks, so the polled currentTime check is the primary signal; there is no
-            // fixed dwell, which would otherwise hold the outgoing still on screen after 'ended'.
-            const start=node.currentTime; let done=false;
-            const finish=() => { if(done) return; done=true; clearTimeout(alarm); dbg('first progress', {id:a.id}); resolve(); };
-            if (node.requestVideoFrameCallback) node.requestVideoFrameCallback(finish);
-            const check=() => { if (done) return; if (node.readyState>=2 && node.currentTime>start) finish(); else if (node.isConnected) setTimeout(check,30); };
+            // Holepunch can expose rVFC without ever delivering it. Media-clock progress
+            // is readiness only, never evidence that a frame was actually presented.
+            const start=node.currentTime;
+            const finish=() => { if(done) return; done=true; cleanup(); dbg('first progress', {id:a.id}); resolve(); };
+            if (node.requestVideoFrameCallback) callback=node.requestVideoFrameCallback(finish);
+            const check=() => { if(done) return; if(node.readyState>=2 && node.currentTime>start) finish(); else if(node.isConnected) checkTimer=setTimeout(check,30); };
             check();
           };
         });
@@ -116,20 +125,38 @@
     } catch(error) { remove(item); throw error; }
   }
   function arm(item) {
-    clearTimeout(timer); clearTimeout(item.poll); clearTimeout(item.qualityTimer); item.fired = false;
-    // A new arm (restart in place, reconcile) invalidates progress callbacks already queued by the
-    // previous one, so exactly one hand-off and one quality sample per second are live.
-    const generation = (item.generation = (item.generation || 0) + 1);
+    clearTimeout(timer); cancelProgress(item); item.fired = false;
+    const generation = item.generation;
     const duration=item.entry.duration || item.entry.asset.video_duration || 120;
-    const finish=() => { if(item.generation!==generation || current!==item || stopped || item.fired) return; item.fired=true; clearTimeout(item.poll); advance(); };
+    const active=() => item.generation===generation && current===item && !stopped && !item.fired;
+    const finish=(reason='duration') => {
+      if(!active()) return;
+      item.fired=true;
+      if(debugOn) {
+        const q=item.node.getVideoPlaybackQuality?.();
+        dbg('end transition', {id:item.entry.asset.id, generation, reason, ct:item.node.currentTime,
+          callbacks:item.callbackCount || 0, presented:item.presentedFrames ?? null,
+          created:q?.totalVideoFrames ?? null, dropped:q?.droppedVideoFrames ?? null});
+      }
+      cancelProgress(item); advance();
+    };
     if (item.node.tagName === 'VIDEO') {
       const v=item.node;
-      // Hand off ~50 ms before the end so the outgoing frame is replaced without a 'ended' gap.
-      // 'ended', 'error' and the watchdog remain as fallbacks; item.fired makes the advance one-shot.
-      const progress=() => { if(item.generation!==generation || item.fired || current!==item) return; if(!(v.duration > 0) || !Number.isFinite(v.duration)) { if(v.requestVideoFrameCallback) v.requestVideoFrameCallback(progress); return; } if(v.currentTime >= v.duration-0.05) { dbg('early hand-off', {id:item.entry.asset.id}); finish(); } else if(v.requestVideoFrameCallback) v.requestVideoFrameCallback(progress); };
-      v.onended=finish; v.onerror=finish; v.ontimeupdate=progress;
-      if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(progress);
-      const poll=() => { if(item.fired || current!==item || stopped) return; progress(); if(!item.fired) item.poll=setTimeout(poll,50); };
+      item.callbackCount=0; item.presentedFrames=null;
+      // Only EOS ends a complete clip: currentTime nearing duration is NOT final-frame proof.
+      // Clock polling remains an EOS fallback for sinks whose rVFC never fires.
+      const progress=() => { if(active() && v.ended && !v.seeking) finish('ended'); };
+      const frame=(_now,metadata) => {
+        if(!active()) return;
+        item.frameCallback=null; item.callbackCount++;
+        item.presentedFrames=metadata?.presentedFrames ?? null;
+        progress();
+        if(active()) item.frameCallback=v.requestVideoFrameCallback(frame);
+      };
+      v.onended=() => { if(v.ended && !v.seeking) finish('ended'); };
+      v.onerror=() => finish('error'); v.ontimeupdate=progress;
+      if(v.requestVideoFrameCallback) item.frameCallback=v.requestVideoFrameCallback(frame);
+      const poll=() => { if(!active()) return; progress(); if(active()) item.poll=setTimeout(poll,50); };
       item.poll=setTimeout(poll,50);
       if (debugOn && v.getVideoPlaybackQuality) {
         let qn=0;
@@ -142,7 +169,10 @@
         };
         item.qualityTimer=setTimeout(quality,1000);
       }
-      timer=setTimeout(finish,((item.entry.duration || duration+5))*1000);
+      // Explicitly shortened entries may cut playback; full-length entries wait for EOS.
+      const fullDuration=Number.isFinite(v.duration) && v.duration>0 ? v.duration : item.entry.asset.video_duration;
+      const short=item.entry.duration && fullDuration && item.entry.duration < fullDuration;
+      timer=setTimeout(() => finish(short ? 'scheduled-cut' : 'watchdog'),(short ? item.entry.duration : duration+5)*1000);
     } else timer=setTimeout(finish,duration*1000);
   }
   async function advance(forceId) {
@@ -154,7 +184,11 @@
     try {
       const candidate = playlist[index];
       // Same clip back to back (including a one-entry loop): restart in place. No teardown, no cover,
-      // still exactly one decoder. The early hand-off point is the same as for a normal advance.
+      // still exactly one decoder. Invalidate handlers before seek/play can dispatch media events.
+      if(current) {
+        cancelProgress(current);
+        current.node.onended = current.node.onerror = current.node.ontimeupdate = null;
+      }
       if (current && current.node.tagName === 'VIDEO' && current.node.isConnected && candidate && candidate.asset.kind === 'video' && candidate.asset.url === current.entry.asset.url) {
         dbg('restart in place', {id:candidate.asset.id});
         current.entry = candidate; current.held = false;

@@ -24,7 +24,15 @@ async function harness(entries, options={}) {
     get duration() { return options.duration ?? NaN; }
     getVideoPlaybackQuality() { return {totalVideoFrames: options.frames ?? 0, droppedVideoFrames: options.dropped ?? 0}; }
     play() { events.push('play:'+this.src); this._playing=true; queueMicrotask(() => this.onplaying?.()); return Promise.resolve(); }
-    requestVideoFrameCallback(fn) { if(options.frameCallbacks===false || this._rvfc) return; this._rvfc=true; queueMicrotask(() => { events.push('video-ready'); fn(); }); }
+    requestVideoFrameCallback(fn) {
+      this.callbacks ??= new Map(); const id=++serial; this.callbacks.set(id,fn);
+      if(options.frameCallbacks!==false && !options.manualCallbacks && !this._rvfc) {
+        this._rvfc=true; queueMicrotask(() => { this.callbacks.delete(id); events.push('video-ready'); fn(0,{presentedFrames:1}); });
+      }
+      return id;
+    }
+    cancelVideoFrameCallback(id) { this.callbacks?.delete(id); }
+    get ended() { return this._ended || false; }
   }
   const stage=new Element('div'), body=new Element('body'), head=new Element('head'), status=new Element('div');
   const window={parent:{postMessage(){}},addEventListener:(type,fn) => (listeners[type]??=[]).push(fn),removeEventListener:(type,fn) => { listeners[type]=(listeners[type]||[]).filter((f)=>f!==fn); }};
@@ -41,7 +49,7 @@ const entry=(id,kind,duration=1)=>({id,asset_id:id,duration,enabled:true,start:n
 
 test('video handoff keeps an opaque still until the next video makes progress',async()=>{
   const h=await harness([entry('a','video'),entry('b','video')]);
-  await h.run(1000);
+  const v=h.nodes.find((n)=>n.tagName==='VIDEO'); v._ended=true; v.onended(); await h.settle();
   const secondPlay=h.events.indexOf('play:/b');
   assert.ok(secondPlay>h.events.indexOf('release:VIDEO'));
   const cover=h.nodes.find((n)=>n.className==='cover');
@@ -119,21 +127,31 @@ test('production video fallback retains the outgoing surface when media has not 
   assert.equal(h.nodes.find((n)=>n.tagName==='VIDEO').isConnected,false);
 });
 
-test('early hand-off advances before ended when media time nears the end',async()=>{
+test('poll and timeupdate cannot multiply the single pending frame callback',async()=>{
+  const clip=entry('a','video',10);
+  const h=await harness([clip],{duration:10,currentTime:1,frameCallbacks:false});
+  await h.run(30); // readiness fallback, leaving rVFC undelivered
+  const v=h.nodes.find((n)=>n.tagName==='VIDEO');
+  for(let i=0;i<5;i++) { v.ontimeupdate(); await h.run(50); }
+  assert.equal(v.callbacks.size,1,'Exactly one callback, including cancelled readiness callback');
+});
+
+test('full clip keeps its final frames until EOS, not a 50ms early handoff',async()=>{
   const clip=entry('a','video',10); clip.asset.video_duration=10;
   const h=await harness([clip,entry('b','video')],{duration:10,currentTime:9.92});
   await h.run(50);
-  assert.ok(h.events.includes('play:/b'),'The next item must start before the first clip reports ended');
-  assert.equal(h.nodes.filter((n)=>n.tagName==='VIDEO'&&n.isConnected).length,1,'Still one live decoder');
+  assert.equal(h.events.includes('play:/b'),false,'Frames 598-600 must not be cut off');
+  const v=h.nodes.find((n)=>n.tagName==='VIDEO'); v._ended=true; v.onended(); await h.settle();
+  assert.ok(h.events.includes('play:/b'));
 });
 
-test('early hand-off does not double-advance when ended and the poll both fire',async()=>{
+test('EOS does not double-advance when an old ended handler fires',async()=>{
   const clip=entry('a','video',10);
   const h=await harness([clip,entry('b','video'),entry('c','video')],{duration:10,currentTime:9.92});
   const first=h.nodes.find((n)=>n.tagName==='VIDEO');
   await h.settle();
   const lateEnded=first.onended; // Captured while 'a' is live, fired after the hand-off.
-  await h.run(50);
+  first._ended=true; first.onended(); await h.settle();
   const plays=h.events.filter((e)=>e.startsWith('play:')).length;
   assert.ok(lateEnded,'The first clip must still have its ended handler armed');
   lateEnded();
@@ -144,7 +162,7 @@ test('early hand-off does not double-advance when ended and the poll both fire',
 test('outgoing video holds on the next clip poster as its cover',async()=>{
   const first=entry('a','video'); const second=entry('b','video'); second.asset.poster='/b-poster.jpg';
   const h=await harness([first,second]);
-  await h.run(1000);
+  const v=h.nodes.find((n)=>n.tagName==='VIDEO'); v._ended=true; v.onended(); await h.settle();
   const covers=h.nodes.filter((n)=>n.className==='cover');
   assert.equal(covers.length,1);
   assert.equal(covers[0]._src,'/b-poster.jpg','The cover must be the incoming clip first frame, not the outgoing end poster');
@@ -152,7 +170,7 @@ test('outgoing video holds on the next clip poster as its cover',async()=>{
 
 test('same clip back to back restarts in place without a new video element',async()=>{
   const h=await harness([entry('a','video')]);
-  await h.run(1000);
+  const v=h.nodes.find((n)=>n.tagName==='VIDEO'); v._ended=true; v.onended(); await h.settle();
   assert.equal(h.nodes.filter((n)=>n.tagName==='VIDEO').length,1,'No second decoder may be created');
   assert.equal(h.events.filter((e)=>e==='release:VIDEO').length,0,'The clip must not be released');
   assert.equal(h.nodes.filter((n)=>n.className==='cover').length,0,'No cover for an in-place restart');
@@ -162,7 +180,7 @@ test('same clip back to back restarts in place without a new video element',asyn
 test('a looping clip restarts in place exactly once per loop',async()=>{
   const clip=entry('a','video',10); clip.asset.video_duration=10;
   const h=await harness([clip],{duration:10,currentTime:9.92,search:'?debug=1'});
-  await h.run(50);
+  const v=h.nodes.find((n)=>n.tagName==='VIDEO'); v._ended=true; v.onended(); await h.settle();
   assert.equal(h.events.filter((e)=>e==='seek').length,1,'ontimeupdate and the poll must not both restart the clip');
   assert.equal(h.logs.filter((l)=>l.includes('restart in place')).length,1);
 });
@@ -176,6 +194,70 @@ test('the debug quality line is one sample per second, not one per frame callbac
   const samples=h.logs.filter((l)=>l.includes('"ev":"quality"'));
   assert.equal(samples.length,2,'Exactly one quality sample per elapsed second');
   assert.ok(samples[1].includes('"ct":3'),'The sample must read the live currentTime, not a stale closure');
+});
+
+test('full-length duration timer is a watchdog, never an EOS substitute',async()=>{
+  const clip=entry('a','video',10);
+  const h=await harness([clip],{duration:10,currentTime:1});
+  assert.equal([...h.timers.values()].some(t=>t.ms===10000),false);
+  assert.ok([...h.timers.values()].some(t=>t.ms===15000));
+});
+
+test('cancelled frame callback cannot schedule or restart the new loop generation',async()=>{
+  const h=await harness([entry('a','video',10)],{duration:10,currentTime:1,frameCallbacks:false});
+  await h.run(30);
+  const v=h.nodes.find(n=>n.tagName==='VIDEO');
+  const oldFrame=[...v.callbacks.values()][0], oldEnd=v.onended;
+  v._ended=true; oldEnd(); await h.settle();
+  v._ended=false;
+  oldFrame(0,{presentedFrames:600}); oldEnd(); await h.settle();
+  assert.equal(h.events.filter(e=>e==='seek').length,1);
+  assert.equal(v.callbacks.size,1);
+  const id=[...v.callbacks.keys()][0], callback=v.callbacks.get(id);
+  v.callbacks.delete(id); callback(0,{presentedFrames:1});
+  assert.equal(v.callbacks.size,1,'A live callback replaces itself with exactly one successor');
+});
+
+test('page teardown cancels a never-delivered callback and stale polls',async()=>{
+  const h=await harness([entry('a','video',10)],{duration:10,currentTime:1,frameCallbacks:false});
+  await h.run(30);
+  const v=h.nodes.find(n=>n.tagName==='VIDEO');
+  h.setPlaylist([]); await h.run(2000);
+  assert.equal(v.callbacks.size,0);
+  assert.equal([...h.timers.values()].some(t=>t.ms===50),false);
+});
+
+test('600-frame loops retain every callback and produce one EOS restart per loop',async()=>{
+  const clip=entry('a','video',10);
+  const h=await harness([clip],{duration:10,currentTime:0,frameCallbacks:false,search:'?debug=1'});
+  await h.run(30);
+  const v=h.nodes.find(n=>n.tagName==='VIDEO');
+  for(let loop=0;loop<3;loop++) {
+    v._ended=false;
+    for(let n=1;n<=600;n++) {
+      v._t=n/60;
+      const id=[...v.callbacks.keys()][0], callback=v.callbacks.get(id);
+      v.callbacks.delete(id); callback(0,{presentedFrames:loop*600+n});
+      v.ontimeupdate();
+      assert.equal(v.callbacks.size,1);
+      assert.equal(h.events.filter(e=>e==='seek').length,loop,'No restart before frame 600 and EOS');
+    }
+    const oldEnd=v.onended; v._ended=true; oldEnd(); await h.settle();
+    v._ended=false; oldEnd(); await h.settle();
+    assert.equal(h.events.filter(e=>e==='seek').length,loop+1);
+  }
+  const ends=h.logs.filter(l=>l.includes('"ev":"end transition"')).map(l=>JSON.parse(l.slice(9)));
+  assert.equal(ends.length,3);
+  assert.ok(ends.every(e=>e.callbacks===600 && e.reason==='ended'));
+  assert.deepEqual(ends.map(e=>e.presented),[600,1200,1800]);
+});
+
+test('holepunch clock progress never fabricates presented-frame counts',async()=>{
+  const h=await harness([entry('a','video',10)],{duration:10,currentTime:0,frameCallbacks:false,search:'?debug=1'});
+  await h.run(30);
+  const v=h.nodes.find(n=>n.tagName==='VIDEO'); v._ended=true; v.onended(); await h.settle();
+  const end=JSON.parse(h.logs.find(l=>l.includes('"ev":"end transition"')).slice(9));
+  assert.equal(end.presented,null); assert.equal(end.callbacks,0);
 });
 
 test('hand-off has no fixed dwell timer',async()=>{
