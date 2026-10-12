@@ -79,6 +79,70 @@ class ContentTests(unittest.TestCase):
         self.assertEqual((self.root / 'media/promo-a.mp4').read_bytes(), b'video')
         self.assertIn('promo-a', [e['asset_id'] for e in state['entries']])
 
+    def test_bundled_4k_demo_is_a_library_asset_but_not_in_the_loop(self):
+        (self.root / 'library.json').unlink()
+        (self.app / 'media/demo-4k-hevc.mp4').write_bytes(b'video')
+        details = {'video_duration': 10, 'poster': '/media/demo-4k-hevc.mp4.poster.jpg',
+                   'end_poster': '/media/demo-4k-hevc.mp4.end_poster.jpg'}
+        with patch.object(content, 'video_details', return_value=details):
+            state = content.read(self.root, self.app)
+        asset = next(a for a in state['assets'] if a['id'] == 'demo-4k-hevc')
+        self.assertEqual((asset['name'], asset['kind'], asset['url']), ('4K HEVC demo', 'video', '/media/demo-4k-hevc.mp4'))
+        self.assertEqual(asset['end_poster'], details['end_poster'])
+        self.assertEqual((self.root / 'media/demo-4k-hevc.mp4').read_bytes(), b'video')
+        self.assertNotIn('demo-4k-hevc', [e['asset_id'] for e in state['entries']])
+        self.assertEqual(state['demo_catalog'], 3)
+
+    def test_catalog_2_upgrade_appends_4k_asset_and_keeps_entries(self):
+        (self.app / 'media/demo-4k-hevc.mp4').write_bytes(b'video')
+        state = json.loads(json.dumps(self.state))
+        state['demo_catalog'] = 2
+        state['assets'] = [a for a in state['assets'] if a['id'] != 'demo-4k-hevc']
+        state['entries'][0]['duration'] = 7  # An intentionally edited loop.
+        before = json.loads(json.dumps(state['entries']))
+        revision = state['revision']
+        details = {'video_duration': 10, 'poster': 'p', 'end_poster': 'e'}
+        with patch.object(content, 'video_details', return_value=details) as probe:
+            self.assertTrue(content.upgrade_demos(state, self.root, self.app))
+            self.assertFalse(content.upgrade_demos(state, self.root, self.app))
+            probe.assert_called_once()
+        self.assertEqual(state['entries'], before)
+        self.assertEqual(state['demo_catalog'], 3)
+        self.assertEqual(state['revision'], revision + 1)
+        self.assertEqual([a['id'] for a in state['assets']].count('demo-4k-hevc'), 1)
+        self.assertEqual(next(a for a in state['assets'] if a['id'] == 'demo-4k-hevc')['end_poster'], 'e')
+
+    def test_catalog_3_upgrade_without_clip_in_image_stays_retryable(self):
+        state = json.loads(json.dumps(self.state))
+        state['demo_catalog'] = 2
+        state['assets'] = [a for a in state['assets'] if a['id'] != 'demo-4k-hevc']
+        self.assertFalse(content.upgrade_demos(state, self.root, self.app))
+        self.assertEqual(state['demo_catalog'], 2)
+        self.assertNotIn('demo-4k-hevc', [a['id'] for a in state['assets']])
+
+    def test_video_stills_fit_4k_without_upscaling_and_end_poster_uses_last_frame(self):
+        file = self.app / 'media/clip.mp4'
+        file.write_bytes(b'video')
+        calls = []
+        def fake_run(args, **kwargs):
+            if args[0] == 'ffprobe':
+                return type('R', (), {'stdout': json.dumps({'format': {'duration': '10.0'}})})()
+            calls.append(args)
+            Path(args[-1]).write_bytes(b'jpg')
+            return type('R', (), {'stdout': ''})()
+        with patch.object(content.subprocess, 'run', side_effect=fake_run):
+            details = content.video_details(file, '/media/clip.mp4')
+        self.assertEqual(details['end_poster'], '/media/clip.mp4.end_poster.jpg')
+        for args in calls:
+            vf = args[args.index('-vf') + 1]
+            self.assertEqual(vf, "scale='min(3840,iw)':'min(2160,ih)':force_original_aspect_ratio=decrease")
+            self.assertNotIn('1920', vf)
+        end = calls[1]
+        self.assertEqual(end[end.index('-sseof') + 1], '-1')
+        # -update is an image2 output option; before -i, ffmpeg 7 fails the whole library start.
+        self.assertGreater(end.index('-update'), end.index('-i'))
+        self.assertEqual(end[end.index('-update') + 1], '1')
+
     def test_schedule_inclusive_start_exclusive_end_and_timezone(self):
         item = self.state['entries'][0]
         item.update(start='2026-10-10T10:00:00+11:00', end='2026-10-10T11:00:00+11:00')

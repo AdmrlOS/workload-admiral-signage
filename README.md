@@ -137,20 +137,59 @@ properties that this WebKit path expects and hands decoded frames to the
 browser, which scans them out on the video plane. This is an owned compatibility
 adapter, not the Westeros compositor. No external compositor is involved.
 
-The web view does not render at the display mode. `SIGNAGE_UI_SIZE` sets the view
-and framebuffer size; by default a mode larger than 1920×1080 renders at the
-largest size within 1920×1080 that keeps the mode's aspect ratio (3840×2160 →
-1920×1080) and the primary plane's scaler stretches it over the whole CRTC
-(`SRC_W/H` = UI size, `CRTC_W/H` = mode size). Before committing to scaling the
-browser runs an atomic `TEST_ONLY` commit of the scaled configuration; if the
-kernel rejects it, it logs the failure and falls back to UI size = mode size. The
-status JSON reports `width`/`height` (mode) and `ui_width`/`ui_height`.
+`SIGNAGE_UI_SIZE` selects the **physical framebuffer** size and defaults to the
+selected display mode (`native`). With the default `SIGNAGE_UI_SCALE=1`, a
+3840×2160 mode means both a **3840×2160 framebuffer and CSS viewport**
+(`devicePixelRatio=1`). There is no default 1080p cap. To select 4K explicitly:
 
-WebKit reports the video rectangle in web-view (UI) coordinates, while the NV12
-overlay is positioned in CRTC coordinates. The broker passes the UI and mode sizes
-to the adapter, which scales the rectangle by mode/UI per axis, rounding outward
-to even pixels (NV12 chroma is subsampled), before setting the video sink's
-render rectangle. With equal sizes the rectangle passes through unchanged.
+```sh
+SIGNAGE_DRM_MODE=3840x2160
+```
+
+Leave `SIGNAGE_UI_SIZE` and `SIGNAGE_UI_SCALE` unset for native rendering.
+An explicit lower size such as `SIGNAGE_UI_SIZE=1920x1080` is an **opt-in
+performance choice**: it renders a smaller framebuffer that the primary plane
+stretches over the display. `SIGNAGE_UI_SIZE=3840x2160` also works when the mode
+is at least that large. Native 4K increases GPU/buffer cost; measure frame rate
+and memory use on the target hardware.
+
+`SIGNAGE_UI_SCALE` defaults to `1` and is a WPE device scale factor, **not page
+zoom or a KMS upscale**. An explicit `SIGNAGE_UI_SCALE=2` with native 4K retains
+the 3840×2160 framebuffer but uses a 1920×1080 CSS viewport and
+`devicePixelRatio=2`; text and SVG still render at native resolution. Canvas pages
+must size their own backing stores using DPR; low-resolution raster assets are
+not made sharper.
+Values must be finite and in libwpe's supported range 0.05–5, and must divide the
+framebuffer dimensions into integer logical dimensions. Invalid settings fail startup.
+
+Fixed-size HTML pages such as the menuboard declare their design size via
+`signage-canvas`. `/player/bridge.js` fits them to the CSS viewport using body
+`zoom` (2× for a 1920×1080 design in the default 3840×2160 viewport). This is
+page layout/paint scaling inside the native framebuffer: text and SVG are
+rasterized at the enlarged native resolution, not rendered into a 1080p
+framebuffer and then upscaled by KMS. Raster images and fixed-resolution canvas
+backing stores still retain their source-resolution limits.
+
+Before committing to primary-plane scaling the browser runs an atomic
+`TEST_ONLY` commit; if the kernel rejects it, it logs the failure and falls back
+to framebuffer size = mode size, recalculating the logical viewport. The status
+JSON reports `width`/`height` (mode), `ui_width`/`ui_height` (physical framebuffer),
+`view_width`/`view_height` (logical viewport), and `ui_scale`.
+
+WebKit's Westeros holepunch path reports the video rectangle after the compositor
+transform, including device scale, in **physical UI framebuffer coordinates**.
+The broker therefore continues to pass physical UI and mode sizes to the adapter,
+which scales by mode/UI per axis, rounding outward to even pixels (NV12 chroma is
+subsampled). Passing logical dimensions here would apply device scale twice.
+Native libwpe pointer and axis positions also remain physical; WebKit divides
+positions by device scale for DOM events, so input bounds must not become logical.
+These contracts were checked against libwpe's public scale API, Cog's DRM backend,
+and upstream WebKit 2.48's `ThreadedCompositor`,
+`CoordinatedPlatformLayerBufferHolePunch`, and libwpe event factory. No board was
+accessed for this change: the installed WebKit build still needs verification of
+exported 3840×2160 buffers, the default 3840×2160 CSS viewport/DPR 1, pointer
+alignment and inset video rectangle alignment (also at explicit scale 2), plus
+frame rate and memory use.
 The adapter also constrains decoder output to linear `NV12` before the sink;
 without it a stateless decoder can negotiate the tiled `NV12_32L32`, which the
 display shows as garbage.
@@ -326,7 +365,8 @@ See Admiral's [launch contract](https://docs.admrl.co/core-concepts/configuratio
 | `SIGNAGE_DRM_DEVICE` | Auto-detect | Display DRM card path, independent of GPU render-node numbering. |
 | `SIGNAGE_RENDER_DEVICE` | Display GBM/kmsro | Optional GPU render node (for example `/dev/dri/renderD128`) for EGL; frames are imported into the separate display card, or GPU-copied into buffers allocated from it. |
 | `SIGNAGE_DRM_MODE` | Auto-select | Display mode override as `WIDTHxHEIGHT@REFRESH`. |
-| `SIGNAGE_UI_SIZE` | Mode size, or largest ≤1920×1080 of the mode's aspect ratio | Web view size as `WIDTHxHEIGHT`, no larger than the mode; the primary plane scales it to the mode. |
+| `SIGNAGE_UI_SIZE` | Native mode size | Physical framebuffer size: `native` uses the mode; `WIDTHxHEIGHT` must not exceed it. Smaller buffers are an opt-in performance choice, scaled to the mode by the primary plane. |
+| `SIGNAGE_UI_SCALE` | `1` | WPE device scale, finite 0.05–5; framebuffer/scale must give integer logical dimensions. Default native 4K has a 3840×2160 CSS viewport; explicit scale `2` gives 1920×1080 CSS on the same 3840×2160 framebuffer. |
 | `SIGNAGE_DRM_CONNECTOR` | Auto-select | Display connector ID or name. |
 | `SIGNAGE_DRM_PRIMARY_PLANE` | Auto-select | Browser primary-plane ID. |
 | `SIGNAGE_VIDEO_PLANE_ID` | Auto-select | Compatible NV12 video-overlay ID. |
@@ -458,6 +498,24 @@ scripts/make-menuboard-media.sh SOURCE_A.mp4 SOURCE_B.mp4
 
 Both clips must be H.264 (the allowed stateless decoders also take HEVC/VP9). Files in the Custom
 Volume (`/data/media/promo-a.mp4`) override the bundled ones.
+
+### 4K HEVC demo clip
+
+`media/demo-4k-hevc.mp4` is a 10 s, 3840×2160, 50 fps HEVC Main (L5.1) clip with no audio. It backs
+the built-in library asset "4K HEVC demo" (`/media/demo-4k-hevc.mp4`). It is not in the default loop;
+add it from the library. It is 50 fps because that is what the T527 plays without drops: cedrus at
+528 MHz decodes 4K HEVC at about 86 fps into its tiled format but only about 64 fps (about 55 fps
+while the browser is presenting) into the linear NV12 the display planes accept, so a 4K60 clip
+falls behind and GStreamer drops frames for QoS. Measured on the board: 4K50 and 4K30 play with no
+dropped frames. Regenerate it with:
+
+```sh
+scripts/make-demo-4k-hevc.sh [SOURCE.mp4]   # with no argument, downloads the source into $TMPDIR
+```
+
+Attribution: derived from "Test Jellyfin 4K HEVC 8bit 40M.mp4" by Gnattu, from the Jellyfin test
+videos (https://repo.jellyfin.org/test-videos/), licensed CC BY-SA 4.0. The clip is trimmed and
+re-encoded. This file is distributed under CC BY-SA 4.0.
 
 ## Board acceptance runbook
 

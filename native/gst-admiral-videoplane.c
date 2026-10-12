@@ -53,6 +53,10 @@ typedef struct {
     gboolean hidden;
     guint8 incoming[sizeof(SignageVideoMessage)];
     gsize incoming_length;
+    /* Per-second render diagnostics (SIGNAGE_VIDEO_STATS=1). */
+    gboolean stats;
+    gint64 stats_at, blocked_us, render_us;
+    guint frames, max_held;
 } AdmiralPlaneSink;
 
 typedef struct { GstVideoSinkClass parent_class; } AdmiralPlaneSinkClass;
@@ -302,7 +306,11 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     if (!send_message(self, &message)) return GST_FLOW_ERROR;
     self->hidden = FALSE;
     /* The browser keeps at most three; more means it stopped presenting. */
-    if (g_hash_table_size(self->held) > MIN_POOL_BUFFERS) drain_releases(self, 50);
+    if (g_hash_table_size(self->held) > MIN_POOL_BUFFERS) {
+        gint64 before = g_get_monotonic_time();
+        drain_releases(self, 50);
+        self->blocked_us += g_get_monotonic_time() - before;
+    }
     return GST_FLOW_OK;
 }
 
@@ -311,7 +319,24 @@ admiral_plane_sink_show_frame(GstVideoSink *video_sink, GstBuffer *buffer)
 {
     AdmiralPlaneSink *self = (AdmiralPlaneSink *)video_sink;
     g_mutex_lock(&self->lock);
+    gint64 start = g_get_monotonic_time();
     GstFlowReturn result = self->have_info && self->fd >= 0 && self->socket >= 0 ? show_locked(self, buffer) : GST_FLOW_NOT_NEGOTIATED;
+    if (self->stats) {
+        gint64 now = g_get_monotonic_time();
+        self->render_us += now - start;
+        self->frames++;
+        self->max_held = MAX(self->max_held, g_hash_table_size(self->held));
+        if (!self->stats_at) self->stats_at = now;
+        if (now - self->stats_at >= G_USEC_PER_SEC) {
+            guint64 rendered = 0, dropped = 0;
+            GstStructure *st = NULL;
+            g_object_get(self, "stats", &st, NULL);
+            if (st) { gst_structure_get_uint64(st, "rendered", &rendered); gst_structure_get_uint64(st, "dropped", &dropped); gst_structure_free(st); }
+            g_message("Video sink: %u frames in %.2f s, render avg %.2f ms, blocked on releases %.1f ms, max held %u, basesink rendered %" G_GUINT64_FORMAT " dropped %" G_GUINT64_FORMAT,
+                      self->frames, (now - self->stats_at) / 1e6, self->render_us / 1000.0 / self->frames, self->blocked_us / 1000.0, self->max_held, rendered, dropped);
+            self->stats_at = now; self->frames = 0; self->render_us = self->blocked_us = 0; self->max_held = 0;
+        }
+    }
     g_mutex_unlock(&self->lock);
     return result;
 }
@@ -481,4 +506,9 @@ admiral_plane_sink_init(AdmiralPlaneSink *self)
     self->hidden = TRUE;
     self->framebuffers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     self->held = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, held_free);
+    self->stats = g_strcmp0(g_getenv("SIGNAGE_VIDEO_STATS"), "1") == 0;
+    /* Experiment knobs: SIGNAGE_VIDEO_QOS=0 disables QoS events upstream; SIGNAGE_VIDEO_MAX_LATENESS_MS. */
+    if (g_strcmp0(g_getenv("SIGNAGE_VIDEO_QOS"), "0") == 0) gst_base_sink_set_qos_enabled(GST_BASE_SINK(self), FALSE);
+    const gchar *lateness = g_getenv("SIGNAGE_VIDEO_MAX_LATENESS_MS");
+    if (lateness && *lateness) gst_base_sink_set_max_lateness(GST_BASE_SINK(self), g_ascii_strtoll(lateness, NULL, 10) * GST_MSECOND);
 }

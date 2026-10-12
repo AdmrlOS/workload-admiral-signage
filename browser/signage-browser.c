@@ -17,6 +17,8 @@
 #include <glib-unix.h>
 #include <inttypes.h>
 #include <json-glib/json-glib.h>
+#include <math.h>
+#include <stdlib.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -82,6 +84,7 @@ typedef struct {
     uint32_t src_x, src_y, src_w, src_h; /* 16.16 */
     int32_t crtc_x, crtc_y;
     uint32_t crtc_w, crtc_h;
+    gint64 arrived_us; /* monotonic time the SHOW reached video_message */
 } VideoState;
 
 /* The holepunch sink hands decoded frames to the browser instead of committing
@@ -93,6 +96,9 @@ typedef struct {
     gboolean pending_valid, dirty;
     GHashTable *serials; /* fb -> latest SHOW serial, while the fb is in a slot */
     guint64 shown, replaced, rejected;
+    gint64 pending_submitted_at; /* monotonic time the in-flight video state was committed */
+    gint64 stage_us[4]; /* video message -> commit ioctl -> flip -> release, summed per shown frame */
+    guint64 stage_n;
 } VideoPlane;
 
 /* Per reporting interval; reset with the fps line. */
@@ -109,7 +115,9 @@ typedef struct {
     char *device;
     uint32_t connector, crtc, crtc_index, primary;
     drmModeModeInfo mode;
-    unsigned ui_width, ui_height; /* WPE view and framebuffer size; the primary plane scales it to mode */
+    unsigned ui_width, ui_height; /* physical framebuffer size; primary plane scales it to mode */
+    unsigned view_width, view_height; /* logical WPE/CSS viewport */
+    float ui_scale; /* WPE device scale factor, not page zoom */
     uint32_t mode_blob;
     uint32_t connector_crtc, crtc_mode, crtc_active;
     uint32_t plane_fb, plane_crtc, plane_src_x, plane_src_y, plane_src_w, plane_src_h;
@@ -133,6 +141,7 @@ typedef struct {
     gint64 submitted_at;
     CommitStats stats;
     guint fd_source, watchdog_source, sigterm_source, sigint_source;
+    guint stats_source;
     guint64 presented;
     gboolean modeset;
     gboolean holepunch;
@@ -179,6 +188,10 @@ static void write_status(Browser *browser)
     JSON_INT("height", browser->mode.vdisplay);
     JSON_INT("ui_width", browser->ui_width);
     JSON_INT("ui_height", browser->ui_height);
+    JSON_INT("view_width", browser->view_width);
+    JSON_INT("view_height", browser->view_height);
+    json_builder_set_member_name(builder, "ui_scale");
+    json_builder_add_double_value(builder, browser->ui_scale);
     JSON_INT("refresh", mode_refresh(&browser->mode));
     JSON_INT("presented_frames", browser->presented);
     JSON_STRING("scanout_path", browser->presented == 0 ? "pending" : browser->copy_mode ? "gpu-copy" : "direct");
@@ -353,41 +366,63 @@ static gboolean try_device(Browser *browser, const char *path)
     return TRUE;
 }
 
-static unsigned gcd_unsigned(unsigned a, unsigned b)
+
+/* WPEBackend-fdo takes logical sizes and exports size * device-scale buffers.
+ * Keep integer logical dimensions exact so exported buffers match our KMS pool. */
+static gboolean choose_view_size(Browser *browser)
 {
-    while (b) { unsigned t = a % b; a = b; b = t; }
-    return a;
+    const char *wanted = g_getenv("SIGNAGE_UI_SCALE");
+    double scale = 1.0;
+    if (wanted && *wanted) {
+        char *end = NULL;
+        errno = 0;
+        scale = g_ascii_strtod(wanted, &end);
+        /* libwpe's public API only accepts [0.05, 5.0]. */
+        if (end == wanted || *end || errno || !isfinite(scale) || scale < 0.05 || scale > 5.0) {
+            g_printerr("Invalid SIGNAGE_UI_SCALE '%s'; expected a finite number from 0.05 to 5.0\n", wanted);
+            return FALSE;
+        }
+    }
+    browser->ui_scale = (float)scale;
+    browser->view_width = (unsigned)(browser->ui_width / scale + 0.5);
+    browser->view_height = (unsigned)(browser->ui_height / scale + 0.5);
+    if (!browser->view_width || !browser->view_height ||
+        fabs((double)browser->view_width * browser->ui_scale - browser->ui_width) > 0.001 ||
+        fabs((double)browser->view_height * browser->ui_scale - browser->ui_height) > 0.001) {
+        g_printerr("SIGNAGE_UI_SCALE %g must produce integer logical dimensions for the %ux%u framebuffer\n",
+                   scale, browser->ui_width, browser->ui_height);
+        return FALSE;
+    }
+    g_message("Browser framebuffer %ux%u, logical viewport %ux%u, device scale %g, display mode %ux%u%s",
+              browser->ui_width, browser->ui_height, browser->view_width, browser->view_height, (double)browser->ui_scale,
+              browser->mode.hdisplay, browser->mode.vdisplay,
+              browser->ui_width == browser->mode.hdisplay && browser->ui_height == browser->mode.vdisplay ? "" : " (scaled by the primary plane)");
+    return TRUE;
 }
 
-/* GPU rendering cost scales with pixels: modes above 1080p render the UI at the
- * largest size within 1920x1080 that keeps the mode's aspect ratio. */
+/* Render at the display mode by default. A smaller explicit framebuffer is an
+ * opt-in performance tradeoff, upscaled by the primary plane. */
 static gboolean choose_ui_size(Browser *browser)
 {
     unsigned mode_w = browser->mode.hdisplay, mode_h = browser->mode.vdisplay;
     browser->ui_width = mode_w;
     browser->ui_height = mode_h;
     const char *wanted = g_getenv("SIGNAGE_UI_SIZE");
-    if (wanted && *wanted) {
-        unsigned width = 0, height = 0;
-        char trailing;
-        if (sscanf(wanted, "%ux%u%c", &width, &height, &trailing) != 2 || !width || !height || width > mode_w || height > mode_h) {
-            g_printerr("Invalid SIGNAGE_UI_SIZE '%s'; expected WIDTHxHEIGHT no larger than the %ux%u mode\n", wanted, mode_w, mode_h);
+    if (wanted && *wanted && strcmp(wanted, "native")) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long width = strtoull(wanted, &end, 10);
+        const char *height_start = end && *end == 'x' ? end + 1 : "";
+        unsigned long long height = strtoull(height_start, &end, 10);
+        if (wanted[0] < '0' || wanted[0] > '9' || height_start[0] < '0' || height_start[0] > '9' ||
+            *end || errno || !width || !height || width > mode_w || height > mode_h) {
+            g_printerr("Invalid SIGNAGE_UI_SIZE '%s'; expected native or WIDTHxHEIGHT no larger than the %ux%u mode\n", wanted, mode_w, mode_h);
             return FALSE;
         }
-        browser->ui_width = width;
-        browser->ui_height = height;
-    } else if (mode_w > 1920 || mode_h > 1080) {
-        unsigned divisor = gcd_unsigned(mode_w, mode_h);
-        unsigned ratio_w = mode_w / divisor, ratio_h = mode_h / divisor;
-        unsigned factor = MIN(1920 / ratio_w, 1080 / ratio_h);
-        if (factor) {
-            browser->ui_width = ratio_w * factor;
-            browser->ui_height = ratio_h * factor;
-        }
+        browser->ui_width = (unsigned)width;
+        browser->ui_height = (unsigned)height;
     }
-    g_message("Browser UI %ux%u, display mode %ux%u%s", browser->ui_width, browser->ui_height, mode_w, mode_h,
-              browser->ui_width == mode_w && browser->ui_height == mode_h ? "" : " (scaled by the primary plane)");
-    return TRUE;
+    return choose_view_size(browser);
 }
 
 static gboolean open_display(Browser *browser)
@@ -551,6 +586,7 @@ static gboolean submit_commit(Browser *browser)
             if (with_video) {
                 browser->stats.video_commits++;
                 video->pending = video->next;
+                video->pending_submitted_at = g_get_monotonic_time();
                 video->pending_valid = TRUE;
                 video->dirty = FALSE;
             }
@@ -645,8 +681,17 @@ static gboolean initial_scanout(Browser *browser)
                   browser->ui_width, browser->ui_height, browser->mode.hdisplay, browser->mode.vdisplay, g_strerror(saved_errno));
         browser->ui_width = browser->mode.hdisplay;
         browser->ui_height = browser->mode.vdisplay;
+        if (!choose_view_size(browser)) return FALSE;
     }
     return FALSE;
+}
+
+static void report_stats(Browser *browser);
+
+static gboolean report_stats_tick(gpointer data)
+{
+    report_stats(data);
+    return G_SOURCE_CONTINUE;
 }
 
 static void report_stats(Browser *browser)
@@ -655,10 +700,10 @@ static void report_stats(Browser *browser)
     CommitStats *stats = &browser->stats;
     if (browser->copy.reported_at) {
         double seconds = (now - browser->copy.reported_at) / (double)G_USEC_PER_SEC;
-        guint64 copied = browser->copy.copied - browser->copy.reported_frames;
+        guint64 presented = browser->presented - browser->copy.reported_frames;
         g_message("Presented %" G_GUINT64_FORMAT " browser frames (%.1f fps over the last %.0f s, path=%s, GPU copy avg %.2f ms)",
-                  browser->presented, seconds > 0 ? 600 / seconds : 0, seconds, browser->copy_mode ? "gpu-copy" : "direct",
-                  copied ? browser->copy.copy_us / 1000.0 / copied : 0.0);
+                  presented, seconds > 0 ? presented / seconds : 0, seconds, browser->copy_mode ? "gpu-copy" : "direct",
+                  presented ? browser->copy.copy_us / 1000.0 / presented : 0.0);
         g_message("Commits: %" G_GUINT64_FORMAT " (%" G_GUINT64_FORMAT " with video, %.1f video fps), ioctl avg %.2f max %.2f ms, "
                   "submit->flip avg %.2f max %.2f ms, EBUSY %" G_GUINT64_FORMAT ", replaced UI frames %" G_GUINT64_FORMAT
                   ", replaced video frames %" G_GUINT64_FORMAT,
@@ -666,13 +711,20 @@ static void report_stats(Browser *browser)
                   stats->commits ? stats->commit_us / 1000.0 / stats->commits : 0.0, stats->max_commit_us / 1000.0,
                   stats->commits ? stats->flip_us / 1000.0 / stats->commits : 0.0, stats->max_flip_us / 1000.0,
                   stats->ebusy, stats->replaced, browser->video.replaced - stats->video_replaced_base);
+        VideoPlane *video = &browser->video;
+        if (video->stage_n)
+            g_message("Video stages avg ms: message->commit %.2f, commit->flip %.2f, flip->release %.2f over %" G_GUINT64_FORMAT " frames",
+                      video->stage_us[0] / 1000.0 / video->stage_n, video->stage_us[1] / 1000.0 / video->stage_n,
+                      video->stage_us[2] / 1000.0 / video->stage_n, video->stage_n);
     }
     guint64 shown = browser->video.shown, video_replaced = browser->video.replaced;
     memset(stats, 0, sizeof *stats);
     stats->video_shown_base = shown;
     stats->video_replaced_base = video_replaced;
+    memset(browser->video.stage_us, 0, sizeof browser->video.stage_us);
+    browser->video.stage_n = 0;
     browser->copy.reported_at = now;
-    browser->copy.reported_frames = browser->copy.copied;
+    browser->copy.reported_frames = browser->presented;
     browser->copy.copy_us = 0;
 }
 
@@ -690,7 +742,15 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
         uint32_t retired = video->current.fb;
         video->current = video->pending;
         video->pending_valid = FALSE;
-        if (video->current.fb) video->shown++;
+        if (video->current.fb) {
+            video->shown++;
+            if (video->current.arrived_us) {
+                video->stage_us[0] += video->pending_submitted_at - video->current.arrived_us;
+                video->stage_us[1] += browser->submitted_at - video->pending_submitted_at;
+                video->stage_us[2] += g_get_monotonic_time() - browser->submitted_at;
+                video->stage_n++;
+            }
+        }
         video_release_if_unused(browser, retired);
     }
     if (browser->pending) {
@@ -705,8 +765,7 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
             else
                 g_message("First ARGB DMA-BUF browser frame scanned out directly on plane %u; alpha preserved without GLES copy", browser->primary);
         }
-        if (browser->presented % 600 == 0) report_stats(browser);
-        if (browser->presented == 1 || browser->presented % 120 == 0) write_status(browser);
+        if (browser->presented % 120 == 0) write_status(browser);
     }
     if (!browser->frame_complete_early) wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
     submit_commit(browser);
@@ -726,6 +785,7 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
         state.src_w = message->src_w; state.src_h = message->src_h;
         state.crtc_x = message->crtc_x; state.crtc_y = message->crtc_y;
         state.crtc_w = message->crtc_w; state.crtc_h = message->crtc_h;
+        state.arrived_us = g_get_monotonic_time();
     } else if (message && message->type == SIGNAGE_VIDEO_SHOW) {
         g_warning("Ignoring malformed video frame message for fb %u", message->fb);
         signage_drm_broker_video_released(message->fb, message->serial);
@@ -765,6 +825,7 @@ static void setup_video_plane(Browser *browser)
     video->plane = plane;
     video->serials = g_hash_table_new(g_direct_hash, g_direct_equal);
     g_message("Video plane %u is committed by the browser together with the UI (one atomic commit per vblank)", plane);
+    browser->stats_source = g_timeout_add_seconds(1, (GSourceFunc)report_stats_tick, browser);
 }
 
 static gboolean drm_ready(gint fd, GIOCondition condition, gpointer data)
@@ -1481,13 +1542,15 @@ static gboolean initialize_webkit(Browser *browser)
     static const struct wpe_view_backend_exportable_fdo_client client = {
         .export_buffer_resource = export_legacy, .export_dmabuf_resource = export_dmabuf, .export_shm_buffer = export_shm
     };
-    browser->exportable = wpe_view_backend_exportable_fdo_create(&client, browser, browser->ui_width, browser->ui_height);
+    browser->exportable = wpe_view_backend_exportable_fdo_create(&client, browser, browser->view_width, browser->view_height);
     if (!browser->exportable) { fail(browser, "Cannot create the WPE exportable backend"); return FALSE; }
     browser->backend = wpe_view_backend_exportable_fdo_get_view_backend(browser->exportable);
     configure_sandbox();
     WebKitWebViewBackend *backend = webkit_web_view_backend_new(browser->backend, NULL, NULL);
     browser->view = webkit_web_view_new(backend);
     if (!browser->view) { fail(browser, "Cannot create the WebKit web view"); return FALSE; }
+    /* Dispatch after WebKit installs its backend client, before navigation. */
+    wpe_view_backend_dispatch_set_device_scale_factor(browser->backend, browser->ui_scale);
     WebKitColor background = { 0, 0, 0, 0 };
     webkit_web_view_set_background_color(browser->view, &background);
     WebKitSettings *settings = webkit_web_view_get_settings(browser->view);
@@ -1507,6 +1570,7 @@ static gboolean initialize_webkit(Browser *browser)
     wpe_view_backend_set_fullscreen_handler(browser->backend, fullscreen, browser);
     wpe_view_backend_add_activity_state(browser->backend, wpe_view_activity_state_visible | wpe_view_activity_state_focused | wpe_view_activity_state_in_window);
     wpe_view_backend_set_target_refresh_rate(browser->backend, mode_refresh(&browser->mode) * 1000);
+    /* libwpe pointer/axis positions are physical; WebKit divides by device scale. */
     browser->input = signage_input_start(browser->backend, browser->ui_width, browser->ui_height);
     webkit_web_view_load_uri(browser->view, browser->uri);
     return TRUE;
@@ -1516,6 +1580,7 @@ static void cleanup(Browser *browser)
 {
     if (browser->fd_source) g_source_remove(browser->fd_source);
     if (browser->watchdog_source) g_source_remove(browser->watchdog_source);
+    if (browser->stats_source) g_source_remove(browser->stats_source);
     if (browser->retry_source) g_source_remove(browser->retry_source);
     if (browser->sigterm_source) g_source_remove(browser->sigterm_source);
     if (browser->sigint_source) g_source_remove(browser->sigint_source);
@@ -1587,8 +1652,9 @@ static void help(void)
          "SIGNAGE_DRM_CONNECTOR       Connector name (HDMI-A-1) or numeric ID\n"
          "SIGNAGE_DRM_PRIMARY_PLANE   Numeric ARGB8888 primary-plane ID\n"
          "SIGNAGE_DRM_MODE            WIDTHxHEIGHT[@REFRESH] (otherwise preferred connector mode)\n"
-         "SIGNAGE_UI_SIZE            WIDTHxHEIGHT of the web view, scaled to the mode by the primary plane\n"
-         "                            (default: mode size, or the largest <=1920x1080 size of the mode's aspect ratio)\n"
+         "SIGNAGE_UI_SIZE            native or WIDTHxHEIGHT physical framebuffer, scaled to the mode by the primary plane\n"
+         "                            (default: native mode size; smaller sizes are opt-in performance choices)\n"
+         "SIGNAGE_UI_SCALE           Device scale (default 1; finite 0.05..5, integer logical viewport required)\n"
          "SIGNAGE_VIDEO_MODE          holepunch (default) or composited\n"
          "SIGNAGE_VIDEO_SINK          kmssink lets kmssink commit the video plane itself (default: the browser commits it with the UI)\n"
          "SIGNAGE_FRAME_CALLBACK      flip releases WebKit's frame callback at the page flip (default: when the commit is accepted)\n"
@@ -1628,6 +1694,7 @@ int main(int argc, char **argv)
     if (browser.holepunch) {
         GError *error = NULL;
         if (!signage_drm_broker_start(browser.fd, browser.connector, browser.crtc, browser.crtc_index, browser.primary,
+                                     /* Westeros rectangles include the compositor device-scale transform. */
                                      browser.ui_width, browser.ui_height,
                                      browser.mode.hdisplay, browser.mode.vdisplay, &error)) {
             browser.holepunch_error = g_strdup(error ? error->message : "DRM holepunch broker initialization failed");

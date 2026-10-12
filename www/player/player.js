@@ -7,6 +7,9 @@
   let lastPoll = 0, previousRevision = null, stopped = false;
   const images = new Map(), hints = new Map();
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve,ms));
+  // Hand-off timeline marks for on-device timing: ?debug=1 or localStorage.signageDebug='1'. No-op otherwise.
+  const debugOn = (() => { try { return /[?&]debug=1(&|$)/.test(location.search) || localStorage.getItem('signageDebug') === '1'; } catch (_) { return false; } })();
+  const dbg = (ev, extra) => { if (debugOn) console.log('[player] ' + JSON.stringify({t:(typeof performance !== 'undefined' ? performance.now() : Date.now()).toFixed(1), ev, ...extra})); };
   const paint = () => new Promise((resolve) => { const alarm=setTimeout(resolve,250); requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(alarm); resolve(); })); });
   function imageReady(url) {
     while (!images.has(url) && images.size >= 8) images.delete(images.keys().next().value);
@@ -32,9 +35,10 @@
   }
   function remove(item) {
     if (!item) return;
-    clearTimeout(item.watchdog);
-    if (item.node.tagName === 'VIDEO') { item.node.onended = item.node.onerror = null; item.node.pause(); item.node.removeAttribute('src'); item.node.load(); }
-    item.node.remove(); if (item.cover) item.cover.remove();
+    clearTimeout(item.watchdog); clearTimeout(item.poll);
+    clearTimeout(item.qualityTimer);
+    if (item.node.tagName === 'VIDEO' && !item.released) { item.released = true; item.node.onended = item.node.onerror = item.node.ontimeupdate = null; item.node.pause(); item.node.removeAttribute('src'); item.node.load(); }
+    item.node.remove(); if (item.cover) { item.cover.remove(); dbg('cover removed'); }
   }
   function handshake(frame,type,timeout) {
     return new Promise((resolve,reject) => {
@@ -44,14 +48,25 @@
       window.addEventListener('message',handler);
     });
   }
-  async function hold(item) {
+  async function hold(item, nextPoster) {
     if (!item || item.held) return;
     item.held = true;
     if (item.node.tagName === 'VIDEO') {
-      const url = item.entry.asset.end_poster || item.entry.asset.poster;
-      // Predecoded last-frame still survives teardown of the hardware plane.
-      if (url) { await imageReady(url); const cover = new Image(); cover.className = 'cover'; cover.src = url; stage.appendChild(cover); item.cover = cover; await paint(); }
-      item.node.onended = item.node.onerror = null; item.node.pause(); item.node.removeAttribute('src'); item.node.load(); await paint();
+      dbg('hold start', {id:item.entry.asset.id});
+      // The cover is the next clip's first frame when it has a poster (so the board shows the
+      // incoming still), else this clip's last frame. A failed still never blocks the teardown.
+      for (const url of [nextPoster, item.entry.asset.end_poster, item.entry.asset.poster].filter(Boolean)) {
+        try {
+          await imageReady(url);
+          const cover = new Image(); cover.className = 'cover'; cover.src = url;
+          if (cover.decode) await cover.decode().catch(() => {});
+          stage.appendChild(cover); item.cover = cover; dbg('cover shown', {url}); break;
+        } catch (_) { /* try the next candidate */ }
+      }
+      // Predecoded still survives teardown of the hardware plane. Exactly one paint, before teardown.
+      await paint();
+      item.node.onended = item.node.onerror = item.node.ontimeupdate = null; item.node.pause(); item.node.removeAttribute('src'); item.node.load(); item.released = true;
+      dbg('old video released', {id:item.entry.asset.id});
     } else if (item.node.tagName === 'IFRAME') {
       const posters = {};
       for (const e of playlist) if (e.asset.end_poster) posters[new URL(e.asset.url,location.href).pathname] = e.asset.end_poster;
@@ -68,7 +83,8 @@
     } else if (a.kind === 'image') { node = new Image(); node.className='surface image'; }
     else { node=document.createElement('iframe'); node.className='surface frame'; node.title=a.name; node.setAttribute('sandbox','allow-scripts'); node.setAttribute('allow','autoplay'); }
     node.style.zIndex='1';
-    const item = {entry,node,held:false,watchdog:0};
+    dbg('next element created', {id:a.id, kind:a.kind});
+    const item = {entry,node,held:false,watchdog:0,poll:0,fired:false};
     try {
       let ready;
       if (a.kind === 'video') {
@@ -76,16 +92,19 @@
           const alarm=setTimeout(() => reject(new Error('Video did not start')),15000);
           node.onerror=() => { clearTimeout(alarm); reject(new Error('Video unavailable')); };
           node.onplaying=() => {
-            // A decoded/presented frame is a stronger signal than canplay.
-            if (node.requestVideoFrameCallback) {
-              // Holepunch sinks can expose the callback API without delivering callbacks.
-              const background=setTimeout(() => { if(node.readyState >= 2 && node.currentTime > 0) { clearTimeout(alarm); resolve(); } },750);
-              node.requestVideoFrameCallback(() => { clearTimeout(background); clearTimeout(alarm); resolve(); });
-            }
-            else { const check=() => { if (node.readyState>=2 && node.currentTime>0) { clearTimeout(alarm); resolve(); } else if (node.isConnected) setTimeout(check,30); }; check(); }
+            dbg('playing', {id:a.id});
+            // Resolve on the first sign of progress: a presented frame (rVFC, when delivered) or
+            // currentTime advancing past its value at 'playing'. Holepunch sinks often never deliver
+            // rVFC callbacks, so the polled currentTime check is the primary signal; there is no
+            // fixed dwell, which would otherwise hold the outgoing still on screen after 'ended'.
+            const start=node.currentTime; let done=false;
+            const finish=() => { if(done) return; done=true; clearTimeout(alarm); dbg('first progress', {id:a.id}); resolve(); };
+            if (node.requestVideoFrameCallback) node.requestVideoFrameCallback(finish);
+            const check=() => { if (done) return; if (node.readyState>=2 && node.currentTime>start) finish(); else if (node.isConnected) setTimeout(check,30); };
+            check();
           };
         });
-        stage.appendChild(node); node.src=a.url;
+        stage.appendChild(node); node.src=a.url; dbg('src set', {id:a.id});
         node.play().catch(() => { if(node.onerror) node.onerror(); });
       } else if (a.kind === 'image') {
         await imageReady(a.url); node.src=a.url; stage.appendChild(node); ready=paint();
@@ -93,16 +112,36 @@
         // Append about:blank first so the handshake can bind to its WindowProxy before navigation.
         stage.appendChild(node); ready=handshake(node,'signage-ready',15000); node.src=a.url;
       }
-      await ready; await paint(); return item;
+      await ready; if (a.kind !== 'video') await paint(); return item;
     } catch(error) { remove(item); throw error; }
   }
   function arm(item) {
-    clearTimeout(timer);
+    clearTimeout(timer); clearTimeout(item.poll); clearTimeout(item.qualityTimer); item.fired = false;
+    // A new arm (restart in place, reconcile) invalidates progress callbacks already queued by the
+    // previous one, so exactly one hand-off and one quality sample per second are live.
+    const generation = (item.generation = (item.generation || 0) + 1);
     const duration=item.entry.duration || item.entry.asset.video_duration || 120;
-    const finish=() => { if(current===item && !stopped) advance(); };
+    const finish=() => { if(item.generation!==generation || current!==item || stopped || item.fired) return; item.fired=true; clearTimeout(item.poll); advance(); };
     if (item.node.tagName === 'VIDEO') {
-      item.node.onended=finish; item.node.onerror=finish;
-      // Full videos follow ended; the watchdog also advances broken or stalled media.
+      const v=item.node;
+      // Hand off ~50 ms before the end so the outgoing frame is replaced without a 'ended' gap.
+      // 'ended', 'error' and the watchdog remain as fallbacks; item.fired makes the advance one-shot.
+      const progress=() => { if(item.generation!==generation || item.fired || current!==item) return; if(!(v.duration > 0) || !Number.isFinite(v.duration)) { if(v.requestVideoFrameCallback) v.requestVideoFrameCallback(progress); return; } if(v.currentTime >= v.duration-0.05) { dbg('early hand-off', {id:item.entry.asset.id}); finish(); } else if(v.requestVideoFrameCallback) v.requestVideoFrameCallback(progress); };
+      v.onended=finish; v.onerror=finish; v.ontimeupdate=progress;
+      if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(progress);
+      const poll=() => { if(item.fired || current!==item || stopped) return; progress(); if(!item.fired) item.poll=setTimeout(poll,50); };
+      item.poll=setTimeout(poll,50);
+      if (debugOn && v.getVideoPlaybackQuality) {
+        let qn=0;
+        const quality=() => {
+          if (item.generation!==generation || current!==item || stopped || qn>=120) return;
+          qn++;
+          const q=v.getVideoPlaybackQuality();
+          dbg('quality', {id:item.entry.asset.id, ct:+v.currentTime.toFixed(2), dur:+(v.duration||0).toFixed(2), created:q.totalVideoFrames, dropped:q.droppedVideoFrames});
+          item.qualityTimer=setTimeout(quality,1000);
+        };
+        item.qualityTimer=setTimeout(quality,1000);
+      }
       timer=setTimeout(finish,((item.entry.duration || duration+5))*1000);
     } else timer=setTimeout(finish,duration*1000);
   }
@@ -113,7 +152,18 @@
     let index = forceId ? playlist.findIndex((e) => e.id===forceId) : current ? (playlist.findIndex((e) => e.id===current.entry.id)+1)%playlist.length : 0;
     index=Math.max(index,0);
     try {
-      try { await hold(current); } catch (_) { /* Retain its visible surface while attempting the next item. */ }
+      const candidate = playlist[index];
+      // Same clip back to back (including a one-entry loop): restart in place. No teardown, no cover,
+      // still exactly one decoder. The early hand-off point is the same as for a normal advance.
+      if (current && current.node.tagName === 'VIDEO' && current.node.isConnected && candidate && candidate.asset.kind === 'video' && candidate.asset.url === current.entry.asset.url) {
+        dbg('restart in place', {id:candidate.asset.id});
+        current.entry = candidate; current.held = false;
+        const v = current.node; v.currentTime = 0; v.play().catch(() => {});
+        notify(candidate); arm(current); return;
+      }
+      // The outgoing clip holds on the incoming clip's first frame when it has one; otherwise its own last frame.
+      const nextPoster = candidate && candidate.asset.kind === 'video' ? candidate.asset.poster : null;
+      try { await hold(current, nextPoster); } catch (_) { /* Retain its visible surface while attempting the next item. */ }
       let next = null;
       const attempts=playlist.length;
       for (let i=0;i<attempts;i++) {

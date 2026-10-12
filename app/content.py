@@ -19,6 +19,7 @@ MAX_UNPACKED = 512 * 1024 * 1024
 TYPES = {'.mp4': 'video', '.webm': 'video', '.mov': 'video', '.png': 'image',
          '.jpg': 'image', '.jpeg': 'image', '.webp': 'image', '.gif': 'image',
          '.avif': 'image', '.html': 'html', '.zip': 'html'}
+DEMO_4K_ID, DEMO_4K_NAME = 'demo-4k-hevc', 'demo-4k-hevc.mp4'
 
 
 class ContentError(Exception):
@@ -37,10 +38,14 @@ def video_details(file, url):
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError()
         details = {'video_duration': duration}
-        for label, seek in (('poster', 0), ('end_poster', max(0, duration - 0.05))):
+        # Stills keep up to the panel's 4K size and never upscale. The end poster seeks to the
+        # container's final second (-sseof -1). -update 1 is an image2 *output* option: before -i,
+        # ffmpeg 7 rejects it ("Option update not found") and the library never starts.
+        scale = "scale='min(3840,iw)':'min(2160,ih)':force_original_aspect_ratio=decrease"
+        for label, seek in (('poster', ['-ss', '0']), ('end_poster', ['-sseof', '-1'])):
             still = file.with_name(file.name + '.' + label + '.jpg')
-            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-ss', str(seek), '-i', str(file),
-                '-frames:v', '1', '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease',
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', *seek, '-i', str(file),
+                '-frames:v', '1', '-update', '1', '-vf', scale,
                 '-q:v', '2', str(still)], capture_output=True, check=True, timeout=60)
             if not still.is_file() or not still.stat().st_size:
                 raise ValueError()
@@ -68,19 +73,49 @@ def demo_entries(assets):
             for identity, duration in order if identity in available]
 
 
-def upgrade_demos(state):
-    """Add the explicit PiP demo once; retain intentionally edited published loops."""
-    if state.get('demo_catalog', 1) >= 2:
-        return False
-    old = [(e['asset_id'], e['duration'], e['enabled'], e['start'], e['end']) for e in state['entries']]
-    shipped = [('welcome', 12, True, None, None), ('menuboard', 48, True, None, None),
-               ('promo-a', 0, True, None, None), ('promo-b', 0, True, None, None)]
-    known = {a['id'] for a in state['assets']}
-    state['assets'].extend(dict(a) for a in PAGE_DEMOS if a['id'] not in known)
-    if old == shipped:
-        state['entries'] = demo_entries(state['assets'])
-    state.update(demo_catalog=2, revision=state['revision']+1, updated_at=time.time())
-    return True
+def builtin_4k_asset(root, app_root):
+    """The bundled 4K HEVC demo clip as a library asset, or None when the image lacks it."""
+    source = app_root / 'media' / DEMO_4K_NAME
+    if not source.is_file():
+        return None
+    file = root / 'media' / DEMO_4K_NAME
+    file.parent.mkdir(parents=True, exist_ok=True)
+    if not file.exists():
+        shutil.copy2(source, file)
+    url = '/media/' + DEMO_4K_NAME
+    return {'id': DEMO_4K_ID, 'name': '4K HEVC demo', 'kind': 'video', 'url': url,
+            'size': file.stat().st_size, 'builtin': True, **video_details(file, url)}
+
+
+def upgrade_demos(state, root=None, app_root=None):
+    """Apply each shipped catalog step once; retain intentionally edited published loops."""
+    changed = False
+    if state.get('demo_catalog', 1) < 2:
+        old = [(e['asset_id'], e['duration'], e['enabled'], e['start'], e['end']) for e in state['entries']]
+        shipped = [('welcome', 12, True, None, None), ('menuboard', 48, True, None, None),
+                   ('promo-a', 0, True, None, None), ('promo-b', 0, True, None, None)]
+        known = {a['id'] for a in state['assets']}
+        state['assets'].extend(dict(a) for a in PAGE_DEMOS if a['id'] not in known)
+        if old == shipped:
+            state['entries'] = demo_entries(state['assets'])
+        state.update(demo_catalog=2, revision=state['revision']+1, updated_at=time.time())
+        changed = True
+    if state.get('demo_catalog', 1) < 3:
+        # Adds the library asset only; never touches entries, so the loop is left as published.
+        # If the image lacks the clip or preparing it fails, stay at catalog 2 and retry next start.
+        if root is None or app_root is None:
+            return changed
+        if DEMO_4K_ID not in {a['id'] for a in state['assets']}:
+            try:
+                asset = builtin_4k_asset(root, app_root)
+            except ContentError:
+                return changed
+            if not asset:
+                return changed
+            state['assets'].append(asset)
+        state.update(demo_catalog=3, revision=state['revision']+1, updated_at=time.time())
+        changed = True
+    return changed
 
 
 def initial_state(root, app_root):
@@ -105,8 +140,11 @@ def initial_state(root, app_root):
             assets.append({'id': name[:-4], 'name': 'SUBSTATION · ' + ('Fresh daily' if 'a.' in name else 'Made your way'),
                            'kind': 'video', 'url': '/media/' + name, 'size': file.stat().st_size, 'builtin': True,
                            **video_details(file, '/media/' + name)})
+    four_k = builtin_4k_asset(root, app_root)
+    if four_k:
+        assets.append(four_k)
     assets.extend(dict(a) for a in PAGE_DEMOS)
-    return {'revision': 1, 'demo_catalog': 2, 'assets': assets, 'entries': demo_entries(assets), 'updated_at': time.time()}
+    return {'revision': 1, 'demo_catalog': 3, 'assets': assets, 'entries': demo_entries(assets), 'updated_at': time.time()}
 
 
 def save(root, state):
@@ -128,7 +166,7 @@ def read(root, app_root):
         if not path.exists():
             save(root, initial_state(root, app_root))
         state = json.loads(path.read_text())
-        if upgrade_demos(state):
+        if upgrade_demos(state, root, app_root):
             save(root, state)
         return state
 
