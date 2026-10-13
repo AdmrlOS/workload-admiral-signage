@@ -120,6 +120,43 @@ class ServerTests(unittest.TestCase):
         with patch.dict(os.environ, {'SIGNAGE_PAGE': 'player', 'SIGNAGE_URL': 'http://127.0.0.1:8080/menuboard/'}, clear=True):
             self.assertEqual(server.configuration()['browser_url'], 'http://127.0.0.1:8080/menuboard/')
 
+    def test_ram_window_and_range_delivery(self):
+        from ram_cache import RamCache
+        with patch.object(server, 'RAM_CACHE', RamCache(1024, 0, available=lambda: 4096)):
+            payload = json.dumps({'urls': ['/media/test.mp4'], 'active': '/media/test.mp4'}).encode()
+            with urlopen(Request(self.base + '/api/preload', data=payload,
+                                 headers={'X-Signage-Request': 'player', 'Content-Type': 'application/json'})) as response:
+                self.assertEqual(response.status, 200)
+            server.PRELOADER.join()
+            with urlopen(Request(self.base + '/media/test.mp4', headers={'Range': 'bytes=2-4'})) as response:
+                self.assertEqual(response.read(), b'234')
+                self.assertEqual(response.headers['X-Signage-Cache'], 'ram')
+            server.RAM_CACHE.close()
+
+    def test_preload_rejects_cross_origin_and_nonobject_payload(self):
+        for data, headers, code in ((b'[]', {'X-Signage-Request': 'player'}, 400),
+                (b'{"urls":[]}', {'X-Signage-Request': 'player', 'Origin': 'http://evil.test'}, 403)):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(self.base + '/api/preload', data=data, headers=headers))
+            self.assertEqual(error.exception.code, code)
+            error.exception.close()
+
+    def test_package_dependencies_and_staging_csp(self):
+        from ram_cache import RamCache
+        package = server.DATA_ROOT / 'content' / 'safe'
+        package.mkdir(parents=True, exist_ok=True)
+        (package / 'index.html').write_text('<head><meta name="signage-preload" content="static"></head><img src="image.png">')
+        (package / 'font.woff2').write_bytes(b'font')
+        with patch.object(server, 'RAM_CACHE', RamCache(1024, 0, available=lambda: 4096)):
+            server.preload_window(['/content/safe/index.html'])
+            server.PRELOADER.join()
+            with server.RAM_CACHE.acquire(package / 'font.woff2') as data:
+                self.assertEqual(bytes(data), b'font')
+            with urlopen(self.base + '/content/safe/index.html?signage_stage=1') as response:
+                self.assertIn("media-src 'none'", response.headers['Content-Security-Policy'])
+                self.assertIn(b'signage_stage', response.read())
+            server.RAM_CACHE.close()
+
     def test_config_and_health(self):
         with urlopen(self.base + "/healthz") as response:
             self.assertTrue(json.load(response)["ok"])

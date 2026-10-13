@@ -49,6 +49,12 @@
   window.addEventListener('load',async () => {
     fitCanvas();
     if (document.fonts) await document.fonts.ready;
+    await Promise.all(Array.from(document.images || [], image=>image.decode ? image.decode() : Promise.resolve()));
+    // A static staging declaration is not permission to open a second sink.
+    // CSP blocks media in staged responses; reject a dishonest declaration too.
+    if(window.__signage_stage && document.querySelectorAll('video,audio,iframe,object,embed').length) {
+      window.parent.postMessage({type:'signage-stage-error'},'*'); return;
+    }
     await afterPaint(); window.parent.postMessage({type:'signage-ready'},'*');
   });
 })();

@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import content
+from ram_cache import RamCache
 
 from diagnostics import APP_ROOT, snapshot
 from entrypoint import start_url
@@ -17,6 +18,71 @@ from entrypoint import start_url
 DATA_ROOT = Path(os.environ.get("SIGNAGE_DATA_DIR", "/data"))
 PORT = int(os.environ.get("SIGNAGE_HTTP_PORT", "8080"))
 STATUS = {"runtime": {}, "video": {}, "holepunch": {"verified": False}}
+# Conservative compressed-byte budget, separate from decoder/CMA and native UI reserves.
+RAM_CACHE = RamCache(int(os.environ.get('SIGNAGE_RAM_CACHE_MB', '256')) * 1024 * 1024,
+                     int(os.environ.get('SIGNAGE_RAM_RESERVE_MB', '1024')) * 1024 * 1024)
+PRELOADER = None
+PRELOAD_ACTIVE = False
+PRELOAD_LOCK = threading.Lock()
+PRELOAD_PENDING = None
+
+
+def resolve_asset(url):
+    parsed = urlsplit(url)
+    if parsed.scheme or parsed.netloc:
+        return None
+    path = unquote(parsed.path)
+    if path.startswith('/content/'):
+        roots, name = [DATA_ROOT / 'content'], path[9:]
+    elif path.startswith('/media/'):
+        roots, name = [DATA_ROOT / 'media', APP_ROOT / 'media'], path[7:]
+    else:
+        return None
+    return next((found for root in roots if (found := safe_file(root, name))), None)
+
+
+def preload_window(urls):
+    """Latest two-item window only, one loader; edits cancel old in-flight loads."""
+    global PRELOADER, PRELOAD_PENDING, PRELOAD_ACTIVE
+    files = []
+    for url in urls:
+        file = resolve_asset(url)
+        if file is None:
+            continue
+        files.append(file)
+        if urlsplit(url).path.startswith('/content/') and file.suffix.lower() in ('.html', '.htm'):
+            # Package dependencies include CSS/fonts/images/nested CSS URLs without parsing HTML.
+            package = DATA_ROOT / 'content' / unquote(urlsplit(url).path).split('/')[2]
+            for dependency in package.rglob('*'):
+                if len(files) >= 3000:
+                    break
+                if dependency.is_file() and not dependency.is_symlink() and dependency.resolve().is_relative_to(package.resolve()):
+                    files.append(dependency.resolve())
+    files = list(dict.fromkeys(files))
+    with PRELOAD_LOCK:
+        epoch = RAM_CACHE.set_window(files)
+        PRELOAD_PENDING = (RAM_CACHE, files, epoch)
+        if not PRELOAD_ACTIVE:
+            PRELOAD_ACTIVE = True
+            PRELOADER = threading.Thread(target=preload_worker, daemon=True)
+            PRELOADER.start()
+    return RAM_CACHE.stats()
+
+
+def preload_worker():
+    global PRELOAD_PENDING, PRELOAD_ACTIVE
+    while True:
+        with PRELOAD_LOCK:
+            if PRELOAD_PENDING is None:
+                PRELOAD_ACTIVE = False
+                return
+            cache, files, epoch = PRELOAD_PENDING
+            PRELOAD_PENDING = None
+        for file in files:
+            if epoch != cache.epoch:
+                break
+            cache.warm(file, epoch)
+
 
 
 def configuration():
@@ -112,6 +178,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.connection.settimeout(120)
         try:
+            if urlsplit(self.path).path == '/api/preload':
+                origin = self.headers.get('Origin')
+                if (self.command != 'POST' or self.headers.get('X-Signage-Request') != 'player'
+                        or self.headers.get('Sec-Fetch-Site') == 'cross-site'
+                        or (origin and urlsplit(origin).netloc != self.headers.get('Host'))):
+                    raise content.ContentError('Player origin required.', 403)
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 8192 or self.headers.get('Transfer-Encoding'):
+                    raise content.ContentError('Invalid preload request.')
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise content.ContentError('Invalid preload request.')
+                urls = body.get('urls')
+                if not isinstance(urls, list) or len(urls) > 6 or not all(isinstance(url, str) for url in urls):
+                    raise content.ContentError('At most active/next assets and posters may be pinned.')
+                return self.json_response(preload_window(urls))
             self.json_response(self.mutation())
         except content.ContentError as exc:
             self.json_response({'error': str(exc)}, status=exc.status)
@@ -134,7 +216,16 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/api/library', '/api/playlist'):
             try:
                 state = content.read(DATA_ROOT, APP_ROOT)
-                return self.json_response(content.playlist(state) if path == '/api/playlist' else state, head)
+                if path == '/api/playlist':
+                    state = content.playlist(state)
+                    for entry in state['entries']:
+                        asset = entry['asset']
+                        file = resolve_asset(asset['url']) if asset['kind'] == 'html' else None
+                        if file and file.stat().st_size <= 1024 * 1024:
+                            with file.open('rb') as stream:
+                                markup = stream.read(1024 * 1024)
+                            asset['preload_static'] = bool(re.search(br'<meta\s+name=[\"\']signage-preload[\"\']\s+content=[\"\']static[\"\']\s*/?>', markup, re.I))
+                return self.json_response(state, head)
             except (OSError, ValueError, content.ContentError):
                 return self.json_response({'error': 'The content library could not be opened. Check the data volume.'}, head, status=500)
         if path == "/healthz":
@@ -162,8 +253,10 @@ class Handler(BaseHTTPRequestHandler):
         package_html = path.startswith('/content/') and file.suffix.lower() in ('.html', '.htm')
         html_body = None
         if package_html:
-            html_body = file.read_bytes()
-            bridge = b'<script src="/player/bridge.js"></script>'
+            with RAM_CACHE.acquire(file) as cached:
+                html_body = cached[:] if cached is not None else file.read_bytes()
+            staging = parse_qs(urlsplit(self.path).query).get('signage_stage') == ['1']
+            bridge = (b'<script>window.__signage_stage=true;</script>' if staging else b'') + b'<script src="/player/bridge.js"></script>'
             match = re.search(br'<head(?:\s[^>]*)?>', html_body, re.IGNORECASE)
             at = match.end() if match else 0
             html_body = html_body[:at] + bridge + html_body[at:]
@@ -179,12 +272,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+        with RAM_CACHE.acquire(file) as cached:
+            return self.file_response(file, html_body, cached, head, path, package_html, size, start, end, ranged)
+
+    def file_response(self, file, html_body, cached, head, path, package_html, size, start, end, ranged):
         self.send_response(206 if ranged else 200)
+        self.send_header('X-Signage-Cache', 'ram' if cached is not None else 'disk')
         self.send_header("Content-Type", mimetypes.guess_type(file.name)[0] or "application/octet-stream")
         self.send_header("Accept-Ranges", "none" if package_html else "bytes")
         self.send_header('X-Content-Type-Options', 'nosniff')
         if path.startswith('/content/'):
-            self.send_header('Content-Security-Policy', "sandbox allow-scripts; connect-src 'none'; form-action 'none'; frame-ancestors 'self'")
+            staging = parse_qs(urlsplit(self.path).query).get('signage_stage') == ['1']
+            self.send_header('Content-Security-Policy', "sandbox allow-scripts; connect-src 'none'; form-action 'none'; frame-ancestors 'self'" + ("; media-src 'none'; frame-src 'none'; object-src 'none'" if staging else ''))
         self.send_header("Content-Length", str(max(0, end - start + 1)))
         self.send_header("Cache-Control", "private, max-age=3600" if path.startswith(("/media/", "/content/")) and not package_html else "no-store")
         if ranged:
@@ -194,6 +293,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if html_body is not None:
                     self.wfile.write(html_body)
+                    return
+                if cached is not None:
+                    offset = start
+                    while offset <= end:
+                        chunk = cached[offset:min(offset + 65536, end + 1)]
+                        self.wfile.write(chunk)
+                        offset += len(chunk)
                     return
                 with file.open("rb") as stream:
                     stream.seek(start)
