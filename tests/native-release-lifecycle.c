@@ -20,6 +20,17 @@ static gpointer broker_peer(gpointer data)
 int main(int argc, char **argv)
 {
     gst_init(&argc, &argv);
+    AdmiralPlaneSink *caps_sink = g_object_new(admiral_plane_sink_get_type(), NULL);
+    for (int fps = 60; fps >= 0; fps -= 30) {
+        GstCaps *caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "NV12",
+            "width", G_TYPE_INT, 3840, "height", G_TYPE_INT, 2160,
+            "framerate", GST_TYPE_FRACTION, fps, 1, NULL);
+        assert(admiral_plane_sink_set_caps(GST_BASE_SINK(caps_sink), caps));
+        assert(gst_base_sink_get_render_delay(GST_BASE_SINK(caps_sink)) == (fps ? gst_util_uint64_scale(2 * GST_SECOND, 1, fps) : 0));
+        assert(gst_base_sink_get_processing_deadline(GST_BASE_SINK(caps_sink)) == (fps ? gst_util_uint64_scale(3 * GST_SECOND, 1, fps) : 0));
+        gst_caps_unref(caps);
+    }
+    gst_object_unref(caps_sink);
     for (int i = 0; i < 100; i++) {
         int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
         int fd = open("/dev/null", O_RDWR); assert(fd >= 0);

@@ -554,6 +554,10 @@ admiral_plane_sink_set_caps(GstBaseSink *base, GstCaps *caps)
          * processing budget; render delay remains two vblank periods. */
         gst_base_sink_set_processing_deadline(base, gst_util_uint64_scale(3 * GST_SECOND,
             GST_VIDEO_INFO_FPS_D(&info), GST_VIDEO_INFO_FPS_N(&info)));
+    } else {
+        /* Renegotiation to unknown rate must not inherit the previous budget. */
+        gst_base_sink_set_render_delay(base, 0);
+        gst_base_sink_set_processing_deadline(base, 0);
     }
     return TRUE;
 }
