@@ -37,6 +37,8 @@ enum {
     SIGNAGE_VIDEO_SHOW = 1,
     SIGNAGE_VIDEO_HIDE = 2,
     SIGNAGE_VIDEO_RELEASED = 3,
+    SIGNAGE_VIDEO_PRESENTED = 4,
+    SIGNAGE_VIDEO_CANCELLED = 5, /* terminal SHOW outcome, never retirement */
 };
 
 typedef struct {
@@ -60,3 +62,7 @@ void signage_drm_broker_set_video_handler(SignageVideoHandler handler, gpointer 
 gboolean signage_drm_broker_video_handler_active(void);
 /* Tells the connected sink that fb is no longer on screen or queued. */
 void signage_drm_broker_video_released(uint32_t fb, uint32_t serial);
+void signage_drm_broker_video_presented(uint32_t fb, uint32_t serial);
+void signage_drm_broker_video_cancelled(uint32_t fb, uint32_t serial);
+guint64 signage_drm_broker_video_generation(void);
+void signage_drm_broker_video_disconnect(void);

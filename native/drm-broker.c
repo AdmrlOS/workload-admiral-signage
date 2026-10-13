@@ -30,6 +30,11 @@ typedef struct {
 } PlaneProperty;
 
 typedef struct {
+    SignageVideoMessage message;
+    gsize offset;
+} VideoTx;
+
+typedef struct {
     GSocketService *service;
     int fd;
     char *metadata; /* without the trailing "}\n"; see send_metadata() */
@@ -43,6 +48,9 @@ typedef struct {
     GSource *client_source;
     guint8 pending[sizeof(SignageVideoMessage)];
     gsize pending_length;
+    GQueue outgoing;
+    GSource *write_source;
+    guint64 generation;
 } Broker;
 
 static Broker broker = { .fd = -1 };
@@ -265,6 +273,12 @@ drop_client(gboolean notify)
 {
     if (!broker.client)
         return;
+    if (broker.write_source) {
+        g_source_destroy(broker.write_source);
+        g_source_unref(broker.write_source);
+        broker.write_source = NULL;
+    }
+    g_queue_clear_full(&broker.outgoing, g_free);
     if (broker.client_source) {
         g_source_destroy(broker.client_source);
         g_source_unref(broker.client_source);
@@ -353,6 +367,8 @@ on_incoming(GSocketService *service G_GNUC_UNUSED, GSocketConnection *connection
     GSocket *socket = g_socket_connection_get_socket(connection);
     g_socket_set_blocking(socket, FALSE);
     broker.client = g_object_ref(connection);
+    broker.generation++;
+    if (!broker.generation) broker.generation++;
     broker.client_source = g_socket_create_source(socket, G_IO_IN | G_IO_HUP | G_IO_ERR, NULL);
     g_source_set_callback(broker.client_source, (GSourceFunc) G_CALLBACK(client_readable), NULL, NULL);
     g_source_attach(broker.client_source, NULL);
@@ -380,19 +396,69 @@ signage_drm_broker_video_handler_active(void)
     return broker.video_handler != NULL;
 }
 
-void
-signage_drm_broker_video_released(uint32_t fb, uint32_t serial)
+static gboolean video_writable(GSocket *socket, GIOCondition condition, gpointer data);
+
+static gboolean video_tx_drain(void)
+{
+    while (broker.client && !g_queue_is_empty(&broker.outgoing)) {
+        VideoTx *tx = g_queue_peek_head(&broker.outgoing);
+        int fd = g_socket_get_fd(g_socket_connection_get_socket(broker.client));
+        ssize_t n = send(fd, (guint8 *)&tx->message + tx->offset,
+                         sizeof(tx->message) - tx->offset, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return TRUE;
+        if (n <= 0) { drop_client(TRUE); return FALSE; }
+        tx->offset += (gsize)n;
+        if (tx->offset == sizeof(tx->message)) g_free(g_queue_pop_head(&broker.outgoing));
+    }
+    return TRUE;
+}
+
+static gboolean video_writable(GSocket *socket G_GNUC_UNUSED, GIOCondition condition G_GNUC_UNUSED, gpointer data G_GNUC_UNUSED)
+{
+    if (!video_tx_drain()) return G_SOURCE_REMOVE;
+    if (!g_queue_is_empty(&broker.outgoing)) return G_SOURCE_CONTINUE;
+    GSource *source = broker.write_source;
+    broker.write_source = NULL;
+    g_source_unref(source);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+video_ack(uint32_t type, uint32_t fb, uint32_t serial)
 {
     if (!broker.client || !fb)
         return;
-    SignageVideoMessage message = { .type = SIGNAGE_VIDEO_RELEASED, .fb = fb, .serial = serial };
-    int fd = g_socket_get_fd(g_socket_connection_get_socket(broker.client));
-    ssize_t sent;
-    do sent = send(fd, &message, sizeof(message), MSG_DONTWAIT | MSG_NOSIGNAL);
-    while (sent < 0 && errno == EINTR);
-    if (sent != (ssize_t) sizeof(message))
-        g_warning("Cannot tell the holepunch sink that fb %u is free: %s", fb, sent < 0 ? g_strerror(errno) : "short write");
+    /* Never drop half a stream record. Congestion is a normal disconnect/hide,
+     * not a false retirement. Bound memory even for a peer that never reads. */
+    if (broker.outgoing.length >= 64) { drop_client(TRUE); return; }
+    VideoTx *tx = g_new0(VideoTx, 1);
+    tx->message = (SignageVideoMessage){ .type = type, .fb = fb, .serial = serial };
+    g_queue_push_tail(&broker.outgoing, tx);
+    if (!video_tx_drain() || g_queue_is_empty(&broker.outgoing) || broker.write_source) return;
+    GSocket *socket = g_socket_connection_get_socket(broker.client);
+    broker.write_source = g_socket_create_source(socket, G_IO_OUT | G_IO_HUP | G_IO_ERR, NULL);
+    g_source_set_callback(broker.write_source, (GSourceFunc)G_CALLBACK(video_writable), NULL, NULL);
+    g_source_attach(broker.write_source, NULL);
 }
+
+void signage_drm_broker_video_released(uint32_t fb, uint32_t serial)
+{
+    video_ack(SIGNAGE_VIDEO_RELEASED, fb, serial);
+}
+
+void signage_drm_broker_video_presented(uint32_t fb, uint32_t serial)
+{
+    video_ack(SIGNAGE_VIDEO_PRESENTED, fb, serial);
+}
+
+void signage_drm_broker_video_cancelled(uint32_t fb, uint32_t serial)
+{
+    video_ack(SIGNAGE_VIDEO_CANCELLED, fb, serial);
+}
+
+guint64 signage_drm_broker_video_generation(void) { return broker.generation; }
+void signage_drm_broker_video_disconnect(void) { drop_client(TRUE); }
 
 static gboolean
 prepare_socket(GError **error)

@@ -34,6 +34,7 @@
 #include <drm_fourcc.h>
 #include <drm.h>
 #include "input.h"
+#include "split-scanout.h"
 #include "../native/drm-broker.h"
 
 #define VERSION "0.1.0"
@@ -51,6 +52,7 @@ typedef struct {
 typedef struct {
     struct wl_resource *resource;
     uint32_t fb;
+    gboolean split; /* same owned FB referenced by both UI views */
     uint32_t handles[4];
     uint8_t n_planes;
     ScanoutBuffer *scanout; /* pool buffer (GPU copy); its fb is owned by the pool */
@@ -81,8 +83,10 @@ typedef struct {
 
 /* One state of the brokered video overlay; fb == 0 means disabled. */
 typedef struct {
-    uint32_t fb;
+    uint32_t fb, serial;
+    guint64 generation;
     uint32_t src_x, src_y, src_w, src_h; /* 16.16 */
+    gboolean cancelled;
     int32_t crtc_x, crtc_y;
     uint32_t crtc_w, crtc_h;
     gint64 arrived_us; /* monotonic time the SHOW reached video_message */
@@ -96,6 +100,9 @@ typedef struct {
     uint32_t fb, crtc, src_x, src_y, src_w, src_h, crtc_x, crtc_y, crtc_w, crtc_h;
     VideoState current, pending, next; /* on screen, in flight, waiting for the next commit */
     gboolean pending_valid, dirty;
+    GQueue waiting; /* bounded by sink's two unpresented SHOW credits */
+    guint64 generation;
+    uint32_t last_serial;
     GHashTable *serials; /* fb -> latest SHOW serial, while the fb is in a slot */
     guint64 shown, replaced, rejected;
     gint64 pending_submitted_at; /* monotonic time the in-flight video state was committed */
@@ -123,6 +130,9 @@ typedef struct {
     float ui_scale; /* WPE device scale factor, not page zoom */
     uint32_t mode_blob;
     uint32_t connector_crtc, crtc_mode, crtc_active;
+    uint32_t split_plane, split_props[14];
+    uint64_t split_zpos, split_blend, split_alpha;
+    SignageSplitGeometry split_geometry;
     uint32_t plane_fb, plane_crtc, plane_src_x, plane_src_y, plane_src_w, plane_src_h;
     uint32_t plane_x, plane_y, plane_w, plane_h;
     uint32_t plane_in_fence; /* optional IN_FENCE_FD on the primary plane */
@@ -192,6 +202,8 @@ static void write_status(Browser *browser)
     JSON_INT("connector_id", browser->connector);
     JSON_INT("crtc_id", browser->crtc);
     JSON_INT("primary_plane_id", browser->primary);
+    JSON_INT("split_plane_id", browser->split_plane);
+    JSON_BOOL("ui_split_active", browser->current && browser->current->split);
     JSON_INT("width", browser->mode.hdisplay);
     JSON_INT("height", browser->mode.vdisplay);
     JSON_INT("ui_width", browser->ui_width);
@@ -260,6 +272,8 @@ static gboolean supports_format(drmModePlane *plane, uint32_t format)
         if (plane->formats[i] == format) return TRUE;
     return FALSE;
 }
+
+#include "split-plane.h"
 
 static gboolean parse_mode(const char *text, unsigned *width, unsigned *height, unsigned *refresh)
 {
@@ -533,6 +547,8 @@ static void video_release_if_unused(Browser *browser, uint32_t fb)
 {
     VideoPlane *video = &browser->video;
     if (!fb || fb == video->current.fb || (video->pending_valid && fb == video->pending.fb) || (video->dirty && fb == video->next.fb)) return;
+    for (GList *it = video->waiting.head; it; it = it->next)
+        if (((VideoState *)it->data)->fb == fb) return;
     gpointer serial = NULL;
     if (!video->serials || !g_hash_table_lookup_extended(video->serials, GUINT_TO_POINTER(fb), NULL, &serial)) return;
     g_hash_table_remove(video->serials, GUINT_TO_POINTER(fb));
@@ -585,6 +601,12 @@ static gboolean frame_ready(const Frame *frame)
 static gboolean submit_commit(Browser *browser)
 {
     VideoPlane *video = &browser->video;
+    if (!video->dirty && !g_queue_is_empty(&video->waiting)) {
+        VideoState *next = g_queue_pop_head(&video->waiting);
+        video->next = *next;
+        g_free(next);
+        video->dirty = TRUE;
+    }
     if (browser->commit_pending || browser->retry_source || (!browser->queued && !video->dirty)) return TRUE;
     Frame *frame = browser->queued;
     if (frame && !frame_ready(frame)) {
@@ -600,7 +622,7 @@ static gboolean submit_commit(Browser *browser)
         if (!request) { fail(browser, "Cannot allocate an atomic request"); return FALSE; }
         gboolean valid = TRUE;
         if (frame) {
-            ADD_PRIMARY_STATE(frame->fb);
+            if (!add_ui_state(browser, request, frame)) valid = FALSE;
             if (frame->fence_fd >= 0 && browser->plane_in_fence) ADD(browser->primary, browser->plane_in_fence, frame->fence_fd);
         }
         if (with_video) {
@@ -658,6 +680,8 @@ static gboolean submit_commit(Browser *browser)
             g_warning("Atomic commit with video fb %u rejected: %s; dropping that video frame", video->next.fb, g_strerror(saved_errno));
             video->rejected++;
             uint32_t rejected = video->next.fb;
+            if (video->next.generation == signage_drm_broker_video_generation())
+                signage_drm_broker_video_cancelled(rejected, video->next.serial);
             video->dirty = FALSE;
             browser->stats.video_rejected++;
             video_release_if_unused(browser, rejected);
@@ -711,7 +735,7 @@ static gboolean initial_scanout(Browser *browser)
             ADD(browser->connector, browser->connector_crtc, browser->crtc);
             ADD(browser->crtc, browser->crtc_mode, browser->mode_blob);
             ADD(browser->crtc, browser->crtc_active, 1);
-            ADD_PRIMARY_STATE(frame->fb);
+            if (!add_ui_state(browser, request, frame)) valid = FALSE;
             /* Prove the kernel accepts the scaled configuration before WPE renders for it. */
             errno = EINVAL;
             if (valid) valid = drmModeAtomicCommit(browser->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY, NULL) == 0;
@@ -796,6 +820,8 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
         video->current = video->pending;
         video->current.flipped_us = g_get_monotonic_time();
         video->pending_valid = FALSE;
+        if (video->current.fb && !video->current.cancelled && video->current.generation == signage_drm_broker_video_generation())
+            signage_drm_broker_video_presented(video->current.fb, video->current.serial);
         if (video->current.fb && video->current.fb != retired) {
             video->shown++;
             if (video->current.arrived_us) {
@@ -835,9 +861,24 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
     Browser *browser = data;
     VideoPlane *video = &browser->video;
     if (!video->plane) return;
+    guint64 generation = signage_drm_broker_video_generation();
+    if (video->generation != generation) {
+        video->generation = generation;
+        video->last_serial = 0;
+    }
+    if (message && message->type == SIGNAGE_VIDEO_SHOW) {
+        /* Reconnect before serial exhaustion; never alias an identity. */
+        if (!message->serial || message->serial <= video->last_serial) {
+            signage_drm_broker_video_disconnect();
+            return;
+        }
+        video->last_serial = message->serial;
+    }
     VideoState state = { 0 };
     if (message && message->type == SIGNAGE_VIDEO_SHOW && message->fb && message->src_w && message->src_h && message->crtc_w && message->crtc_h) {
         state.fb = message->fb;
+        state.serial = message->serial;
+        state.generation = generation;
         state.src_x = message->src_x; state.src_y = message->src_y;
         state.src_w = message->src_w; state.src_h = message->src_h;
         state.crtc_x = message->crtc_x; state.crtc_y = message->crtc_y;
@@ -845,14 +886,44 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
         state.arrived_us = g_get_monotonic_time();
     } else if (message && message->type == SIGNAGE_VIDEO_SHOW) {
         g_warning("Ignoring malformed video frame message for fb %u", message->fb);
-        signage_drm_broker_video_released(message->fb, message->serial);
+        signage_drm_broker_video_cancelled(message->fb, message->serial);
+        if (message->fb) g_hash_table_insert(video->serials, GUINT_TO_POINTER(message->fb), GUINT_TO_POINTER(message->serial));
+        video_release_if_unused(browser, message->fb);
         return;
     }
     if (!message) g_hash_table_remove_all(video->serials); /* nobody left to tell */
+    if (!state.fb) {
+        /* A pending atomic commit cannot be recalled, but HIDE terminalizes
+         * its presentation credit now; its later flip must not fake PRESENTED. */
+        if (video->pending_valid && video->pending.fb && !video->pending.cancelled) {
+            if (message && video->pending.generation == generation) signage_drm_broker_video_cancelled(video->pending.fb, video->pending.serial);
+            video->pending.cancelled = TRUE;
+        }
+        while (!g_queue_is_empty(&video->waiting)) {
+            VideoState *discard = g_queue_pop_head(&video->waiting);
+            uint32_t fb = discard->fb;
+            if (message && discard->generation == generation) signage_drm_broker_video_cancelled(fb, discard->serial);
+            g_free(discard);
+            video_release_if_unused(browser, fb);
+        }
+    }
+    if (state.fb && ((video->pending_valid && video->pending.fb && !video->pending.cancelled ? 1u : 0u) +
+                    (video->dirty && video->next.fb ? 1u : 0u) + video->waiting.length >= 2)) {
+        signage_drm_broker_video_disconnect();
+        return;
+    }
     if (state.fb) g_hash_table_insert(video->serials, GUINT_TO_POINTER(state.fb), GUINT_TO_POINTER(message->serial));
+    if (state.fb && video->dirty) {
+        VideoState *queued = g_new(VideoState, 1);
+        *queued = state;
+        g_queue_push_tail(&video->waiting, queued);
+        submit_commit(browser);
+        return;
+    }
     const VideoState *latest = video->dirty ? &video->next : video->pending_valid ? &video->pending : &video->current;
     if (!state.fb && !latest->fb) return; /* timestamps are diagnostic, not state equality */
     uint32_t replaced = video->dirty ? video->next.fb : 0;
+    if (replaced && message && video->next.generation == generation) signage_drm_broker_video_cancelled(replaced, video->next.serial);
     video->next = state;
     video->dirty = TRUE;
     if (replaced && replaced != state.fb) {
@@ -911,7 +982,7 @@ static Frame *import_direct(Browser *browser, struct wpe_view_backend_exportable
     frame->n_planes = MIN(resource->n_planes, 4);
     const char *step = "unsupported size/format";
     gboolean valid = resource->width == browser->ui_width && resource->height == browser->ui_height &&
-        resource->n_planes > 0 && resource->n_planes <= 4 && resource->format == DRM_FORMAT_ARGB8888;
+        resource->n_planes == 1 && resource->format == DRM_FORMAT_ARGB8888;
     int saved_errno = EINVAL;
     gboolean explicit_modifiers = FALSE, all_linear_or_implicit = TRUE;
     if (valid) step = "drmPrimeFDToHandle";
@@ -937,6 +1008,16 @@ static Frame *import_direct(Browser *browser, struct wpe_view_backend_exportable
                 frame->handles, resource->strides, resource->offsets, &frame->fb, 0) == 0;
         }
         if (!valid) saved_errno = errno;
+    }
+    if (valid) {
+        frame->split = resource->modifiers[0] == 0x0800000000000072ULL && resource->width > 2560;
+        step = "atomic UI format/crop validation";
+        if (frame->split && !browser->split_plane) valid = FALSE;
+        drmModeAtomicReq *test = valid ? drmModeAtomicAlloc() : NULL;
+        if (valid) valid = test && add_ui_state(browser, test, frame) &&
+            drmModeAtomicCommit(browser->fd, test, DRM_MODE_ATOMIC_TEST_ONLY, NULL) == 0;
+        if (test) drmModeAtomicFree(test);
+        if (!valid) saved_errno = errno ? errno : EINVAL;
     }
     if (valid) {
         frame->resource = resource->buffer_resource;
@@ -1606,6 +1687,11 @@ static gboolean initialize_webkit(Browser *browser)
         return FALSE;
     }
     g_message("EGL %d.%d vendor=%s version=%s", major, minor, eglQueryString(browser->egl, EGL_VENDOR), eglQueryString(browser->egl, EGL_VERSION));
+    const char *modifier_policy = g_getenv("SIGNAGE_UI_MODIFIER");
+    if (!modifier_policy || !*modifier_policy || !strcmp(modifier_policy, "auto")) {
+        g_setenv("SIGNAGE_UI_MODIFIER", browser->split_plane ? "afbc-de350" : "linear", TRUE);
+        g_message("UI allocator policy %s (native dimensions retained)", g_getenv("SIGNAGE_UI_MODIFIER"));
+    }
     if (!wpe_loader_init("libWPEBackend-fdo-1.0.so") || !wpe_fdo_initialize_for_egl_display(browser->egl)) {
         fail(browser, "Cannot initialize WPEBackend-fdo with the GBM EGL display");
         return FALSE;
@@ -1718,6 +1804,7 @@ static void cleanup(Browser *browser)
     if (browser->mode_blob) drmModeDestroyPropertyBlob(browser->fd, browser->mode_blob);
     if (browser->fd >= 0) { drmDropMaster(browser->fd); close(browser->fd); }
     if (browser->handles) g_hash_table_unref(browser->handles);
+    g_queue_clear_full(&browser->video.waiting, g_free);
     if (browser->video.serials) g_hash_table_unref(browser->video.serials);
     if (browser->loop) g_main_loop_unref(browser->loop);
     g_free(browser->device);
@@ -1791,6 +1878,7 @@ int main(int argc, char **argv)
             } else g_message("SIGNAGE_VIDEO_SINK=kmssink: the holepunch sink commits the video plane itself");
         }
     }
+    select_split_plane(&browser);
     browser.fd_source = g_unix_fd_add(browser.fd, G_IO_IN | G_IO_ERR | G_IO_HUP, drm_ready, &browser);
     browser.watchdog_source = g_timeout_add_seconds(1, watchdog, &browser);
     browser.sigterm_source = g_unix_signal_add(SIGTERM, quit_signal, &browser);

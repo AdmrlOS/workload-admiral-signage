@@ -38,7 +38,7 @@
 
 typedef struct {
     GstBin parent;
-    GstElement *kms, *filter;
+    GstElement *kms, *filter, *queue;
     GstPad *ghost;
     GstElement *pipeline;
     gulong element_handler;
@@ -409,7 +409,12 @@ watch_pipeline(AdmiralSink *self)
     GstObject *object = gst_object_ref(self);
     GstObject *parent;
     while ((parent = gst_object_get_parent(object))) { gst_object_unref(object); object = parent; }
-    if (!GST_IS_BIN(object)) { gst_object_unref(object); return; }
+    if (!GST_IS_PIPELINE(object)) { gst_object_unref(object); return; }
+    if (self->pipeline == GST_ELEMENT(object)) { gst_object_unref(object); return; }
+    if (self->pipeline) {
+        if (self->element_handler) g_signal_handler_disconnect(self->pipeline, self->element_handler);
+        gst_object_unref(self->pipeline);
+    }
     self->pipeline = GST_ELEMENT(object);
     self->element_handler = g_signal_connect(object, "deep-element-added", G_CALLBACK(observe_element), self);
     self->bus = gst_element_get_bus(self->pipeline);
@@ -463,8 +468,13 @@ create_kms_child(AdmiralSink *self, gboolean browser_commits)
     if (!self->kms) return FALSE;
     self->filter = gst_element_factory_make("capsfilter", "admiral-video-caps");
     if (!self->filter) { gst_object_unref(self->kms); self->kms = NULL; return FALSE; }
-    gst_bin_add_many(GST_BIN(self), self->filter, self->kms, NULL);
-    if (!gst_element_link(self->filter, self->kms)) return FALSE;
+    self->queue = gst_element_factory_make("queue", "admiral-video-delivery");
+    if (!self->queue) return FALSE;
+    /* Decode independently of KMS credit waits; bounded, never leaky. */
+    g_object_set(self->queue, "max-size-buffers", 4u, "max-size-bytes", 0u,
+                 "max-size-time", (guint64)0, "leaky", 0, NULL);
+    gst_bin_add_many(GST_BIN(self), self->filter, self->queue, self->kms, NULL);
+    if (!gst_element_link_many(self->filter, self->queue, self->kms, NULL)) return FALSE;
     GstPad *pad = gst_element_get_static_pad(self->kms, "sink");
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, sink_buffer, self, NULL);
     gst_object_unref(pad);
@@ -503,6 +513,11 @@ static GstStateChangeReturn
 admiral_sink_change_state(GstElement *element, GstStateChange transition)
 {
     AdmiralSink *self = (AdmiralSink *)element;
+    /* WebKit can initialize the sink before adding it to playbin. Retry once
+     * parentage exists instead of permanently observing our own private bin. */
+    if (transition == GST_STATE_CHANGE_READY_TO_PAUSED ||
+        transition == GST_STATE_CHANGE_PAUSED_TO_PLAYING)
+        watch_pipeline(self);
     if (transition == GST_STATE_CHANGE_NULL_TO_READY) {
         /* WebKit may reuse this sink after a failed URL or playback attempt.
          * A stopped kmssink retains the driver name derived from its old fd,
@@ -512,14 +527,16 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
             gst_element_set_state(self->kms, GST_STATE_NULL);
             gst_ghost_pad_set_target(GST_GHOST_PAD(self->ghost), NULL);
             gst_element_set_state(self->filter, GST_STATE_NULL);
+            gst_element_set_state(self->queue, GST_STATE_NULL);
             gst_bin_remove(GST_BIN(self), self->filter);
+            gst_bin_remove(GST_BIN(self), self->queue); self->queue = NULL;
             gst_bin_remove(GST_BIN(self), self->kms); self->kms = self->filter = NULL;
         }
         release_resources(self);
         g_mutex_lock(&self->lock);
         self->failed = self->blend_configured = FALSE;
         self->decoder_verified = self->dmabuf_seen = FALSE;
-        self->decoded_frames = self->input_frames = 0;
+        self->decoded_frames = self->input_frames = self->decoder_dropped = 0;
         self->connector_id = self->crtc_id = self->browser_plane_id = self->video_plane_id = 0;
         self->decoded_width = self->decoded_height = 0;
         g_clear_pointer(&self->error, g_free);

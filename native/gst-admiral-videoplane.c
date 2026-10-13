@@ -55,6 +55,11 @@ typedef struct {
     GstBuffer *last;          /* re-shown when the rectangle changes */
     guint32 last_fb, serial;
     gboolean hidden;
+    gboolean flushing;
+    guint32 awaiting_fb, awaiting_serial;
+    GHashTable *unpresented; /* serial -> fb, bounded two-frame pipeline */
+    GHashTable *identities, *presented_pts; /* serial -> PTS; unique decoded PTS per seek */
+    guint64 presented_total;
     guint8 incoming[sizeof(SignageVideoMessage)];
     gsize incoming_length;
     /* Per-second render diagnostics (SIGNAGE_VIDEO_STATS=1). */
@@ -125,6 +130,36 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
         SignageVideoMessage message;
         memcpy(&message, self->incoming, sizeof(message));
         self->incoming_length = 0;
+        if (message.type == SIGNAGE_VIDEO_CANCELLED) {
+            if (message.fb && GPOINTER_TO_UINT(g_hash_table_lookup(self->unpresented, GUINT_TO_POINTER(message.serial))) == message.fb) {
+                g_hash_table_remove(self->unpresented, GUINT_TO_POINTER(message.serial));
+                g_hash_table_remove(self->identities, GUINT_TO_POINTER(message.serial));
+                g_cond_broadcast(&self->receiver_wake);
+            }
+            continue; /* NEVER release decoder storage on cancellation */
+        }
+        if (message.type == SIGNAGE_VIDEO_PRESENTED) {
+            if (GPOINTER_TO_UINT(g_hash_table_lookup(self->unpresented, GUINT_TO_POINTER(message.serial))) == message.fb && message.fb) {
+                g_hash_table_remove(self->unpresented, GUINT_TO_POINTER(message.serial));
+                guint64 *pts = g_hash_table_lookup(self->identities, GUINT_TO_POINTER(message.serial));
+                if (pts && *pts != GST_CLOCK_TIME_NONE) {
+                    if (g_getenv("SIGNAGE_VIDEO_TRACE_PRESENTED"))
+                        g_message("Video presented identity: serial=%u fb=%u pts=%" G_GUINT64_FORMAT,
+                                  message.serial, message.fb, *pts);
+                    /* Optional diagnostic, never an unbounded long-stream set.
+                     * Exact acceptance uses the ordered external trace. */
+                    if (g_getenv("SIGNAGE_VIDEO_TRACE_PRESENTED") && g_hash_table_size(self->presented_pts) < 4096) {
+                        guint64 *copy = g_new(guint64, 1); *copy = *pts;
+                        g_hash_table_add(self->presented_pts, copy);
+                    }
+                }
+                g_hash_table_remove(self->identities, GUINT_TO_POINTER(message.serial));
+                self->awaiting_fb = self->awaiting_serial = 0;
+                self->presented_total++;
+                g_cond_broadcast(&self->receiver_wake);
+            }
+            continue;
+        }
         if (message.type != SIGNAGE_VIDEO_RELEASED) continue;
         HeldFrame *held = g_hash_table_lookup(self->held, GUINT_TO_POINTER(message.fb));
         /* An older release crossed a newer SHOW of the same framebuffer. */
@@ -285,6 +320,21 @@ compute_geometry(AdmiralPlaneSink *self, GstBuffer *buffer, SignageVideoMessage 
     return message->src_w && message->src_h;
 }
 
+/* Two unpresented SHOW credits: backpressure the streaming thread, never the
+ * browser/UI main loop. Buffer retirement remains a separate acknowledgement. */
+static GstFlowReturn wait_credit(AdmiralPlaneSink *self, guint limit)
+{
+    gint64 deadline = g_get_monotonic_time() + G_USEC_PER_SEC;
+    while (g_hash_table_size(self->unpresented) > limit && !self->disconnected && !self->flushing) {
+        if (!g_cond_wait_until(&self->receiver_wake, &self->lock, deadline)) {
+            GST_ELEMENT_ERROR(self, RESOURCE, WRITE, ("Video pageflip acknowledgement timed out"),
+                              ("fb=%u serial=%u", self->awaiting_fb, self->awaiting_serial));
+            return GST_FLOW_ERROR;
+        }
+    }
+    return self->flushing ? GST_FLOW_FLUSHING : self->disconnected ? GST_FLOW_ERROR : GST_FLOW_OK;
+}
+
 /* Lock held. */
 static GstFlowReturn
 show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
@@ -295,6 +345,8 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     }
     drain_releases(self, 0);
     GError *error = NULL;
+    GstFlowReturn credit = wait_credit(self, 1);
+    if (credit != GST_FLOW_OK) return credit;
     guint32 fb = framebuffer_for(self, buffer, &error);
     if (!fb) {
         GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("%s", error->message), (NULL));
@@ -303,6 +355,10 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     }
     if (buffer != self->last) gst_buffer_replace(&self->last, buffer);
     self->last_fb = fb;
+    if (self->serial == G_MAXUINT32) {
+        GST_ELEMENT_ERROR(self, RESOURCE, WRITE, ("Video identity exhausted; recreate pipeline"), (NULL));
+        return GST_FLOW_ERROR;
+    }
     SignageVideoMessage message = { .type = SIGNAGE_VIDEO_SHOW, .fb = fb, .serial = ++self->serial };
     if (!compute_geometry(self, buffer, &message)) {
         /* Entirely off screen: hide, but keep the frame for when it returns. */
@@ -322,6 +378,12 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
         gst_buffer_replace(&held->buffer, buffer);
     }
     held->serial = message.serial;
+    self->awaiting_fb = message.fb;
+    self->awaiting_serial = message.serial;
+    g_hash_table_insert(self->unpresented, GUINT_TO_POINTER(message.serial), GUINT_TO_POINTER(message.fb));
+    guint64 *pts = g_new(guint64, 1); *pts = GST_BUFFER_PTS(buffer);
+    if (message.serial <= 5) g_message("Video identity: serial=%u pts=%" G_GUINT64_FORMAT " duration=%" G_GUINT64_FORMAT, message.serial, *pts, GST_BUFFER_DURATION(buffer));
+    g_hash_table_insert(self->identities, GUINT_TO_POINTER(message.serial), pts);
     if (!send_message(self, &message)) return GST_FLOW_ERROR;
     self->hidden = FALSE;
     /* The browser keeps at most three; more means it stopped presenting. */
@@ -360,6 +422,104 @@ admiral_plane_sink_show_frame(GstVideoSink *video_sink, GstBuffer *buffer)
     return result;
 }
 
+static GstFlowReturn wait_presented(AdmiralPlaneSink *self)
+{
+    return wait_credit(self, 0);
+}
+
+static gboolean admiral_plane_sink_query(GstElement *element, GstQuery *query)
+{
+    GstBaseSink *base = GST_BASE_SINK(element);
+    gboolean live = FALSE, upstream_live = FALSE;
+    GstClockTime minimum = 0, maximum = GST_CLOCK_TIME_NONE;
+    gboolean latency_query = GST_QUERY_TYPE(query) == GST_QUERY_LATENCY;
+    gboolean ok = latency_query
+        ? gst_base_sink_query_latency(base, &live, &upstream_live, &minimum, &maximum)
+        : GST_ELEMENT_CLASS(admiral_plane_sink_parent_class)->query(element, query);
+    if (GST_QUERY_TYPE(query) == GST_QUERY_LATENCY && !ok) {
+        /* Before preroll BaseSink rejects LATENCY and playbin sends zero.
+         * We already know the renderer/processing budget from negotiated caps;
+         * advertise it now so the first decoded frames get the same budget. */
+        if (!gst_base_sink_get_sync(base)) {
+            gst_query_set_latency(query, FALSE, 0, GST_CLOCK_TIME_NONE);
+            return TRUE;
+        }
+        GstClockTime delay = gst_base_sink_get_render_delay(base);
+        if (delay) {
+            gst_query_set_latency(query, TRUE, delay + gst_base_sink_get_processing_deadline(base), GST_CLOCK_TIME_NONE);
+            return TRUE;
+        }
+    }
+    if (ok && GST_QUERY_TYPE(query) == GST_QUERY_LATENCY) {
+        /* BaseSink already accounts for processing when upstream is live.
+         * Its returned live bit describes sink clock sync, not upstream. */
+        GstClockTime processing = gst_base_sink_get_processing_deadline(base);
+        if (live && !upstream_live) {
+            minimum += processing;
+            if (maximum != GST_CLOCK_TIME_NONE) maximum += processing;
+        }
+        gst_query_set_latency(query, live, minimum, maximum);
+        g_message("Video latency query: live=%d min=%.3f ms max=%" G_GUINT64_FORMAT,
+                  live, minimum / (double)GST_MSECOND, maximum);
+    }
+    return ok;
+}
+
+static gboolean admiral_plane_sink_event(GstBaseSink *base, GstEvent *event)
+{
+    AdmiralPlaneSink *self = (AdmiralPlaneSink *)base;
+    if (GST_EVENT_TYPE(event) == GST_EVENT_EOS) {
+        g_mutex_lock(&self->lock);
+        GstFlowReturn result = wait_presented(self);
+        g_message("Video EOS drain: unique_pts=%u presented=%" G_GUINT64_FORMAT " last_serial=%u pending=%u result=%s",
+                  g_hash_table_size(self->presented_pts), self->presented_total, self->serial,
+                  g_hash_table_size(self->unpresented), gst_flow_get_name(result));
+        g_mutex_unlock(&self->lock);
+        if (result != GST_FLOW_OK) { gst_event_unref(event); return FALSE; }
+    }
+    if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_START) {
+        g_mutex_lock(&self->lock);
+        self->flushing = TRUE;
+        SignageVideoMessage hide = { .type = SIGNAGE_VIDEO_HIDE };
+        if (self->socket >= 0 && !self->disconnected) send_message(self, &hide);
+        /* Serial is never reset: late outcomes cannot alias post-seek SHOWs.
+         * Keep held references until independent RELEASED retirement. */
+        g_hash_table_remove_all(self->unpresented);
+        g_hash_table_remove_all(self->identities);
+        g_cond_broadcast(&self->receiver_wake);
+        g_mutex_unlock(&self->lock);
+    }
+    if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
+        g_mutex_lock(&self->lock);
+        g_hash_table_remove_all(self->presented_pts);
+        g_mutex_unlock(&self->lock);
+    }
+    if (GST_EVENT_TYPE(event) == GST_EVENT_LATENCY) {
+        GstClockTime latency; gst_event_parse_latency(event, &latency);
+        g_message("Video negotiated latency: %.3f ms", latency / (double)GST_MSECOND);
+    }
+    return GST_BASE_SINK_CLASS(admiral_plane_sink_parent_class)->event(base, event);
+}
+
+static gboolean admiral_plane_sink_unlock(GstBaseSink *base)
+{
+    AdmiralPlaneSink *self = (AdmiralPlaneSink *)base;
+    g_mutex_lock(&self->lock);
+    self->flushing = TRUE;
+    g_cond_broadcast(&self->receiver_wake);
+    g_mutex_unlock(&self->lock);
+    return TRUE;
+}
+
+static gboolean admiral_plane_sink_unlock_stop(GstBaseSink *base)
+{
+    AdmiralPlaneSink *self = (AdmiralPlaneSink *)base;
+    g_mutex_lock(&self->lock);
+    self->flushing = FALSE;
+    g_mutex_unlock(&self->lock);
+    return TRUE;
+}
+
 static gboolean
 admiral_plane_sink_set_caps(GstBaseSink *base, GstCaps *caps)
 {
@@ -383,6 +543,18 @@ admiral_plane_sink_set_caps(GstBaseSink *base, GstCaps *caps)
     g_mutex_unlock(&self->lock);
     GST_VIDEO_SINK_WIDTH(self) = GST_VIDEO_INFO_WIDTH(&info);
     GST_VIDEO_SINK_HEIGHT(self) = GST_VIDEO_INFO_HEIGHT(&info);
+    /* Measured message->commit (~16ms) + flip (~13ms) at 60Hz. The
+     * two-credit atomic pipeline can take two source periods to latch.
+     * Report that real render delay through LATENCY, not a PTS offset. */
+    if (GST_VIDEO_INFO_FPS_N(&info) > 0) {
+        GstClockTime pipeline_budget = gst_util_uint64_scale(2 * GST_SECOND,
+            GST_VIDEO_INFO_FPS_D(&info), GST_VIDEO_INFO_FPS_N(&info));
+        gst_base_sink_set_render_delay(base, pipeline_budget);
+        /* current decode + two queued SHOW credits require three periods of
+         * processing budget; render delay remains two vblank periods. */
+        gst_base_sink_set_processing_deadline(base, gst_util_uint64_scale(3 * GST_SECOND,
+            GST_VIDEO_INFO_FPS_D(&info), GST_VIDEO_INFO_FPS_N(&info)));
+    }
     return TRUE;
 }
 
@@ -409,6 +581,12 @@ admiral_plane_sink_start(GstBaseSink *base)
     g_mutex_lock(&self->lock);
     gboolean ok = self->fd >= 0 && self->socket >= 0 && self->mode_width > 0 && self->mode_height > 0;
     self->disconnected = FALSE;
+    self->flushing = FALSE;
+    self->awaiting_fb = self->awaiting_serial = 0;
+    self->presented_total = 0;
+    g_hash_table_remove_all(self->unpresented);
+    g_hash_table_remove_all(self->identities);
+    g_hash_table_remove_all(self->presented_pts);
     self->hidden = TRUE;
     if (ok && !self->receiver) {
         self->receiver_stop = FALSE;
@@ -449,11 +627,11 @@ admiral_plane_sink_stop(GstBaseSink *base)
     gst_buffer_replace(&self->last, NULL);
     self->last_fb = 0;
     if (g_hash_table_size(self->held)) {
-        /* Fail safe: preserve decoder storage and FBs until process exit, not
-         * pool reuse while an unacknowledged pending/current plane may read it. */
-        GST_ERROR_OBJECT(self, "Retaining unacknowledged scanout buffers until process exit");
-        self->held = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, held_free);
-        self->framebuffers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+        /* EOF/timeouts are not proof of KMS retirement. Do not drop the only
+         * owner or permit pool reuse. Terminate the WebKit process so its
+         * supervisor recreates the connection/pipeline instead of accumulating
+         * unreachable quarantines across every failed scene transition. */
+        g_error("Unretired video buffers: terminating web process for safe recovery");
     } else prune_framebuffers(self, TRUE);
     self->have_info = FALSE;
     self->incoming_length = 0;
@@ -525,6 +703,9 @@ admiral_plane_sink_finalize(GObject *object)
     if (self->socket >= 0) close(self->socket);
     if (self->fd >= 0) close(self->fd);
     g_hash_table_unref(self->held);
+    g_hash_table_unref(self->unpresented);
+    g_hash_table_unref(self->identities);
+    g_hash_table_unref(self->presented_pts);
     g_hash_table_unref(self->framebuffers);
     gst_buffer_replace(&self->last, NULL);
     g_cond_clear(&self->receiver_wake);
@@ -540,11 +721,16 @@ admiral_plane_sink_class_init(AdmiralPlaneSinkClass *klass)
     gst_element_class_set_static_metadata(element, "Admiral browser-committed video plane", "Sink/Video",
         "Hands DMA-BUF video frames to the signage browser, which commits them with the UI", "Admiral");
     gst_element_class_add_static_pad_template(element, &sink_template);
+    element->query = admiral_plane_sink_query;
     GstBaseSinkClass *base = GST_BASE_SINK_CLASS(klass);
     base->set_caps = admiral_plane_sink_set_caps;
     base->propose_allocation = admiral_plane_sink_propose_allocation;
     base->start = admiral_plane_sink_start;
     base->stop = admiral_plane_sink_stop;
+    base->event = admiral_plane_sink_event;
+
+    base->unlock = admiral_plane_sink_unlock;
+    base->unlock_stop = admiral_plane_sink_unlock_stop;
     GST_VIDEO_SINK_CLASS(klass)->show_frame = admiral_plane_sink_show_frame;
 }
 
@@ -555,9 +741,16 @@ admiral_plane_sink_init(AdmiralPlaneSink *self)
     g_cond_init(&self->receiver_wake);
     self->fd = self->socket = -1;
     self->hidden = TRUE;
+    /* Initial budget before CAPS/preroll, refined from source rate in set_caps.
+     * Prevent playbin's first pre-preroll LATENCY query from selecting zero. */
+    gst_base_sink_set_render_delay(GST_BASE_SINK(self), GST_SECOND / 30);
+    gst_base_sink_set_processing_deadline(GST_BASE_SINK(self), GST_SECOND / 30);
     self->framebuffers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     self->held = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, held_free);
     self->stats = g_strcmp0(g_getenv("SIGNAGE_VIDEO_STATS"), "1") == 0;
+    self->unpresented = g_hash_table_new(g_direct_hash, g_direct_equal);
+    self->identities = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    self->presented_pts = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
     /* Experiment knobs: SIGNAGE_VIDEO_QOS=0 disables QoS events upstream; SIGNAGE_VIDEO_MAX_LATENESS_MS. */
     if (g_strcmp0(g_getenv("SIGNAGE_VIDEO_QOS"), "0") == 0) gst_base_sink_set_qos_enabled(GST_BASE_SINK(self), FALSE);
     const gchar *lateness = g_getenv("SIGNAGE_VIDEO_MAX_LATENESS_MS");

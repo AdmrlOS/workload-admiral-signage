@@ -31,6 +31,9 @@ LABEL org.opencontainers.image.title="Admiral Signage Development" \
       org.opencontainers.image.revision="${REVISION}"
 COPY native/ /opt/signage/src/native/
 COPY browser/ /opt/signage/src/browser/
+COPY browser/fdo-modifier-policy.h /opt/signage/browser/fdo-modifier-policy.h
+COPY scripts/build-wpe-fdo.sh /opt/signage/scripts/build-wpe-fdo.sh
+RUN sh /opt/signage/scripts/build-wpe-fdo.sh
 RUN make -C /opt/signage/src/native && make -C /opt/signage/src/native install && \
     make -C /opt/signage/src/browser && make -C /opt/signage/src/browser install && ldconfig
 # WebKit's sandbox device-binds only /dev/video0-2 and /dev/media0; the shim adds every
@@ -56,6 +59,7 @@ ENV PYTHONUNBUFFERED=1 \
     SIGNAGE_HTTP_HOST=0.0.0.0 \
     SIGNAGE_HTTP_PORT=8080 \
     SIGNAGE_VIDEO_MODE=holepunch \
+    SIGNAGE_UI_MODIFIER=auto \
     SIGNAGE_ALLOW_SOFTWARE=0 \
     G_MESSAGES_DEBUG=all \
     GST_DEBUG_NO_COLOR=1 \
