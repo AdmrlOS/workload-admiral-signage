@@ -12,6 +12,7 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <poll.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
@@ -1792,6 +1793,9 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
     return frame;
 }
 
+static volatile gint64 webproc_last_export_us; /* SIGNAGE_WEBPROC_SAMPLE gap sampler input */
+static volatile gint webproc_export_phase;
+
 static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dmabuf_resource *resource)
 {
     Browser *browser = data;
@@ -1804,6 +1808,7 @@ static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dma
             g_message("Transition export mono=%" G_GINT64_FORMAT " gap_us=%" G_GINT64_FORMAT " phase=%d", export_started, export_started-browser->last_visible_export, timing_root->video.gate.phase);
         browser->last_visible_export = export_started;
     }
+    if (visible_export) { webproc_export_phase = timing_root->video.gate.phase; webproc_last_export_us = export_started; }
     Frame *frame = NULL;
     if (browser->root) {
         Browser *root = browser->root;
@@ -2372,6 +2377,177 @@ static void *stall_watchdog(void *unused)
     return NULL;
 }
 
+/* Opt-in (SIGNAGE_WEBPROC_SAMPLE) WebProcess/compositor gap attribution. When no
+ * visible UI frame was exported for >SIGNAGE_WEBPROC_SAMPLE_US (default 30 ms) the
+ * sampler walks this process and its children every 8 ms, reading only
+ * /proc/PID/task/TID/{schedstat,stat,wchan}: run time, run-queue wait time, state
+ * and wait channel per thread. One bounded summary is logged after the next export
+ * (no I/O while the gap is in progress), so it separates CPU-bound page/shader/JIT
+ * work (run_ns), scheduler starvation (wait_ns) and blocking (D/S state + wchan). */
+#define WPS_MAX_THREADS 192
+typedef struct { pid_t pid, tid; char comm[20]; char state; unsigned long long run0, wait0, run1, wait1; unsigned samples, blocked; char wchan[40]; char waits[3][32]; unsigned wait_n[3]; } WpsThread;
+static WpsThread wps_threads[WPS_MAX_THREADS];
+static int wps_count;
+
+static int wps_find(pid_t pid, pid_t tid)
+{
+    for (int i = 0; i < wps_count; i++) if (wps_threads[i].tid == tid && wps_threads[i].pid == pid) return i;
+    return -1;
+}
+
+static void wps_scan(gboolean first)
+{
+    pid_t self = getpid();
+    DIR *proc = opendir("/proc");
+    if (!proc) return;
+    struct dirent *e;
+    while ((e = readdir(proc))) {
+        pid_t pid = (pid_t)atoi(e->d_name);
+        if (pid <= 0) continue;
+        if (pid != self) {
+            char path[96], line[512]; snprintf(path, sizeof path, "/proc/%d/stat", pid);
+            FILE *f = fopen(path, "r"); if (!f) continue;
+            gboolean child = FALSE;
+            if (fgets(line, sizeof line, f)) { char *p = strrchr(line, ')'); int ppid = 0; if (p && sscanf(p + 2, "%*c %d", &ppid) == 1) child = ppid == self; }
+            fclose(f);
+            if (!child) continue;
+        }
+        char tdir[64]; snprintf(tdir, sizeof tdir, "/proc/%d/task", pid);
+        DIR *tasks = opendir(tdir); if (!tasks) continue;
+        struct dirent *t;
+        while ((t = readdir(tasks))) {
+            pid_t tid = (pid_t)atoi(t->d_name); if (tid <= 0) continue;
+            char path[128], buf[512]; unsigned long long run = 0, wait = 0;
+            snprintf(path, sizeof path, "/proc/%d/task/%d/schedstat", pid, tid);
+            FILE *f = fopen(path, "r"); if (!f) continue;
+            if (fscanf(f, "%llu %llu", &run, &wait) != 2) { fclose(f); continue; }
+            fclose(f);
+            int i = wps_find(pid, tid);
+            if (i < 0) {
+                if (wps_count >= WPS_MAX_THREADS) continue;
+                i = wps_count++; memset(&wps_threads[i], 0, sizeof wps_threads[i]);
+                wps_threads[i].pid = pid; wps_threads[i].tid = tid; wps_threads[i].run0 = first ? run : 0; wps_threads[i].wait0 = first ? wait : 0;
+                snprintf(path, sizeof path, "/proc/%d/task/%d/comm", pid, tid);
+                if ((f = fopen(path, "r"))) { if (fgets(wps_threads[i].comm, sizeof wps_threads[i].comm, f)) wps_threads[i].comm[strcspn(wps_threads[i].comm, "\n")] = 0; fclose(f); }
+                wps_threads[i].state = '?';
+                if (!first) { wps_threads[i].run0 = run; wps_threads[i].wait0 = wait; } /* thread born during the gap: count from its first sample */
+            }
+            wps_threads[i].run1 = run; wps_threads[i].wait1 = wait; wps_threads[i].samples++;
+            snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, tid);
+            if ((f = fopen(path, "r"))) {
+                if (fgets(buf, sizeof buf, f)) { char *p = strrchr(buf, ')'); if (p) wps_threads[i].state = p[2]; }
+                fclose(f);
+            }
+            if (wps_threads[i].state == 'D' || wps_threads[i].state == 'S') {
+                snprintf(path, sizeof path, "/proc/%d/task/%d/wchan", pid, tid);
+                if ((f = fopen(path, "r"))) {
+                    char w[32] = "";
+                    if (fgets(w, sizeof w, f) && strcmp(w, "0")) {
+                        w[strcspn(w, "\n")] = 0;
+                        if (wps_threads[i].state == 'D') { snprintf(wps_threads[i].wchan, sizeof wps_threads[i].wchan, "%s", w); wps_threads[i].blocked++; }
+                        int slot = -1;
+                        for (int k = 0; k < 3; k++) if (!strcmp(wps_threads[i].waits[k], w)) { slot = k; break; }
+                        for (int k = 0; slot < 0 && k < 3; k++) if (!wps_threads[i].waits[k][0]) { slot = k; snprintf(wps_threads[i].waits[k], sizeof wps_threads[i].waits[k], "%s", w); }
+                        if (slot >= 0) wps_threads[i].wait_n[slot]++;
+                    }
+                    fclose(f);
+                }
+            }
+        }
+        closedir(tasks);
+    }
+    closedir(proc);
+}
+
+
+typedef struct { unsigned long long gpu_trans; unsigned long long irq_gpu_job, irq_gpu_mmu, irq_de; unsigned long cur_freq; } WpsHw;
+static void wps_hw(WpsHw *h)
+{
+    memset(h, 0, sizeof *h);
+    FILE *f = fopen("/sys/class/devfreq/1800000.gpu/cur_freq", "r");
+    if (f) { if (fscanf(f, "%lu", &h->cur_freq) != 1) h->cur_freq = 0; fclose(f); }
+    f = fopen("/sys/class/devfreq/1800000.gpu/trans_stat", "r");
+    if (f) { char line[256]; while (fgets(line, sizeof line, f)) { unsigned long long n; if (sscanf(line, "Total transition : %llu", &n) == 1) h->gpu_trans = n; } fclose(f); }
+    f = fopen("/proc/interrupts", "r");
+    if (f) {
+        char line[1024];
+        while (fgets(line, sizeof line, f)) {
+            unsigned long long total = 0; char *p = line; char *end;
+            while (*p == ' ') p++;
+            while (*p && *p != ':') p++;
+            if (*p == ':') p++;
+            for (;;) { unsigned long long v = strtoull(p, &end, 10); if (end == p) break; total += v; p = end; }
+            if (strstr(line, "panfrost-job")) h->irq_gpu_job += total;
+            else if (strstr(line, "panfrost-mmu")) h->irq_gpu_mmu += total;
+            else if (strstr(line, "sun55i") || strstr(line, "de-") || strstr(line, "tcon")) h->irq_de += total;
+        }
+        fclose(f);
+    }
+}
+
+static int wps_cmp(const void *a, const void *b)
+{
+    const WpsThread *x = a, *y = b;
+    unsigned long long vx = (x->run1 - x->run0) + (x->wait1 - x->wait0), vy = (y->run1 - y->run0) + (y->wait1 - y->wait0);
+    return vx < vy ? 1 : vx > vy ? -1 : 0;
+}
+
+static void *webproc_sampler(void *unused)
+{
+    (void)unused;
+    gint64 threshold = 30000; const char *env = g_getenv("SIGNAGE_WEBPROC_SAMPLE_US");
+    if (env && atoll(env) > 0) threshold = atoll(env);
+    for (;;) {
+        usleep(4000);
+        gint64 last = webproc_last_export_us, now = g_get_monotonic_time();
+        if (!last || now - last < threshold) continue;
+        wps_count = 0;
+        WpsHw hw0, hw1; wps_hw(&hw0);
+        wps_scan(TRUE); /* baseline = counters at the first sample past the threshold; the gap's first part is read from the lag */
+        gint64 started = last; int phase = webproc_export_phase; unsigned rounds = 0;
+        while (webproc_last_export_us == last && g_get_monotonic_time() - last < 2000000) { usleep(8000); wps_scan(FALSE); rounds++; }
+        wps_hw(&hw1);
+        gint64 gap = g_get_monotonic_time() - started;
+        if (webproc_last_export_us == last) { usleep(100000); continue; } /* page went idle: not an export gap */
+        qsort(wps_threads, wps_count, sizeof wps_threads[0], wps_cmp);
+        g_message("WebProcess gap mono=%" G_GINT64_FORMAT " gap_us=%" G_GINT64_FORMAT " phase=%d rounds=%u threads=%d", started, gap, phase, rounds, wps_count);
+        g_message("  gap hw gpu_freq=%lu->%lu gpu_freq_transitions+%llu gpu_job_irqs+%llu gpu_mmu_irqs+%llu display_irqs+%llu",
+                  hw0.cur_freq, hw1.cur_freq, hw1.gpu_trans - hw0.gpu_trans, hw1.irq_gpu_job - hw0.irq_gpu_job, hw1.irq_gpu_mmu - hw0.irq_gpu_mmu, hw1.irq_de - hw0.irq_de);
+        for (int i = 0; i < wps_count; i++) {
+            WpsThread *t = &wps_threads[i];
+            if (t->pid == getpid() && t->tid == (pid_t)syscall(SYS_gettid)) continue;
+            gboolean unusual = FALSE;
+            for (int k = 0; k < 3; k++) if (t->waits[k][0] && !strstr(t->waits[k], "futex") && !strstr(t->waits[k], "epoll") && !strstr(t->waits[k], "poll") && !strstr(t->waits[k], "nanosleep") && !strstr(t->waits[k], "pipe_read") && !strstr(t->waits[k], "unix_stream") && !strstr(t->waits[k], "sock_")) unusual = TRUE;
+            if (unusual) g_message("  gap wait pid=%d tid=%d %s waits=%s x%u,%s x%u,%s x%u", t->pid, t->tid, t->comm, t->waits[0], t->wait_n[0], t->waits[1], t->wait_n[1], t->waits[2], t->wait_n[2]);
+        }
+        for (int i = 0; i < wps_count && i < 10; i++) {
+            WpsThread *t = &wps_threads[i];
+            if (t->pid == getpid() && t->tid == (pid_t)syscall(SYS_gettid)) continue;
+            if ((t->run1 - t->run0) / 1000 < 2000 && (t->wait1 - t->wait0) / 1000 < 5000 && !t->blocked) continue;
+            g_message("  gap thread pid=%d tid=%d %s run_us=%llu runq_wait_us=%llu last_state=%c blocked_samples=%u wchan=%s", t->pid, t->tid, t->comm,
+                      (t->run1 - t->run0) / 1000, (t->wait1 - t->wait0) / 1000, t->state, t->blocked, t->wchan);
+        }
+        {   /* optional host-side ftrace snapshot trigger: only for gaps during playback (phase != 0) */
+            const char *trigger = g_getenv("SIGNAGE_GAP_TRIGGER_FILE");
+            if (trigger && phase != 0) {
+                char tmp[256], body[160];
+                snprintf(tmp, sizeof tmp, "%s.tmp", trigger);
+                snprintf(body, sizeof body, "mono=%" G_GINT64_FORMAT " gap_us=%" G_GINT64_FORMAT " phase=%d\n", started, gap, phase);
+                FILE *tf = fopen(tmp, "w");
+                if (tf) { fputs(body, tf); fclose(tf); if (rename(tmp, trigger) != 0) unlink(tmp); }
+            }
+        }
+    }
+    return NULL;
+}
+
+static void webproc_sampler_start(void)
+{
+    if (!g_getenv("SIGNAGE_WEBPROC_SAMPLE")) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, webproc_sampler, NULL) == 0) pthread_detach(thread);
+}
+
 static void stall_trace_start(void)
 {
     if (!g_getenv("SIGNAGE_STALL_TRACE")) return;
@@ -2399,6 +2575,7 @@ int main(int argc, char **argv)
     browser.handles = g_hash_table_new(g_direct_hash, g_direct_equal);
     browser.loop = g_main_loop_new(NULL, FALSE);
     stall_trace_start();
+    webproc_sampler_start();
     if (!open_display(&browser)) {
         fail(&browser, "No connected atomic DRM display with ARGB8888 primary plane; check /dev/dri access, DRM master, connector and DE35 support");
         cleanup(&browser);
