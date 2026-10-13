@@ -17,17 +17,20 @@ class ReleaseReceiverTests(unittest.TestCase):
 #include <sys/socket.h>
 #include <string.h>
 #include <assert.h>
+#include "video-ledger.h"
 #define SIGNAGE_VIDEO_RELEASED 3
 #define SIGNAGE_VIDEO_PRESENTED 4
 #define SIGNAGE_VIDEO_CANCELLED 5
 #define GST_CLOCK_TIME_NONE G_MAXUINT64
 #define GST_WARNING_OBJECT(...) ((void)0)
-typedef struct { guint32 type, fb, serial; } SignageVideoMessage;
+#define SIGNAGE_VIDEO_PREPARED 6
+#define SIGNAGE_VIDEO_ACTIVATED 7
+typedef struct { guint32 type; guint64 generation, interval_us; guint32 fb, serial; guint32 src_x,src_y,src_w,src_h; int32_t crtc_x,crtc_y; guint32 crtc_w,crtc_h; } SignageVideoMessage;
 typedef struct { guint32 serial; } HeldFrame;
 typedef struct { GMutex lock; GCond receiver_wake; gboolean receiver_stop, disconnected;
 int socket; GHashTable *held, *unpresented, *identities, *presented_pts; guint32 awaiting_fb, awaiting_serial; guint64 presented_total; gboolean trace_presented;
-guint8 incoming[sizeof(SignageVideoMessage)]; gsize incoming_length;
-guint32 last_presented_serial; gboolean presentation_failed; } AdmiralPlaneSink;
+guint8 incoming[sizeof(SignageVideoMessage)]; gsize incoming_length; VideoLedger *ledger; GMutex ledger_lock;
+guint32 last_fb, serial, last_presented_serial; gboolean presentation_failed, standby, prepared, activated_preroll; guint64 generation; } AdmiralPlaneSink;
 ''' + parser + r'''
 int main(void) {
 for (int iteration=0; iteration<100; iteration++) {
@@ -46,7 +49,7 @@ for (int iteration=0; iteration<100; iteration++) {
  guint64 *pts=g_new(guint64,1); *pts=123;
  g_hash_table_insert(self.identities,GUINT_TO_POINTER(3),pts);
  g_mutex_unlock(&self.lock);
- SignageVideoMessage cancelled={5,7,3};
+ SignageVideoMessage cancelled={.type=5,.fb=7,.serial=3};
  assert(write(fd[1],&cancelled,sizeof(cancelled))==sizeof(cancelled)); g_usleep(15000);
  g_mutex_lock(&self.lock);
  assert(!g_hash_table_contains(self.unpresented,GUINT_TO_POINTER(3)));
@@ -54,8 +57,8 @@ for (int iteration=0; iteration<100; iteration++) {
  assert(self.presented_total==0 && g_hash_table_size(self.held)==1);
  assert(g_hash_table_size(self.presented_pts)==0);
  g_mutex_unlock(&self.lock);
- SignageVideoMessage old={3,7,1}, current={3,7,2};
- SignageVideoMessage presented={4,7,2}, stale_presented={4,7,1};
+ SignageVideoMessage old={.type=3,.fb=7,.serial=1}, current={.type=3,.fb=7,.serial=2};
+ SignageVideoMessage presented={.type=4,.fb=7,.serial=2}, stale_presented={.type=4,.fb=7,.serial=1};
  assert(write(fd[1],&stale_presented,sizeof(stale_presented))==sizeof(stale_presented)); g_usleep(7000);
  g_mutex_lock(&self.lock); assert(self.presented_total==0); g_mutex_unlock(&self.lock);
  g_mutex_lock(&self.lock);
@@ -94,5 +97,5 @@ return 0;
         flags = subprocess.check_output(['pkg-config','--cflags','--libs','glib-2.0'],text=True).split()
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory); (path/'test.c').write_text(harness)
-            subprocess.run(['cc','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(path/'test.c'),'-o',str(path/'test'),*flags],check=True)
+            subprocess.run(['cc','-Wall','-Wextra','-Werror','-I',str(ROOT/'native'),'-fsanitize=address,undefined',str(path/'test.c'),'-o',str(path/'test'),*flags],check=True)
             subprocess.run([str(path/'test')],check=True,timeout=30)

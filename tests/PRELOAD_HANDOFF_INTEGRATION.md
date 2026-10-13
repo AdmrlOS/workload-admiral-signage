@@ -1,5 +1,10 @@
 # Bounded preloading / handoff candidate (offline, NOT gapless acceptance)
 
+Native follow-up: `STANDBY_PROTOCOL.md` now documents the integrated v2 broker,
+PAUSED sink, native WPE export/JS bridge and player/menu lifecycle. The remaining
+blocker descriptions below record the earlier cache-only baseline; they are not
+the current v2 code state. Hardware native4K60/all-frame acceptance remains RED.
+
 ## Shipped production path
 
 `app/ram_cache.py` stores compressed files in anonymous mmap RAM. Defaults:

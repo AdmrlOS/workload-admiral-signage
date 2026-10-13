@@ -233,7 +233,7 @@
       const fin = (ok, why) => { if (done) return; done = true; clearTimeout(tm); v.removeEventListener('canplay', onc); v.removeEventListener('error', one); resolve({ ok, why }); };
       const onc = () => fin(true, 'canplay');
       const one = () => fin(false, 'error');
-      const tm = setTimeout(() => fin(true, 'timeout'), CFG.canplayTimeout);
+      const tm = setTimeout(() => fin(!Q.has('native_stage'), 'timeout'), CFG.canplayTimeout);
       v.addEventListener('canplay', onc); v.addEventListener('error', one);
       v.src = src;
       v.load();
@@ -362,7 +362,20 @@
 
   /* ---------------- boot ---------------- */
   buildA(); buildC(); buildMarks();
-  const boot = () => {
+  const boot = async () => {
+    if (Q.has('native_stage')) {
+      const name=/^[BC]$/.test(only) ? only:'C';
+      curtain.style.display='none'; show(name);
+      const {ctx,stop,R}=await runScene(name);
+      if(ctx.failed || !ctx.v || ctx.v.readyState<2) {
+        log('native-next-not-ready'); return;
+      }
+      if(document.fonts) await document.fonts.ready;
+      await Promise.all(Array.from(document.images,image=>image.decode ? image.decode():Promise.resolve()));
+      window.addEventListener('signage-activated',()=>{ R.play(ctx,stop); },{once:true});
+      window.signageNative?.send({type:'ui-ready'});
+      return;
+    }
     if (/^[ABC]$/.test(only) && freeze) return staticScene(only);
     if (/^[ABC]$/.test(only)) { CFG.seq = [only]; }
     curtain.style.transform = ON; // start covered

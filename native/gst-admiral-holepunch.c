@@ -46,7 +46,8 @@ typedef struct {
     gulong bus_error_handler, bus_eos_handler, bus_qos_handler;
     GMutex lock;
     gint fd, lock_fd, broker_socket; /* broker_socket: kept open for browser-committed frames */
-    gboolean browser_commits, broker_video_frames;
+    gboolean browser_commits, broker_video_frames, standby;
+    guint64 generation;
     gint crtc_width, crtc_height;
     gint connector_id, crtc_id, browser_plane_id, video_plane_id;
     gint x, y, width, height, decoded_width, decoded_height;
@@ -166,6 +167,21 @@ get_drm_fd(AdmiralSink *self, gboolean keep_socket)
     if (connect(sock, (struct sockaddr *)&address, sizeof(address)) < 0) {
         close(sock); return FALSE;
     }
+    /* The URI token is allocated by the native UI bridge, never by connection order. */
+    guint64 requested = 0;
+    if (self->pipeline && g_object_class_find_property(G_OBJECT_GET_CLASS(self->pipeline), "uri")) {
+        gchar *uri = NULL; g_object_get(self->pipeline, "uri", &uri, NULL);
+        const gchar *token = uri ? strstr(uri, "signage_standby=") : NULL;
+        if (token) {
+            char *end=NULL;
+            requested=g_ascii_strtoull(token+strlen("signage_standby="),&end,10);
+            if (!requested || (*end && *end!='&' && *end!='#')) {
+                g_free(uri); close(sock); return FALSE;
+            }
+        }
+        g_free(uri);
+    }
+    if (send(sock, &requested, sizeof(requested), MSG_NOSIGNAL) != sizeof(requested)) { close(sock); return FALSE; }
     gchar payload[4096] = {0};
     union { struct cmsghdr align; gchar bytes[CMSG_SPACE(sizeof(gint))]; } control;
     memset(&control, 0, sizeof(control));
@@ -199,6 +215,11 @@ get_drm_fd(AdmiralSink *self, gboolean keep_socket)
         for (guint i = 0; i < G_N_ELEMENTS(members); i++)
             ok = ok && json_object_has_member(obj, members[i]);
         if (ok) {
+            ok = json_object_has_member(obj, "protocol") && json_object_get_int_member(obj, "protocol") == 2 &&
+                 json_object_has_member(obj, "generation");
+            if (!ok) { g_object_unref(parser); close(received_fd); close(sock); return FALSE; }
+            self->generation = json_object_get_int_member(obj, "generation");
+            self->standby = json_object_get_boolean_member(obj, "standby");
             self->connector_id = (gint)json_object_get_int_member(obj, "connector_id");
             self->crtc_id = (gint)json_object_get_int_member(obj, "crtc_id");
             self->browser_plane_id = (gint)json_object_get_int_member(obj, "browser_plane_id");
@@ -316,6 +337,8 @@ decoder_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer data)
         self->decoder_verified = TRUE;
         self->decoded_frames++;
         GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+        if (self->browser_commits && buffer)
+            admiral_plane_sink_record(self->kms, 4, GST_BUFFER_PTS(buffer), 0);
         for (guint i = 0; buffer && i < gst_buffer_n_memory(buffer); i++)
             self->dmabuf_seen |= gst_is_dmabuf_memory(gst_buffer_peek_memory(buffer, i));
         GstCaps *caps = gst_pad_get_current_caps(pad);
@@ -362,7 +385,12 @@ sink_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer data)
     if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
     g_mutex_lock(&self->lock);
     gboolean failed = self->failed;
-    if (!failed) { self->input_frames++; write_status(self, FALSE); }
+    if (!failed) {
+        self->input_frames++;
+        if (self->browser_commits)
+            admiral_plane_sink_record(self->kms, 5, GST_BUFFER_PTS(GST_PAD_PROBE_INFO_BUFFER(info)), 0);
+        write_status(self, FALSE);
+    }
     g_mutex_unlock(&self->lock);
     return failed ? GST_PAD_PROBE_DROP : GST_PAD_PROBE_OK;
 }
@@ -564,13 +592,18 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
         if (software && g_strcmp0(g_getenv("SIGNAGE_ALLOW_SOFTWARE"), "1") != 0) {
             fail_sink(self, "avdec_h264 comparison requires SIGNAGE_ALLOW_SOFTWARE=1"); return GST_STATE_CHANGE_FAILURE;
         }
-        self->lock_fd = open(RUN_DIR "/video.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-        if (self->lock_fd < 0 || flock(self->lock_fd, LOCK_EX | LOCK_NB) < 0) {
-            fail_sink(self, "Only one HTML video plane is supported"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
-        }
+        /* Broker owns admission for browser-committed streams. Legacy kmssink
+         * still needs exclusive ownership and cannot join standby. */
+        watch_pipeline(self);
         /* Browser-committed frames need DMA-BUF decoder output; software decoding
          * and an explicit override keep kmssink. */
         gboolean want_browser_commits = !software && g_strcmp0(g_getenv("SIGNAGE_VIDEO_SINK"), "kmssink") != 0;
+        if (!want_browser_commits) {
+            self->lock_fd = open(RUN_DIR "/video.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+            if (self->lock_fd < 0 || flock(self->lock_fd, LOCK_EX | LOCK_NB) < 0) {
+                fail_sink(self, "Legacy video plane is exclusive"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
+            }
+        }
         if (!get_drm_fd(self, want_browser_commits)) {
             fail_sink(self, "DRM broker unavailable, browser CRTC inactive, or valid overlay/alpha configuration missing"); release_resources(self); return GST_STATE_CHANGE_FAILURE;
         }
@@ -609,6 +642,7 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
             gint mode_width = self->mode_width > 0 ? self->mode_width : self->crtc_width;
             gint mode_height = self->mode_height > 0 ? self->mode_height : self->crtc_height;
             admiral_plane_sink_configure(self->kms, self->fd, self->broker_socket, mode_width, mode_height);
+            admiral_plane_sink_set_generation(self->kms, self->generation, self->standby);
             g_message("Holepunch video frames are committed by the browser with the UI on plane %d", self->video_plane_id);
         } else {
             g_object_set(self->kms, "fd", self->fd, "connector-id", self->connector_id,

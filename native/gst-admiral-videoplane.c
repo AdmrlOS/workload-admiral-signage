@@ -11,6 +11,8 @@
  */
 #include "gst-admiral-videoplane.h"
 #include "drm-broker.h"
+#include "video-ledger.h"
+#include <stdio.h>
 
 #include <gst/video/video.h>
 #include <gst/video/gstvideosink.h>
@@ -48,7 +50,9 @@ typedef struct {
     gboolean receiver_stop;
     gint fd, socket, mode_width, mode_height;
     GstVideoInfo info;
-    gboolean have_info, disconnected;
+    gboolean have_info, disconnected, standby, prepared, activated_preroll;
+    guint64 generation;
+    guint64 last_interval_us;
     GstVideoRectangle render; /* CRTC coordinates; w == 0 means "whole mode" */
     GHashTable *framebuffers; /* "inode:offsets:strides" -> fb */
     GHashTable *held;         /* fb -> HeldFrame, until the browser releases it */
@@ -68,6 +72,8 @@ typedef struct {
     gboolean stats;
     gint64 stats_at, blocked_us, render_us;
     guint frames, max_held;
+    VideoLedger *ledger;
+    GMutex ledger_lock;
 } AdmiralPlaneSink;
 
 typedef struct { GstVideoSinkClass parent_class; } AdmiralPlaneSinkClass;
@@ -93,7 +99,9 @@ held_free(gpointer data)
 static gboolean
 send_message(AdmiralPlaneSink *self, const SignageVideoMessage *message)
 {
-    const guint8 *bytes = (const guint8 *)message;
+    SignageVideoMessage owned = *message;
+    owned.generation = self->generation;
+    const guint8 *bytes = (const guint8 *)&owned;
     gsize sent = 0;
     while (sent < sizeof(*message)) {
         ssize_t part = send(self->socket, bytes + sent, sizeof(*message) - sent, MSG_NOSIGNAL);
@@ -132,6 +140,15 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
         SignageVideoMessage message;
         memcpy(&message, self->incoming, sizeof(message));
         self->incoming_length = 0;
+        if (message.generation != self->generation) continue;
+        if (message.type == SIGNAGE_VIDEO_PREPARED && self->standby && message.fb == self->last_fb &&
+            message.serial == self->serial) {
+            self->prepared = TRUE; g_cond_broadcast(&self->receiver_wake); continue;
+        }
+        if (message.type == SIGNAGE_VIDEO_ACTIVATED && self->standby && message.fb == self->last_fb &&
+            message.serial == self->serial && self->last_presented_serial == message.serial) {
+            self->standby = FALSE; self->activated_preroll = TRUE; g_cond_broadcast(&self->receiver_wake); continue;
+        }
         if (message.type == SIGNAGE_VIDEO_CANCELLED) {
             if (message.fb && GPOINTER_TO_UINT(g_hash_table_lookup(self->unpresented, GUINT_TO_POINTER(message.serial))) == message.fb) {
                 self->presentation_failed = TRUE;
@@ -145,6 +162,12 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
             if (GPOINTER_TO_UINT(g_hash_table_lookup(self->unpresented, GUINT_TO_POINTER(message.serial))) == message.fb && message.fb) {
                 g_hash_table_remove(self->unpresented, GUINT_TO_POINTER(message.serial));
                 guint64 *pts = g_hash_table_lookup(self->identities, GUINT_TO_POINTER(message.serial));
+                if (self->ledger) {
+                    g_mutex_lock(&self->ledger_lock);
+                    video_ledger_record(self->ledger, g_get_monotonic_time(),
+                        pts ? *pts : GST_CLOCK_TIME_NONE, 0, 3, message.serial, message.fb);
+                    g_mutex_unlock(&self->ledger_lock);
+                }
                 if (pts && *pts != GST_CLOCK_TIME_NONE) {
                     if (g_getenv("SIGNAGE_VIDEO_TRACE_PRESENTED"))
                         g_message("Video presented identity: serial=%u fb=%u pts=%" G_GUINT64_FORMAT,
@@ -343,12 +366,27 @@ static GstFlowReturn wait_credit(AdmiralPlaneSink *self, guint limit)
 static GstFlowReturn
 show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
 {
+    admiral_plane_sink_record(GST_ELEMENT(self), 1, GST_BUFFER_PTS(buffer), g_hash_table_size(self->unpresented));
     if (self->disconnected) {
         GST_ELEMENT_ERROR(self, RESOURCE, WRITE, ("The browser stopped accepting video frames"), (NULL));
         return GST_FLOW_ERROR;
     }
     drain_releases(self, 0);
     GError *error = NULL;
+    /* A PAUSED preroll sends exactly one retained frame. Never spend a second
+     * credit, advance decoder playback or re-SHOW it before native activation. */
+    if (self->standby && self->serial) {
+        if (buffer == self->last) return GST_FLOW_OK;
+        gint64 deadline=g_get_monotonic_time()+G_USEC_PER_SEC;
+        while (self->standby && !self->disconnected && !self->flushing)
+            if (!g_cond_wait_until(&self->receiver_wake,&self->lock,deadline)) return GST_FLOW_ERROR;
+        if (self->flushing) return GST_FLOW_FLUSHING;
+        if (self->disconnected) return GST_FLOW_ERROR;
+    }
+    if (self->activated_preroll) {
+        self->activated_preroll=FALSE;
+        if (buffer==self->last) return GST_FLOW_OK; /* already PRESENTED at activation */
+    }
     GstFlowReturn credit = wait_credit(self, 1);
     if (credit != GST_FLOW_OK) return credit;
     guint32 fb = framebuffer_for(self, buffer, &error);
@@ -359,6 +397,10 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     }
     if (buffer != self->last) gst_buffer_replace(&self->last, buffer);
     self->last_fb = fb;
+    GstClockTime interval = GST_BUFFER_DURATION(buffer);
+    if (!GST_CLOCK_TIME_IS_VALID(interval) || !interval) interval = GST_VIDEO_INFO_FPS_N(&self->info) > 0 ?
+        gst_util_uint64_scale(GST_SECOND, GST_VIDEO_INFO_FPS_D(&self->info), GST_VIDEO_INFO_FPS_N(&self->info)) : 0;
+    self->last_interval_us = interval ? (interval + GST_USECOND - 1) / GST_USECOND : 0;
     if (self->serial == G_MAXUINT32) {
         GST_ELEMENT_ERROR(self, RESOURCE, WRITE, ("Video identity exhausted; recreate pipeline"), (NULL));
         return GST_FLOW_ERROR;
@@ -389,6 +431,12 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     if (message.serial <= 5) g_message("Video identity: serial=%u pts=%" G_GUINT64_FORMAT " duration=%" G_GUINT64_FORMAT, message.serial, *pts, GST_BUFFER_DURATION(buffer));
     g_hash_table_insert(self->identities, GUINT_TO_POINTER(message.serial), pts);
     if (!send_message(self, &message)) return GST_FLOW_ERROR;
+    if (self->ledger) {
+        g_mutex_lock(&self->ledger_lock);
+        video_ledger_record(self->ledger, g_get_monotonic_time(),
+            GST_BUFFER_PTS(buffer), g_hash_table_size(self->held), 2, message.serial, message.fb);
+        g_mutex_unlock(&self->ledger_lock);
+    }
     self->hidden = FALSE;
     /* The browser keeps at most three; more means it stopped presenting. */
     if (g_hash_table_size(self->held) > MIN_POOL_BUFFERS) {
@@ -440,6 +488,51 @@ static GstFlowReturn wait_presented(AdmiralPlaneSink *self)
     return result;
 }
 
+/* Caller holds lock; only EOS/stop performs I/O, not presentation callbacks. */
+static void dump_ledger(AdmiralPlaneSink *self)
+{
+    if (!self->ledger) return;
+    g_mutex_lock(&self->ledger_lock);
+    const gchar *dir = g_getenv("SIGNAGE_VIDEO_LEDGER_DIR");
+    gchar *path = g_strdup_printf("%s/plane-%ld-%p-%u.csv", dir ? dir : "/run", (long)getpid(), (void *)self, self->serial);
+    FILE *stream = fopen(path, "w");
+    if (stream) {
+        fprintf(stream, "# generation=%" G_GUINT64_FORMAT " total=%" G_GUINT64_FORMAT " capacity=%u\nmono_us,pts,value,stage,serial,fb\n", self->generation, self->ledger->total, VIDEO_LEDGER_CAPACITY);
+        for (guint64 i = 0; ; i++) {
+            const VideoLedgerRecord *r = video_ledger_at(self->ledger, i);
+            if (!r) break;
+            fprintf(stream, "%" G_GUINT64_FORMAT ",%" G_GUINT64_FORMAT ",%" G_GUINT64_FORMAT ",%u,%u,%u\n",
+                    r->mono_us, r->pts, r->value, r->stage, r->serial, r->fb);
+        }
+        fclose(stream);
+    }
+    g_free(path);
+    self->ledger->total = 0;
+    g_mutex_unlock(&self->ledger_lock);
+}
+
+void admiral_plane_sink_record(GstElement *element, guint stage, guint64 pts, guint64 value)
+{
+    AdmiralPlaneSink *self = (AdmiralPlaneSink *)element;
+    if (!self->ledger) return;
+    g_mutex_lock(&self->ledger_lock);
+    video_ledger_record(self->ledger, g_get_monotonic_time(), pts, value, stage, 0, 0);
+    g_mutex_unlock(&self->ledger_lock);
+}
+
+static GstPadProbeReturn ledger_upstream(GstPad *pad, GstPadProbeInfo *info, gpointer data)
+{
+    (void)pad;
+    GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+    if (event && GST_EVENT_TYPE(event) == GST_EVENT_QOS) {
+        GstQOSType type; gdouble proportion; GstClockTimeDiff diff; GstClockTime timestamp;
+        gst_event_parse_qos(event, &type, &proportion, &diff, &timestamp);
+        (void)type; (void)proportion;
+        admiral_plane_sink_record(data, 6, timestamp, (guint64)diff);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
 static gboolean admiral_plane_sink_query(GstElement *element, GstQuery *query)
 {
     GstBaseSink *base = GST_BASE_SINK(element);
@@ -484,6 +577,12 @@ static gboolean admiral_plane_sink_event(GstBaseSink *base, GstEvent *event)
     if (GST_EVENT_TYPE(event) == GST_EVENT_EOS) {
         g_mutex_lock(&self->lock);
         GstFlowReturn result = wait_presented(self);
+        if (result == GST_FLOW_OK) {
+            SignageVideoMessage endpoint = { .type = SIGNAGE_VIDEO_ENDPOINT,
+                .fb = self->last_fb, .serial = self->last_presented_serial, .interval_us = self->last_interval_us };
+            if (!endpoint.interval_us || !send_message(self, &endpoint)) result = GST_FLOW_ERROR;
+        }
+        dump_ledger(self);
         g_message("Video EOS drain: unique_pts=%u presented=%" G_GUINT64_FORMAT " last_serial=%u pending=%u result=%s",
                   g_hash_table_size(self->presented_pts), self->presented_total, self->serial,
                   g_hash_table_size(self->unpresented), gst_flow_get_name(result));
@@ -656,6 +755,7 @@ admiral_plane_sink_stop(GstBaseSink *base)
     } else prune_framebuffers(self, TRUE);
     self->have_info = FALSE;
     self->incoming_length = 0;
+    dump_ledger(self);
     g_mutex_unlock(&self->lock);
     return TRUE;
 }
@@ -697,6 +797,14 @@ admiral_plane_sink_overlay_init(GstVideoOverlayInterface *iface)
     iface->set_window_handle = admiral_plane_sink_set_window_handle;
 }
 
+void admiral_plane_sink_set_generation(GstElement *element, guint64 generation, gboolean standby)
+{
+    AdmiralPlaneSink *self = (AdmiralPlaneSink *)element;
+    g_mutex_lock(&self->lock);
+    self->generation = generation; self->standby = standby; self->prepared = FALSE;
+    g_mutex_unlock(&self->lock);
+}
+
 void
 admiral_plane_sink_configure(GstElement *element, gint drm_fd, gint socket_fd, gint mode_width, gint mode_height)
 {
@@ -728,6 +836,8 @@ admiral_plane_sink_finalize(GObject *object)
     g_hash_table_unref(self->identities);
     g_hash_table_unref(self->presented_pts);
     g_hash_table_unref(self->framebuffers);
+    g_free(self->ledger);
+    g_mutex_clear(&self->ledger_lock);
     gst_buffer_replace(&self->last, NULL);
     g_cond_clear(&self->receiver_wake);
     g_mutex_clear(&self->lock);
@@ -759,6 +869,7 @@ static void
 admiral_plane_sink_init(AdmiralPlaneSink *self)
 {
     g_mutex_init(&self->lock);
+    g_mutex_init(&self->ledger_lock);
     g_cond_init(&self->receiver_wake);
     self->fd = self->socket = -1;
     self->hidden = TRUE;
@@ -769,6 +880,11 @@ admiral_plane_sink_init(AdmiralPlaneSink *self)
     self->framebuffers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     self->held = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, held_free);
     self->stats = g_strcmp0(g_getenv("SIGNAGE_VIDEO_STATS"), "1") == 0;
+    if (g_getenv("SIGNAGE_VIDEO_LEDGER_DIR")) {
+        self->ledger = g_new0(VideoLedger, 1);
+        gst_pad_add_probe(GST_BASE_SINK_PAD(self), GST_PAD_PROBE_TYPE_EVENT_UPSTREAM,
+                          ledger_upstream, self, NULL);
+    }
     self->unpresented = g_hash_table_new(g_direct_hash, g_direct_equal);
     self->identities = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
     self->presented_pts = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);

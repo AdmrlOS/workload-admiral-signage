@@ -1,6 +1,30 @@
 /* Package lifecycle: paint before reveal; retain the page while releasing its decoder. */
 (() => {
   'use strict';
+  if(window.__signageLifecycleInstalled) return;
+  window.__signageLifecycleInstalled=true;
+  const nativeStage=new URLSearchParams(location.search).has('native_stage');
+  if (nativeStage) {
+    const token=new URLSearchParams(location.search).get('signage_standby');
+    const nativePlay=HTMLMediaElement.prototype.play;
+    const source=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');
+    Object.defineProperty(HTMLMediaElement.prototype,'src',{...source,set(value){
+      const uri=new URL(value,location.href); uri.searchParams.set('signage_standby',token);
+      source.set.call(this,uri.href);
+    }});
+    let activated=false;
+    HTMLMediaElement.prototype.play=function(){ return activated ? nativePlay.call(this):Promise.resolve(); };
+    window.addEventListener('signage-native',event=>{
+      if(event.detail?.event!=='play') return;
+      activated=true;
+      window.dispatchEvent(new CustomEvent('signage-activated'));
+    });
+    window.addEventListener('load',fitCanvas);
+    window.addEventListener('resize',fitCanvas);
+    // Content opts into its own paused preparation lifecycle. No generic hidden
+    // autoplay or curtain timeout can assert readiness on behalf of a package.
+    return;
+  }
   if (window.parent === window) return;
   let held = false;
   const timers = new Set(), intervals = new Set(), frames = new Set();

@@ -9,7 +9,7 @@ PREFIX ?= /usr/local
 .PHONY: all install clean
 all: signage-browser signage-bwrap
 
-signage-browser: signage-browser.c input.c input.h ../native/drm-broker.c ../native/drm-broker.h
+signage-browser: signage-browser.c standby-renderer.h input.c input.h ../native/drm-broker.c ../native/drm-broker.h ../native/standby-protocol.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra -Werror -o $@ signage-browser.c input.c ../native/drm-broker.c $(LDLIBS)
 
 signage-bwrap: signage-bwrap.c

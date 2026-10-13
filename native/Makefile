@@ -10,7 +10,7 @@ all: libgstadmiralholepunch.so
 
 SOURCES = gst-admiral-holepunch.c gst-admiral-videoplane.c
 
-libgstadmiralholepunch.so: $(SOURCES) gst-admiral-videoplane.h drm-broker.h
+libgstadmiralholepunch.so: $(SOURCES) gst-admiral-videoplane.h drm-broker.h video-ledger.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror -fPIC -shared -o $@ $(SOURCES) $(LDLIBS)
 
 install: all

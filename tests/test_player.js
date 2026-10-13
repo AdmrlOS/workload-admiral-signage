@@ -36,15 +36,30 @@ async function harness(entries, options={}) {
   }
   const stage=new Element('div'), body=new Element('body'), head=new Element('head'), status=new Element('div');
   const window={parent:{postMessage(){}},addEventListener:(type,fn) => (listeners[type]??=[]).push(fn),removeEventListener:(type,fn) => { listeners[type]=(listeners[type]||[]).filter((f)=>f!==fn); }};
-  const context={console:{...console,log:(...a)=>{logs.push(a.map(String).join(' '));console.log(...a);}}, URL,URLSearchParams,Promise,Date,Map,Image:class extends Element { constructor(){super('img');} },
+    if(options.native) window.signageNative={send:message=>events.push(message)};
+    const context={console:{...console,log:(...a)=>{logs.push(a.map(String).join(' '));console.log(...a);}}, URL,URLSearchParams,Promise,Date,Map,Image:class extends Element { constructor(){super('img');} },
     window,document:{body,head,createElement:(tag)=>new Element(tag),getElementById:(id)=>id==='stage'?stage:status,addEventListener(){}},
-    location:{origin:'http://signage.test',search:options.search||''},setTimeout:timeout,clearTimeout:(id)=>timers.delete(id),requestAnimationFrame:(fn)=>queueMicrotask(fn),
+    location:{origin:'http://signage.test',href:'http://127.0.0.1:8080/player/',search:options.search||''},setTimeout:timeout,clearTimeout:(id)=>timers.delete(id),requestAnimationFrame:(fn)=>queueMicrotask(fn),
     fetch:async(url)=>{ if(options.networkFailure?.() && url==='/api/playlist') throw new Error('offline'); return {ok:true,json:async()=>({entries,revision,now:Date.now()/1000,next_change:null})}; }};
   vm.runInNewContext(readFileSync('www/player/player.js','utf8'),context);
   const settle=async()=>{ for(let i=0;i<80;i++) await Promise.resolve(); };
   await settle();
-  return {events,nodes,timers,logs,settle,message:(node,type)=>{(listeners.message||[]).forEach(fn=>fn({source:node.contentWindow,data:{type}}));},hide:()=>{(listeners.pagehide||[]).forEach(fn=>fn());},setPlaylist:(next)=>{entries=next;revision++;},run:async(ms)=>{ const pair=Array.from(timers).find(([,t])=>t.ms===ms); assert.ok(pair,`Missing timer ${ms}`); timers.delete(pair[0]); for (const n of nodes) if (n._playing && options.advance !== false) n._t += ms/1000; pair[1].fn(); await settle(); }};
+  return {events,nodes,timers,logs,settle,native:data=>{(listeners['signage-native']||[]).forEach(fn=>fn({detail:data}));},message:(node,type)=>{(listeners.message||[]).forEach(fn=>fn({source:node.contentWindow,data:{type}}));},hide:()=>{(listeners.pagehide||[]).forEach(fn=>fn());},setPlaylist:(next)=>{entries=next;revision++;},run:async(ms)=>{ const pair=Array.from(timers).find(([,t])=>t.ms===ms); assert.ok(pair,`Missing timer ${ms}`); timers.delete(pair[0]); for (const n of nodes) if (n._playing && options.advance !== false) n._t += ms/1000; pair[1].fn(); await settle(); }};
 }
+test('native two-client handoff never creates an incoming DOM sink or releases old before matching flip',async()=>{
+ const h=await harness([entry('a','video'),entry('b','video')],{native:true});
+ const reservation=h.events.find(e=>e.type==='native-stage'); assert.ok(reservation);
+ assert.equal(h.nodes.filter(n=>n.tagName==='VIDEO').length,1);
+ h.native({event:'prepared',request:reservation.request,generation:'2'});
+ const old=h.nodes.find(n=>n.tagName==='VIDEO'); old._ended=true; old.onended(); await h.settle();
+ assert.ok(h.events.find(e=>e.type==='native-activate' && e.generation==='2'));
+ assert.equal(h.events.includes('release:VIDEO'),false);
+ h.native({event:'activated',request:reservation.request,generation:'1'}); await h.settle();
+ assert.equal(h.events.includes('release:VIDEO'),false,'stale generation cannot authorize teardown');
+ h.native({event:'activated',request:reservation.request,generation:'2'}); await h.settle();
+ assert.equal(h.events.includes('release:VIDEO'),true);
+});
+
 const entry=(id,kind,duration=1)=>({id,asset_id:id,duration,enabled:true,start:null,end:null,asset:{id,kind,name:id,url:'/'+id,poster:'/first.jpg',end_poster:'/last.jpg',video_duration:1}});
 
 test('static HTML is prepared while the outgoing video still plays, with one sink',async()=>{

@@ -1,6 +1,37 @@
 (() => {
   'use strict';
   const stage = document.getElementById('stage');
+  const nativeParams=new URLSearchParams(location.search);
+  // A separate native WPE export, not a hidden DOM video in the outgoing view.
+  // PAUSED preroll retains its first DMA-BUF while outgoing motion continues.
+  if(nativeParams.has('native_surface')) {
+    const video=document.createElement('video'); video.className='surface video';
+    video.muted=true; video.defaultMuted=true; video.playsInline=true; video.preload='auto';
+    const uri=new URL(nativeParams.get('native_surface'),location.href);
+    uri.searchParams.set('signage_standby',nativeParams.get('signage_standby'));
+    stage.appendChild(video); video.src=uri.href; video.load();
+    video.addEventListener('loadeddata',async()=>{
+      if(document.fonts) await document.fonts.ready;
+      window.signageNative?.send({type:'ui-ready'});
+    },{once:true});
+    window.addEventListener('signage-native',event=>{
+      if(event.detail?.event==='play') video.play().catch(()=>{});
+    });
+    video.onended=()=>window.signageNative?.send({type:'ended'});
+    return;
+  }
+  let nativeStage=null, nativeRequest=0, nativeActiveGeneration=null;
+  function nativeSend(message) { window.signageNative?.send(message); }
+  window.addEventListener('signage-native',event=>{
+    const data=event.detail;
+    if(data.event==='ended' && current?.native && data.generation===nativeActiveGeneration) { advance(); return; }
+    if(!nativeStage || data.request!==nativeStage.request) return;
+    if(data.event==='prepared') { nativeStage.generation=data.generation; nativeStage.ready=true; }
+    else if(data.event==='not-ready' || data.event==='cancelled' || data.event==='failed') {
+      nativeStage.error=data.event; nativeStage.resolve?.(false);
+    } else if(data.event==='activated' && data.generation===nativeStage.generation) nativeStage.resolve?.(true);
+
+  });
   const preview = new URLSearchParams(location.search).has('preview');
   if (preview) document.body.classList.add('preview');
   let playlist = [], current = null, transitioning = false, requested = false, timer = 0, pollTimer = 0, boundaryTimer = 0, clockTimer = 0;
@@ -28,6 +59,7 @@
   }
   const signature = (entry) => JSON.stringify(entry);
   function cancelStage() {
+    if(nativeStage) { nativeSend({type:'native-cancel'}); nativeStage.resolve?.(false); nativeStage=null; }
     stageGeneration++;
     if (staged) { remove(staged.item); staged=null; }
   }
@@ -41,8 +73,20 @@
       fetch('/api/preload',{method:'POST',headers:{'Content-Type':'application/json','X-Signage-Request':'player'},body:JSON.stringify({urls})}).then(response=>{if(!response.ok) cacheWindow='';}).catch(()=>{ cacheWindow=''; });
     }
     warm(next);
-    if(staged && staged.key===signature(next)) return;
+    if((staged && staged.key===signature(next)) || (nativeStage && !nativeStage.error && nativeStage.key===signature(next))) return;
     cancelStage();
+    if(window.signageNative && current && next &&
+        (next.asset.kind==='video' || next.asset.kind==='html') &&
+        (current.entry.asset.kind==='video' || current.native) &&
+        (next.asset.url!==current.entry.asset.url || current.native)) {
+      const uri=next.asset.kind==='video' ? new URL('/player/',location.href) : new URL(next.asset.url,location.href);
+      if(next.asset.kind==='video') uri.searchParams.set('native_surface',new URL(next.asset.url,location.href).href);
+      else uri.searchParams.set('native_stage','1');
+      const slot={key:signature(next),request:++nativeRequest,ready:false,generation:null};
+      nativeStage=slot;
+      nativeSend({type:'native-stage',request:slot.request,uri:uri.href});
+      return;
+    }
     // Static opt-in packages are enforced media-free by response CSP. Arbitrary
     // HTML (which can create video dynamically) gets byte warming only.
     if(!current || !next || next.id===current.entry.id || next.asset.kind!=='html' || !next.asset.preload_static) return;
@@ -212,7 +256,7 @@
   }
   async function advance(forceId) {
     if (transitioning) { requested=true; return; }
-    if (!playlist.length) { clearTimeout(timer); cancelStage(); remove(current); current=null; lookahead(); notify(null); return; }
+    if (!playlist.length) { if(current?.native) nativeSend({type:'native-reset'}); clearTimeout(timer); cancelStage(); remove(current); current=null; lookahead(); notify(null); return; }
     transitioning=true; clearTimeout(timer);
     let index = forceId ? playlist.findIndex((e) => e.id===forceId) : current ? (playlist.findIndex((e) => e.id===current.entry.id)+1)%playlist.length : 0;
     index=Math.max(index,0);
@@ -229,6 +273,26 @@
         current.entry = candidate; current.held = false;
         const v = current.node; v.currentTime = 0; v.play().catch(() => {});
         notify(candidate); arm(current); return;
+      }
+      if(nativeStage && nativeStage.key===signature(candidate)) {
+        const slot=nativeStage;
+        if(!slot.ready || slot.error) {
+          console.warn('Native next-not-ready: retaining outgoing surface',slot.error || 'preroll pending');
+          timer=setTimeout(()=>advance(forceId),100); return;
+        }
+        const activated=new Promise(resolve=>{slot.resolve=resolve;});
+        nativeSend({type:'native-activate',generation:slot.generation});
+        if(await activated) {
+          const old=current;
+          // Native matching flip already switched UI+video. Teardown cannot precede it.
+          remove(old);
+          const node=document.createElement('div'); node.className='surface'; stage.appendChild(node);
+          current={entry:candidate,node,native:true,generation:0}; nativeActiveGeneration=slot.generation; nativeStage=null;
+          notify(candidate);
+          if(candidate.asset.kind!=='video') timer=setTimeout(()=>advance(),(candidate.duration || 120)*1000);
+          lookahead(); return;
+        }
+        console.warn('Native activation failed; outgoing surface retained'); return;
       }
       // A staged media-free page is ready before the outgoing sink is released.
       // Reveal and removal share one browser paint task; rAF is not KMS proof.
@@ -247,6 +311,7 @@
         }
       }
       if(stopped) return;
+      if(current?.native) nativeSend({type:'native-reset'});
       // Serial video fallback is explicitly non-gapless: no spare decoder is
       // supported by the broker. Never disguise a frozen poster as motion.
       const nextPoster = candidate && candidate.asset.kind === 'video' ? candidate.asset.poster : null;
@@ -286,7 +351,8 @@
       if(data.next_change) clockTimer=setTimeout(() => { const now=data.now+(Date.now()-lastPoll)/1000; playlist=playlist.filter((e) => !e.end || new Date(e.end).getTime()/1000>now); reconcile(); },Math.max(25,Math.min(2147483647,(data.next_change-data.now)*1000+30)));
       warm(playlist[0]);
       if(!current) lookahead();
-      if(staged && !playlist.some(e=>signature(e)===staged.key)) cancelStage();
+      if((staged && !playlist.some(e=>signature(e)===staged.key)) ||
+          (nativeStage && !playlist.some(e=>signature(e)===nativeStage.key))) cancelStage();
       reconcile();
     } catch (_) { document.getElementById('now-playing').textContent=previousRevision ? 'Playing saved loop · reconnecting…' : 'Connecting to your content…'; }
     if(!stopped) pollTimer=setTimeout(poll,2000);

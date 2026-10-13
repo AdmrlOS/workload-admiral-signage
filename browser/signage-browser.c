@@ -36,6 +36,7 @@
 #include "input.h"
 #include "split-scanout.h"
 #include "../native/drm-broker.h"
+#include "../native/standby-protocol.h"
 
 #define VERSION "0.1.0"
 
@@ -51,6 +52,7 @@ typedef struct {
 
 typedef struct {
     struct wl_resource *resource;
+    void *owner; /* creating renderer owns WPE/GEM/pool resources */
     uint32_t fb;
     gboolean split; /* same owned FB referenced by both UI views */
     uint32_t handles[4];
@@ -98,6 +100,9 @@ typedef struct {
 typedef struct {
     uint32_t plane;
     uint32_t fb, crtc, src_x, src_y, src_w, src_h, crtc_x, crtc_y, crtc_w, crtc_h;
+    VideoState standby, endpoint;
+    guint64 endpoint_interval;
+    SignageStandby gate;
     VideoState current, pending, next; /* on screen, in flight, waiting for the next commit */
     gboolean pending_valid, dirty;
     GQueue waiting; /* bounded by sink's two unpresented SHOW credits */
@@ -162,6 +167,12 @@ typedef struct {
     gboolean broker_started;
     int exit_code;
     const char *uri;
+    void *root; /* standby renderer: shared committer, never a DRM event consumer */
+    void *staged_view, *visible_view, *retiring_view;
+    gboolean stage_ui_ready, activation_requested, orchestrator_hidden;
+    guint64 stage_request, stage_ui_generation, dead_generation, cancelled_generation;
+    guint stage_tick;
+    gint64 stage_deadline;
     char *failure;
     char *holepunch_error;
 } Browser;
@@ -506,12 +517,15 @@ static Frame *frame_new(void)
 }
 
 static gboolean frame_ready(const Frame *frame);
+static gboolean retry_fence(gpointer data);
 
 static void release_frame(Browser *browser, Frame *frame)
 {
     if (!frame) return;
+    if (frame->owner) browser = frame->owner;
     if (frame->resource && !frame_ready(frame)) {
         browser->copy_retired = g_list_prepend(browser->copy_retired, frame);
+        if (!browser->fence_source) browser->fence_source=g_timeout_add(1,retry_fence,browser);
         return; /* GPU is still sampling WPE's storage */
     }
     if (frame->fence_fd >= 0) close(frame->fence_fd);
@@ -549,13 +563,18 @@ static void video_release_if_unused(Browser *browser, uint32_t fb)
     if (!fb || fb == video->current.fb || (video->pending_valid && fb == video->pending.fb) || (video->dirty && fb == video->next.fb)) return;
     for (GList *it = video->waiting.head; it; it = it->next)
         if (((VideoState *)it->data)->fb == fb) return;
-    gpointer serial = NULL;
-    if (!video->serials || !g_hash_table_lookup_extended(video->serials, GUINT_TO_POINTER(fb), NULL, &serial)) return;
+    if (fb == video->standby.fb) return;
+    VideoState *identity = video->serials ? g_hash_table_lookup(video->serials, GUINT_TO_POINTER(fb)) : NULL;
+    if (!identity) return;
+    guint64 generation = identity->generation; uint32_t serial = identity->serial;
     g_hash_table_remove(video->serials, GUINT_TO_POINTER(fb));
-    signage_drm_broker_video_released(fb, GPOINTER_TO_UINT(serial));
+    signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_RELEASED, fb, serial);
 }
 
 static gboolean submit_commit(Browser *browser);
+static void standby_progress(Browser *browser);
+static void native_notice(Browser *browser, const char *event, guint64 generation);
+static void destroy_stage_view(Browser *view);
 
 static gboolean retry_commit(gpointer data)
 {
@@ -579,7 +598,10 @@ static gboolean retry_fence(gpointer data)
         }
         item = next;
     }
-    submit_commit(browser);
+    if (browser->root) {
+        Browser *root=browser->root;
+        standby_progress(root); submit_commit(root);
+    } else submit_commit(browser);
     if (browser->copy_retired && !browser->fence_source)
         browser->fence_source = g_timeout_add(1, retry_fence, browser);
     return G_SOURCE_REMOVE;
@@ -665,7 +687,10 @@ static gboolean submit_commit(Browser *browser)
             /* Let WebKit render the next frame while this one's GPU copy and
              * flip are in flight. It can then reach us before the next vblank;
              * it waits in queued until this commit flips. */
-            if (frame && browser->frame_complete_early) wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+            if (frame && browser->frame_complete_early) {
+                Browser *owner = frame->owner ? frame->owner : browser;
+                wpe_view_backend_exportable_fdo_dispatch_frame_complete(owner->exportable);
+            }
             return TRUE;
         }
         if (saved_errno == EBUSY) {
@@ -680,8 +705,18 @@ static gboolean submit_commit(Browser *browser)
             g_warning("Atomic commit with video fb %u rejected: %s; dropping that video frame", video->next.fb, g_strerror(saved_errno));
             video->rejected++;
             uint32_t rejected = video->next.fb;
-            if (video->next.generation == signage_drm_broker_video_generation())
-                signage_drm_broker_video_cancelled(rejected, video->next.serial);
+            signage_drm_broker_video_ack(video->next.generation, SIGNAGE_VIDEO_CANCELLED, rejected, video->next.serial);
+            if (video->gate.phase == SIGNAGE_STANDBY_COMMITTING) {
+                /* A failed activation is NOT allowed to put incoming UI on the old video. */
+                guint64 failed = video->next.generation;
+                video->dirty=FALSE;
+                video->gate.phase = SIGNAGE_STANDBY_READY;
+                Browser *stage=browser->staged_view;
+                if (stage && browser->queued) { stage->queued=browser->queued; browser->queued=NULL; }
+                video->standby=video->next;
+                native_notice(browser, "failed", failed);
+                return TRUE;
+            }
             video->dirty = FALSE;
             browser->stats.video_rejected++;
             video_release_if_unused(browser, rejected);
@@ -820,8 +855,19 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
         video->current = video->pending;
         video->current.flipped_us = g_get_monotonic_time();
         video->pending_valid = FALSE;
-        if (video->current.fb && !video->current.cancelled && video->current.generation == signage_drm_broker_video_generation())
-            signage_drm_broker_video_presented(video->current.fb, video->current.serial);
+        if (video->current.fb && !video->current.cancelled)
+            signage_drm_broker_video_ack(video->current.generation, SIGNAGE_VIDEO_PRESENTED, video->current.fb, video->current.serial);
+        if (signage_standby_flipped(&video->gate, video->current.generation, video->current.serial, video->current.fb)) {
+            signage_drm_broker_video_activate(video->current.generation);
+            signage_drm_broker_video_ack(video->current.generation, SIGNAGE_VIDEO_ACTIVATED, video->current.fb, video->current.serial);
+            browser->retiring_view = browser->visible_view;
+            browser->visible_view = browser->staged_view; browser->staged_view = NULL;
+            browser->orchestrator_hidden = TRUE;
+            Browser *visible = browser->visible_view;
+            webkit_web_view_evaluate_javascript(visible->view,
+                "window.dispatchEvent(new CustomEvent('signage-native',{detail:{event:'play'}}))", -1, NULL, NULL, NULL, NULL, NULL);
+            native_notice(browser, "activated", video->current.generation);
+        }
         if (video->current.fb && video->current.fb != retired) {
             video->shown++;
             if (video->current.arrived_us) {
@@ -851,85 +897,107 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
         if (browser->presented % 120 == 0) write_status(browser);
     }
     if (!browser->frame_complete_early) wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+    if (browser->dead_generation && browser->dead_generation == signage_drm_broker_video_generation() &&
+        !browser->visible_view && !video->current.fb && !video->pending_valid && !video->dirty && g_queue_is_empty(&video->waiting)) {
+        signage_drm_broker_video_retired(browser->dead_generation); browser->dead_generation=0;
+    }
+    standby_progress(browser);
     submit_commit(browser);
 }
 
 /* A frame (or hide request) from the holepunch sink; message == NULL when the
  * sink disconnected, which hides the video. */
+static void remember_video(VideoPlane *video, const VideoState *state)
+{
+    VideoState *identity = g_new(VideoState, 1); *identity = *state;
+    g_hash_table_replace(video->serials, GUINT_TO_POINTER(state->fb), identity);
+}
+
 static void video_message(const SignageVideoMessage *message, gpointer data)
 {
     Browser *browser = data;
     VideoPlane *video = &browser->video;
-    if (!video->plane) return;
-    guint64 generation = signage_drm_broker_video_generation();
-    if (video->generation != generation) {
-        video->generation = generation;
-        video->last_serial = 0;
+    if (!video->plane || !message) return;
+    guint64 generation = message->generation;
+    gboolean incoming = generation == video->gate.standby && generation != 0 &&
+        video->gate.phase != SIGNAGE_STANDBY_RETIRING;
+    if (message->type == SIGNAGE_VIDEO_ENDPOINT) {
+        VideoState *current = &video->current;
+        if (current->generation == generation && current->serial == message->serial &&
+            current->fb == message->fb && !current->cancelled && !video->pending_valid &&
+            !video->dirty && g_queue_is_empty(&video->waiting) && message->interval_us) {
+            video->endpoint = *current; video->endpoint_interval = message->interval_us;
+            signage_standby_endpoint(&video->gate, generation, current->serial, current->fb,
+                current->flipped_us, message->interval_us);
+        }
+        standby_progress(browser); return;
     }
-    if (message && message->type == SIGNAGE_VIDEO_SHOW) {
-        /* Reconnect before serial exhaustion; never alias an identity. */
-        if (!message->serial || message->serial <= video->last_serial) {
-            signage_drm_broker_video_disconnect();
+    if (incoming && message->type != SIGNAGE_VIDEO_SHOW) {
+        if (video->gate.phase == SIGNAGE_STANDBY_COMMITTING || video->gate.phase == SIGNAGE_STANDBY_RETIRING) return;
+        uint32_t fb = video->standby.fb, serial = video->standby.serial;
+        video->standby = (VideoState){0};
+        signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, fb, serial);
+        video_release_if_unused(browser, fb);
+        signage_standby_cancel(&video->gate, generation);
+        browser->cancelled_generation = generation;
+        native_notice(browser, "cancelled", generation);
+        return;
+    }
+    if (message->type == SIGNAGE_VIDEO_DISCONNECTED && !incoming && generation != signage_drm_broker_video_generation()) {
+        signage_drm_broker_video_retired(generation); return;
+    }
+    if (generation != signage_drm_broker_video_generation() && !incoming) {
+        /* Retired peer HIDE cannot hide the new active stream. */
+        if (message->fb) signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, message->fb, message->serial);
+        return;
+    }
+    if (message->type == SIGNAGE_VIDEO_SHOW) {
+        VideoState state = { .fb=message->fb, .serial=message->serial, .generation=generation,
+            .src_x=message->src_x, .src_y=message->src_y, .src_w=message->src_w, .src_h=message->src_h,
+            .crtc_x=message->crtc_x, .crtc_y=message->crtc_y, .crtc_w=message->crtc_w, .crtc_h=message->crtc_h,
+            .arrived_us=g_get_monotonic_time() };
+        VideoState *owner = g_hash_table_lookup(video->serials, GUINT_TO_POINTER(state.fb));
+        if (!state.fb || !state.serial || !state.src_w || !state.src_h || !state.crtc_w || !state.crtc_h ||
+            (owner && owner->generation != generation)) {
+            signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, state.fb, state.serial);
+            if (state.fb && (!owner || owner->generation == generation)) {
+                remember_video(video, &state); video_release_if_unused(browser, state.fb);
+            }
             return;
         }
-        video->last_serial = message->serial;
-    }
-    VideoState state = { 0 };
-    if (message && message->type == SIGNAGE_VIDEO_SHOW && message->fb && message->src_w && message->src_h && message->crtc_w && message->crtc_h) {
-        state.fb = message->fb;
-        state.serial = message->serial;
-        state.generation = generation;
-        state.src_x = message->src_x; state.src_y = message->src_y;
-        state.src_w = message->src_w; state.src_h = message->src_h;
-        state.crtc_x = message->crtc_x; state.crtc_y = message->crtc_y;
-        state.crtc_w = message->crtc_w; state.crtc_h = message->crtc_h;
-        state.arrived_us = g_get_monotonic_time();
-    } else if (message && message->type == SIGNAGE_VIDEO_SHOW) {
-        g_warning("Ignoring malformed video frame message for fb %u", message->fb);
-        signage_drm_broker_video_cancelled(message->fb, message->serial);
-        if (message->fb) g_hash_table_insert(video->serials, GUINT_TO_POINTER(message->fb), GUINT_TO_POINTER(message->serial));
-        video_release_if_unused(browser, message->fb);
-        return;
-    }
-    if (!message) g_hash_table_remove_all(video->serials); /* nobody left to tell */
-    if (!state.fb) {
-        /* A pending atomic commit cannot be recalled, but HIDE terminalizes
-         * its presentation credit now; its later flip must not fake PRESENTED. */
-        if (video->pending_valid && video->pending.fb && !video->pending.cancelled) {
-            if (message && video->pending.generation == generation) signage_drm_broker_video_cancelled(video->pending.fb, video->pending.serial);
-            video->pending.cancelled = TRUE;
+        if (incoming) {
+            if (video->standby.fb || video->gate.phase != SIGNAGE_STANDBY_PREPARING) {
+                signage_drm_broker_video_disconnect_generation(generation); return;
+            }
+            remember_video(video, &state); video->standby=state;
+            standby_progress(browser); return; /* NEVER queue standby on the active FIFO */
         }
-        while (!g_queue_is_empty(&video->waiting)) {
-            VideoState *discard = g_queue_pop_head(&video->waiting);
-            uint32_t fb = discard->fb;
-            if (message && discard->generation == generation) signage_drm_broker_video_cancelled(fb, discard->serial);
-            g_free(discard);
-            video_release_if_unused(browser, fb);
+        if ((video->pending_valid && video->pending.fb && !video->pending.cancelled ? 1u:0u) +
+            (video->dirty && video->next.fb ? 1u:0u) + video->waiting.length >= 2) {
+            signage_drm_broker_video_disconnect_generation(generation); return;
         }
+        video->endpoint=(VideoState){0}; video->endpoint_interval=0;
+        video->gate.endpoint_presented=FALSE;
+        remember_video(video, &state);
+        if (video->dirty) { VideoState *queued=g_new(VideoState,1); *queued=state; g_queue_push_tail(&video->waiting,queued); }
+        else { video->next=state; video->dirty=TRUE; }
+        submit_commit(browser); return;
     }
-    if (state.fb && ((video->pending_valid && video->pending.fb && !video->pending.cancelled ? 1u : 0u) +
-                    (video->dirty && video->next.fb ? 1u : 0u) + video->waiting.length >= 2)) {
-        signage_drm_broker_video_disconnect();
-        return;
+    if (message->type == SIGNAGE_VIDEO_DISCONNECTED) browser->dead_generation = generation;
+    /* Only this generation's HIDE/EOF terminalizes its presentation credits. */
+    if (video->pending_valid && video->pending.generation == generation && video->pending.fb && !video->pending.cancelled) {
+        signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, video->pending.fb, video->pending.serial);
+        video->pending.cancelled=TRUE;
     }
-    if (state.fb) g_hash_table_insert(video->serials, GUINT_TO_POINTER(state.fb), GUINT_TO_POINTER(message->serial));
-    if (state.fb && video->dirty) {
-        VideoState *queued = g_new(VideoState, 1);
-        *queued = state;
-        g_queue_push_tail(&video->waiting, queued);
-        submit_commit(browser);
-        return;
+    while (!g_queue_is_empty(&video->waiting)) {
+        VideoState *discard=g_queue_pop_head(&video->waiting); uint32_t fb=discard->fb;
+        signage_drm_broker_video_ack(discard->generation,SIGNAGE_VIDEO_CANCELLED,fb,discard->serial);
+        g_free(discard); video_release_if_unused(browser,fb);
     }
-    const VideoState *latest = video->dirty ? &video->next : video->pending_valid ? &video->pending : &video->current;
-    if (!state.fb && !latest->fb) return; /* timestamps are diagnostic, not state equality */
-    uint32_t replaced = video->dirty ? video->next.fb : 0;
-    if (replaced && message && video->next.generation == generation) signage_drm_broker_video_cancelled(replaced, video->next.serial);
-    video->next = state;
-    video->dirty = TRUE;
-    if (replaced && replaced != state.fb) {
-        video->replaced++;
-        video_release_if_unused(browser, replaced);
-    }
+    uint32_t replaced=video->dirty ? video->next.fb : 0;
+    if (replaced) signage_drm_broker_video_ack(video->next.generation,SIGNAGE_VIDEO_CANCELLED,replaced,video->next.serial);
+    video->next=(VideoState){.generation=generation}; video->dirty=TRUE;
+    video_release_if_unused(browser,replaced);
     submit_commit(browser);
 }
 
@@ -951,7 +1019,7 @@ static void setup_video_plane(Browser *browser)
         }
     }
     video->plane = plane;
-    video->serials = g_hash_table_new(g_direct_hash, g_direct_equal);
+    video->serials = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
     g_message("Video plane %u is committed by the browser together with the UI (one atomic commit per vblank)", plane);
     browser->stats_source = g_timeout_add_seconds(1, (GSourceFunc)report_stats_tick, browser);
 }
@@ -1432,11 +1500,19 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
     ScanoutBuffer *target = NULL;
     for (unsigned i = 0; i < SCANOUT_POOL_SIZE && !target; i++) {
         ScanoutBuffer *buffer = &copy->pool[i];
-        if (!frame_uses(browser->current, buffer) && !frame_uses(browser->pending, buffer) && !frame_uses(browser->queued, buffer))
-            target = buffer;
+        Browser *root=browser->root;
+        if (!frame_uses(browser->current, buffer) && !frame_uses(browser->pending, buffer) && !frame_uses(browser->queued, buffer) &&
+            (!root || !frame_uses(root->queued,buffer))) target = buffer;
     }
     /* All buffers busy: the queued frame was never submitted, so overwrite it. */
     if (!target && browser->queued && browser->queued->scanout) target = browser->queued->scanout;
+    if (!target && browser->root) {
+        Browser *root=browser->root;
+        if (root->queued && root->queued->owner==browser && root->queued->scanout) {
+            target=root->queued->scanout;
+            release_frame(root,root->queued); root->queued=NULL;
+        }
+    }
     char *error = NULL;
     SavedContext saved;
     int fence_fd = -1;
@@ -1522,6 +1598,11 @@ static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dma
 {
     Browser *browser = data;
     Frame *frame = NULL;
+    if (browser->root) {
+        Browser *root = browser->root;
+        browser->current = root->current && root->current->owner == browser ? root->current : NULL;
+        browser->pending = root->pending && root->pending->owner == browser ? root->pending : NULL;
+    }
     if (!browser->copy_mode) {
         char *reason = NULL;
         frame = import_direct(browser, resource, &reason);
@@ -1543,6 +1624,28 @@ static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dma
         }
     }
     if (!frame && !(frame = copy_frame(browser, resource))) return;
+    frame->owner = browser;
+    if (browser->root) {
+        Browser *root = browser->root;
+        if (root->video.gate.phase==SIGNAGE_STANDBY_COMMITTING && root->visible_view==browser) {
+            release_frame(browser,frame);
+        } else if (root->visible_view == browser) {
+            if (root->queued) release_frame(root, root->queued);
+            root->queued = frame; browser->queued = NULL;
+            submit_commit(root);
+        } else if (root->staged_view==browser) {
+            if (browser->queued) release_frame(browser, browser->queued);
+            browser->queued = frame;
+            standby_progress(root);
+        } else release_frame(browser,frame); /* cancelled/retiring view cannot retake scanout */
+        wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+        return;
+    }
+    if (browser->orchestrator_hidden || browser->video.gate.phase == SIGNAGE_STANDBY_COMMITTING) {
+        release_frame(browser, frame);
+        wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+        return;
+    }
     if (browser->queued) {
         browser->stats.replaced++;
         release_frame(browser, browser->queued);
@@ -1667,10 +1770,12 @@ static void configure_sandbox(void)
     g_string_free(nodes, TRUE);
 }
 
+#include "standby-renderer.h"
+
 static gboolean initialize_webkit(Browser *browser)
 {
     const char *render_device = g_getenv("SIGNAGE_RENDER_DEVICE");
-    if (render_device && *render_device) {
+    if (!browser->root && render_device && *render_device) {
         browser->render_fd = open(render_device, O_RDWR | O_CLOEXEC);
         if (browser->render_fd < 0) {
             fail(browser, "Cannot open SIGNAGE_RENDER_DEVICE; check the GPU render-node path and access");
@@ -1678,9 +1783,11 @@ static gboolean initialize_webkit(Browser *browser)
         }
         g_message("Using GPU render device %s separately from KMS display %s", render_device, browser->device);
     }
-    browser->gbm = gbm_create_device(browser->render_fd >= 0 ? browser->render_fd : browser->fd);
+    if (browser->root) {
+        Browser *root = browser->root; browser->gbm = root->gbm; browser->egl = root->egl;
+    } else browser->gbm = gbm_create_device(browser->render_fd >= 0 ? browser->render_fd : browser->fd);
     if (!browser->gbm) { fail(browser, "Cannot create a GBM device for the selected DRM display"); return FALSE; }
-    browser->egl = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, browser->gbm, NULL);
+    if (!browser->root) browser->egl = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, browser->gbm, NULL);
     EGLint major, minor;
     if (browser->egl == EGL_NO_DISPLAY || !eglInitialize(browser->egl, &major, &minor)) {
         fail(browser, "Cannot initialize GBM EGL; check Mesa Panfrost/kmsro and render-node access");
@@ -1702,10 +1809,11 @@ static gboolean initialize_webkit(Browser *browser)
     browser->exportable = wpe_view_backend_exportable_fdo_create(&client, browser, browser->view_width, browser->view_height);
     if (!browser->exportable) { fail(browser, "Cannot create the WPE exportable backend"); return FALSE; }
     browser->backend = wpe_view_backend_exportable_fdo_get_view_backend(browser->exportable);
-    configure_sandbox();
+    if (!browser->root) configure_sandbox();
     WebKitWebViewBackend *backend = webkit_web_view_backend_new(browser->backend, NULL, NULL);
     browser->view = webkit_web_view_new(backend);
     if (!browser->view) { fail(browser, "Cannot create the WebKit web view"); return FALSE; }
+    configure_native_bridge(browser);
     /* Dispatch after WebKit installs its backend client, before navigation. */
     wpe_view_backend_dispatch_set_device_scale_factor(browser->backend, browser->ui_scale);
     WebKitColor background = { 0, 0, 0, 0 };
@@ -1728,13 +1836,14 @@ static gboolean initialize_webkit(Browser *browser)
     wpe_view_backend_add_activity_state(browser->backend, wpe_view_activity_state_visible | wpe_view_activity_state_focused | wpe_view_activity_state_in_window);
     wpe_view_backend_set_target_refresh_rate(browser->backend, mode_refresh(&browser->mode) * 1000);
     /* libwpe pointer/axis positions are physical; WebKit divides by device scale. */
-    browser->input = signage_input_start(browser->backend, browser->ui_width, browser->ui_height);
+    if (!browser->root) browser->input = signage_input_start(browser->backend, browser->ui_width, browser->ui_height);
     webkit_web_view_load_uri(browser->view, browser->uri);
     return TRUE;
 }
 
 static void cleanup(Browser *browser)
 {
+    if (browser->stage_tick) g_source_remove(browser->stage_tick);
     if (browser->fd_source) g_source_remove(browser->fd_source);
     if (browser->watchdog_source) g_source_remove(browser->watchdog_source);
     if (browser->stats_source) g_source_remove(browser->stats_source);
@@ -1794,6 +1903,9 @@ static void cleanup(Browser *browser)
         for (GList *item = retired; item; item = item->next) release_frame(browser, item->data);
         g_list_free(retired);
     }
+    destroy_stage_view(browser->staged_view); browser->staged_view=NULL;
+    destroy_stage_view(browser->retiring_view); browser->retiring_view=NULL;
+    destroy_stage_view(browser->visible_view); browser->visible_view=NULL;
     /* Before the exportable: its buffers' destroy listeners point into the copy cache. */
     destroy_copy(browser);
     if (browser->view) g_object_unref(browser->view);
@@ -1884,6 +1996,7 @@ int main(int argc, char **argv)
     browser.sigterm_source = g_unix_signal_add(SIGTERM, quit_signal, &browser);
     browser.sigint_source = g_unix_signal_add(SIGINT, quit_signal, &browser);
     write_status(&browser);
+    browser.stage_tick = g_timeout_add(1, standby_tick, &browser);
     if (initialize_webkit(&browser) && !browser.failure) g_main_loop_run(browser.loop);
     int result = browser.exit_code;
     cleanup(&browser);

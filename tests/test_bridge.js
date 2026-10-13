@@ -11,7 +11,7 @@ async function bridge(options={}) {
   class Media { play(){return Promise.resolve();} }
   const window={parent,__signage_stage:!!options.staged,setTimeout, setInterval, requestAnimationFrame:fn=>queueMicrotask(fn),addEventListener:(key,fn)=>{handlers[key]=fn;}};
   const document={fonts:{ready:fonts},images:[image],querySelector:()=>null,querySelectorAll:()=>options.media || [],body:{style:{}},getAnimations:()=>[]};
-  vm.runInNewContext(readFileSync('www/player/bridge.js','utf8'),{window,document,HTMLMediaElement:Media,Image:class {},setTimeout,clearTimeout,clearInterval,cancelAnimationFrame(){},location:{href:'http://test/content/page'},URL,Promise});
+  vm.runInNewContext(readFileSync('www/player/bridge.js','utf8'),{window,document,HTMLMediaElement:Media,Image:class {},setTimeout,clearTimeout,clearInterval,cancelAnimationFrame(){},location:{href:'http://test/content/page',search:''},URL,URLSearchParams,Promise});
   handlers.load();
   const settle=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
   await settle();

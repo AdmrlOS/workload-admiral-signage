@@ -39,10 +39,16 @@ enum {
     SIGNAGE_VIDEO_RELEASED = 3,
     SIGNAGE_VIDEO_PRESENTED = 4,
     SIGNAGE_VIDEO_CANCELLED = 5, /* terminal SHOW outcome, never retirement */
+    SIGNAGE_VIDEO_PREPARED = 6,
+    SIGNAGE_VIDEO_ACTIVATED = 7,
+    SIGNAGE_VIDEO_ENDPOINT = 8,
+    SIGNAGE_VIDEO_DISCONNECTED = 9,
 };
 
 typedef struct {
     uint32_t type;
+    uint64_t generation; /* connection identity; never inferred from active */
+    uint64_t interval_us; /* ENDPOINT: complete final frame display interval */
     uint32_t fb;
     /* SHOW: increments per message. RELEASED: the latest serial the browser had
      * for fb; the sink ignores it if it has since shown fb again. */
@@ -64,5 +70,12 @@ gboolean signage_drm_broker_video_handler_active(void);
 void signage_drm_broker_video_released(uint32_t fb, uint32_t serial);
 void signage_drm_broker_video_presented(uint32_t fb, uint32_t serial);
 void signage_drm_broker_video_cancelled(uint32_t fb, uint32_t serial);
+void signage_drm_broker_video_ack(guint64 generation, uint32_t type, uint32_t fb, uint32_t serial);
+void signage_drm_broker_video_disconnect_generation(guint64 generation);
+void signage_drm_broker_video_retired(guint64 generation);
+gboolean signage_drm_broker_video_connected(guint64 generation);
+gboolean signage_drm_broker_video_tx_idle(guint64 generation);
+void signage_drm_broker_video_activate(guint64 generation);
+guint64 signage_drm_broker_video_reserve(void);
 guint64 signage_drm_broker_video_generation(void);
 void signage_drm_broker_video_disconnect(void);

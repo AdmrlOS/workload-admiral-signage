@@ -7,6 +7,10 @@
  * browser's brokered DRM descriptor and asks the browser to put them on the
  * overlay plane in its own atomic commits (see drm-broker.h). */
 GType admiral_plane_sink_get_type(void);
+void admiral_plane_sink_set_generation(GstElement *element, guint64 generation, gboolean standby);
+/* Diagnostic stages: 1 render, 2 SHOW, 3 PRESENTED, 4 decoder out,
+ * 5 sink input, 6 upstream QoS timestamp/jitter. Disabled by default. */
+void admiral_plane_sink_record(GstElement *sink, guint stage, guint64 pts, guint64 value);
 
 /* Borrowed: drm_fd and socket_fd stay owned by the caller and must outlive the
  * sink's PAUSED->READY transition. mode_* is the CRTC size used for clipping. */

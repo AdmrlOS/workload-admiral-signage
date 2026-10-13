@@ -9,7 +9,7 @@ class VideoPresentationTests(unittest.TestCase):
         sink = (ROOT/'native/gst-admiral-videoplane.c').read_text()
         self.assertIn('SIGNAGE_VIDEO_PRESENTED = 4', header)
         flip = browser[browser.index('static void frame_presented('):browser.index('static void video_message(')]
-        self.assertIn('signage_drm_broker_video_presented(video->current.fb, video->current.serial)', flip)
+        self.assertIn('signage_drm_broker_video_ack(video->current.generation, SIGNAGE_VIDEO_PRESENTED, video->current.fb, video->current.serial)', flip)
         self.assertIn('wait_presented(self)', sink)
         self.assertIn('GST_EVENT_EOS', sink)
         self.assertIn('base->event = admiral_plane_sink_event;', sink)

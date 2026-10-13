@@ -10,35 +10,43 @@ class ProtocolSafetyTests(unittest.TestCase):
         source = (ROOT/'browser/signage-browser.c').read_text()
         types = source[source.index('typedef struct {\n    uint32_t fb, serial;'):source.index('/* Per reporting interval;')]
         release = source[source.index('static void video_release_if_unused('):source.index('static gboolean submit_commit(')]
-        handler = source[source.index('static void video_message('):source.index('static void setup_video_plane(')]
+        handler = source[source.index('static void remember_video('):source.index('static void setup_video_plane(')]
         header = (ROOT/'native/drm-broker.h').read_text()
         protocol = header[header.index('enum {'):header.index('/* message is NULL')]
         harness = r'''
 #include <glib.h>
 #include <stdint.h>
 #include <assert.h>
-''' + protocol + types + r'''
-typedef struct { VideoPlane video; } Browser;
+''' + protocol + (ROOT/'native/standby-protocol.h').read_text().replace('#pragma once','') + types + r'''
+typedef struct { VideoPlane video; guint64 dead_generation, cancelled_generation; } Browser;
 static unsigned releases, cancellations, disconnects;
 static guint64 generation = 1;
 static guint64 signage_drm_broker_video_generation(void) { return generation; }
 static void signage_drm_broker_video_disconnect(void) { disconnects++; }
 static void signage_drm_broker_video_released(uint32_t fb, uint32_t serial) { (void)fb; (void)serial; releases++; }
 static void signage_drm_broker_video_cancelled(uint32_t fb, uint32_t serial) { (void)fb; (void)serial; cancellations++; }
+static void signage_drm_broker_video_ack(guint64 gen,uint32_t type,uint32_t fb,uint32_t serial) {
+ (void)gen; (void)fb; (void)serial; if(type==3) releases++; if(type==5) cancellations++;
+}
+static void signage_drm_broker_video_retired(guint64 gen) { (void)gen; }
+static void signage_drm_broker_video_disconnect_generation(guint64 gen) { (void)gen; disconnects++; }
+static void native_notice(Browser *b,const char *e,guint64 gen) { (void)b;(void)e;(void)gen; }
+static void standby_progress(Browser *b) { (void)b; }
 static gboolean submit_commit(Browser *b) { (void)b; return TRUE; }
 ''' + release + handler + r'''
 int main(void) {
- Browser b={0}; b.video.plane=1; b.video.serials=g_hash_table_new(g_direct_hash,g_direct_equal);
- b.video.current.fb=7;
- g_hash_table_insert(b.video.serials,GUINT_TO_POINTER(7),GUINT_TO_POINTER(1));
- SignageVideoMessage malformed={.type=SIGNAGE_VIDEO_SHOW,.fb=7,.serial=2};
+ Browser b={0}; b.video.plane=1; b.video.serials=g_hash_table_new_full(g_direct_hash,g_direct_equal,NULL,g_free);
+ b.video.current=(VideoState){.fb=7,.serial=1,.generation=1};
+ VideoState *identity=g_new0(VideoState,1); *identity=b.video.current;
+ g_hash_table_insert(b.video.serials,GUINT_TO_POINTER(7),identity);
+ SignageVideoMessage malformed={.type=SIGNAGE_VIDEO_SHOW,.generation=1,.fb=7,.serial=2};
  video_message(&malformed,&b);
  assert(releases==0); /* cancellation is NOT scanout retirement */
  assert(cancellations==1);
  b.video.current.fb=0; video_release_if_unused(&b,7); assert(releases==1);
- SignageVideoMessage show={.type=SIGNAGE_VIDEO_SHOW,.fb=8,.serial=3,.src_w=1,.src_h=1,.crtc_w=1,.crtc_h=1};
+ SignageVideoMessage show={.type=SIGNAGE_VIDEO_SHOW,.generation=1,.fb=8,.serial=3,.src_w=1,.src_h=1,.crtc_w=1,.crtc_h=1};
  video_message(&show,&b); assert(b.video.dirty);
- SignageVideoMessage hide={.type=SIGNAGE_VIDEO_HIDE};
+ SignageVideoMessage hide={.type=SIGNAGE_VIDEO_HIDE,.generation=1};
  video_message(&hide,&b); assert(cancellations==2); assert(releases==2); b.video.dirty=FALSE;
  show.serial=4; video_message(&show,&b);
  show.serial=5; video_message(&show,&b);
@@ -52,9 +60,19 @@ int main(void) {
  b.video.pending=(VideoState){.fb=8,.serial=1,.generation=1}; b.video.pending_valid=TRUE;
  unsigned before=cancellations; video_message(&hide,&b); assert(cancellations==before);
  b.video.pending_valid=FALSE; b.video.dirty=FALSE;
- show.serial=UINT32_MAX; video_message(&show,&b);
- show.serial=0; video_message(&show,&b); assert(disconnects==2);
+ show.generation=2; show.serial=UINT32_MAX; video_message(&show,&b);
+ show.serial=0; video_message(&show,&b); assert(disconnects==1);
  video_message(&hide,&b);
+ b.video.dirty=FALSE;
+ assert(signage_standby_prepare(&b.video.gate,2,3,2,200,100));
+ SignageVideoMessage incoming=show; incoming.generation=3; incoming.fb=9; incoming.serial=1;
+ VideoState old_current=b.video.current;
+ video_message(&incoming,&b);
+ assert(b.video.standby.fb==9 && !b.video.dirty && b.video.current.fb==old_current.fb);
+ SignageVideoMessage incoming_hide={.type=SIGNAGE_VIDEO_HIDE,.generation=3};
+ video_message(&incoming_hide,&b);
+ assert(b.video.standby.fb==0 && b.video.current.fb==old_current.fb);
+ assert(b.video.gate.phase==SIGNAGE_STANDBY_EMPTY);
  g_hash_table_unref(b.video.serials);
  return 0;
 }
@@ -96,7 +114,7 @@ int main(void) {
  int fd[2]; assert(socketpair(AF_UNIX,SOCK_STREAM,0,fd)==0);
  int size=1024; setsockopt(fd[0],SOL_SOCKET,SO_SNDBUF,&size,sizeof(size));
  GError *error=NULL; GSocket *socket=g_socket_new_from_fd(fd[0],&error); assert(socket);
- broker.client=g_socket_connection_factory_create_connection(socket); g_object_unref(socket);
+ broker.clients[0].client=g_socket_connection_factory_create_connection(socket); broker.clients[0].generation=broker.active=1; g_object_unref(socket);
  char fill[4096]={0}; while(send(fd[0],fill,sizeof(fill),MSG_DONTWAIT)>0) {}
  assert(errno==EAGAIN);
  constrain=TRUE;
@@ -110,11 +128,11 @@ int main(void) {
   g_usleep(1000);
  }
  assert(got==sizeof(msg)); assert(msg.type==SIGNAGE_VIDEO_PRESENTED && msg.fb==7 && msg.serial==1);
- assert(broker.client);
+ assert(broker.clients[0].client);
  constrain=FALSE;
  while(send(fd[0],fill,sizeof(fill),MSG_DONTWAIT)>0) {}
  for(unsigned i=2;i<200;i++) signage_drm_broker_video_presented(7,i);
- assert(!broker.client); assert(broker.outgoing.length==0); assert(!broker.write_source);
+ assert(!broker.clients[0].client); assert(broker.clients[0].outgoing.length==0); assert(!broker.clients[0].write_source);
  close(fd[1]); return 0;
 }
 '''
