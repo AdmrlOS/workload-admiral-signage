@@ -405,8 +405,9 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
         GST_ELEMENT_ERROR(self, RESOURCE, WRITE, ("Video identity exhausted; recreate pipeline"), (NULL));
         return GST_FLOW_ERROR;
     }
-    SignageVideoMessage message = { .type = SIGNAGE_VIDEO_SHOW, .fb = fb, .serial = ++self->serial };
+    SignageVideoMessage message = { .type = SIGNAGE_VIDEO_SHOW, .fb = fb, .serial = self->serial + 1 };
     if (!compute_geometry(self, buffer, &message)) {
+        g_message("Native geometry empty generation=%" G_GUINT64_FORMAT " rect=%d,%d,%d,%d mode=%d,%d",self->generation,self->render.x,self->render.y,self->render.w,self->render.h,self->mode_width,self->mode_height);
         /* Entirely off screen: hide, but keep the frame for when it returns. */
         if (!self->hidden) {
             SignageVideoMessage hide = { .type = SIGNAGE_VIDEO_HIDE };
@@ -415,6 +416,7 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
         }
         return GST_FLOW_OK;
     }
+    self->serial = message.serial;
     HeldFrame *held = g_hash_table_lookup(self->held, GUINT_TO_POINTER(fb));
     if (!held) {
         held = g_new0(HeldFrame, 1);
@@ -474,6 +476,20 @@ admiral_plane_sink_show_frame(GstVideoSink *video_sink, GstBuffer *buffer)
     return result;
 }
 
+/* GstVideoSink's default preroll may be suppressed by WebKit's show-preroll
+ * policy. Standby preparation is an explicit retained DMA-BUF submission,
+ * not a visible render; route it independently of that presentation policy. */
+static GstFlowReturn admiral_plane_sink_preroll(GstBaseSink *base, GstBuffer *buffer)
+{
+    AdmiralPlaneSink *self = (AdmiralPlaneSink *)base;
+    g_mutex_lock(&self->lock);
+    gboolean standby = self->standby;
+    g_mutex_unlock(&self->lock);
+    g_message("Native preroll generation=%" G_GUINT64_FORMAT " standby=%d pts=%" G_GUINT64_FORMAT,self->generation,standby,GST_BUFFER_PTS(buffer));
+    if (standby) return admiral_plane_sink_show_frame(GST_VIDEO_SINK(base), buffer);
+    return GST_BASE_SINK_CLASS(admiral_plane_sink_parent_class)->preroll(base, buffer);
+}
+
 static GstFlowReturn wait_presented(AdmiralPlaneSink *self)
 {
     GstFlowReturn result = wait_credit(self, 0);
@@ -491,10 +507,10 @@ static GstFlowReturn wait_presented(AdmiralPlaneSink *self)
 /* Caller holds lock; only EOS/stop performs I/O, not presentation callbacks. */
 static void dump_ledger(AdmiralPlaneSink *self)
 {
-    if (!self->ledger) return;
+    if (!self->ledger || !self->ledger->total) return;
     g_mutex_lock(&self->ledger_lock);
     const gchar *dir = g_getenv("SIGNAGE_VIDEO_LEDGER_DIR");
-    gchar *path = g_strdup_printf("%s/plane-%ld-%p-%u.csv", dir ? dir : "/run", (long)getpid(), (void *)self, self->serial);
+    gchar *path = g_strdup_printf("%s/plane-%ld-%p-g%" G_GUINT64_FORMAT "-%u.csv", dir ? dir : "/run", (long)getpid(), (void *)self, self->generation, self->serial);
     FILE *stream = fopen(path, "w");
     if (stream) {
         fprintf(stream, "# generation=%" G_GUINT64_FORMAT " total=%" G_GUINT64_FORMAT " capacity=%u\nmono_us,pts,value,stage,serial,fb\n", self->generation, self->ledger->total, VIDEO_LEDGER_CAPACITY);
@@ -686,7 +702,29 @@ admiral_plane_sink_propose_allocation(GstBaseSink *base, GstQuery *query)
     GstVideoInfo info;
     gsize size = 0;
     if (caps && !gst_video_is_dma_drm_caps(caps) && gst_video_info_from_caps(&info, caps)) size = GST_VIDEO_INFO_SIZE(&info);
-    gst_query_add_allocation_pool(query, NULL, (guint)size, MIN_POOL_BUFFERS, 0);
+    guint min_buffers = MIN_POOL_BUFFERS;
+    if (size && caps) {
+        /* Decoder lead is bounded by its capture pool, not by the queue: at 24 fps
+         * four buffers are only ~170 ms, so a ~250-400 ms decoder hiccup starves
+         * the sink and cascades into sink/decoder QoS drops. Ask for ~SIGNAGE_
+         * DECODE_LEAD_MS of frames (default 700), capped by SIGNAGE_DECODE_LEAD_MB
+         * (default 48 MB) so 4K keeps the old four-buffer pool. */
+        guint64 lead_ms = 700, cap_mb = 48;
+        const gchar *e = g_getenv("SIGNAGE_DECODE_LEAD_MS");
+        if (e && *e) lead_ms = g_ascii_strtoull(e, NULL, 10);
+        e = g_getenv("SIGNAGE_DECODE_LEAD_MB");
+        if (e && *e) cap_mb = g_ascii_strtoull(e, NULL, 10);
+        const GstStructure *s = gst_caps_get_structure(caps, 0);
+        gint fn = 0, fd = 1;
+        if (lead_ms && s && gst_structure_get_fraction(s, "framerate", &fn, &fd) && fn > 0 && fd > 0) {
+            guint64 want = (lead_ms * (guint64)fn + 1000ULL * fd - 1) / (1000ULL * fd);
+            guint64 cap = (cap_mb * 1000 * 1000) / size;
+            if (want > cap) want = cap;
+            if (want > 24) want = 24;
+            if (want > min_buffers) min_buffers = (guint)want;
+        }
+    }
+    gst_query_add_allocation_pool(query, NULL, (guint)size, min_buffers, 0);
     gst_query_add_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL);
     gst_query_add_allocation_meta(query, GST_VIDEO_CROP_META_API_TYPE, NULL);
     return TRUE;
@@ -854,6 +892,7 @@ admiral_plane_sink_class_init(AdmiralPlaneSinkClass *klass)
     gst_element_class_add_static_pad_template(element, &sink_template);
     element->query = admiral_plane_sink_query;
     GstBaseSinkClass *base = GST_BASE_SINK_CLASS(klass);
+    base->preroll = admiral_plane_sink_preroll;
     base->set_caps = admiral_plane_sink_set_caps;
     base->propose_allocation = admiral_plane_sink_propose_allocation;
     base->start = admiral_plane_sink_start;

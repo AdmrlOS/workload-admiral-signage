@@ -37,7 +37,7 @@ svg{display:block}
 .pr b{display:block;font-size:27px;line-height:1.05;color:var(--ink)}
 .pr.fl{background:var(--yellow);border-color:#d99f00;width:86px}
 .pr.fl small{color:#5a4400}
-.pr::after,.banner::after{content:"";position:absolute;top:-10%;left:0;width:46%;height:120%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.75),transparent);transform:translateX(-160%) skewX(-18deg);animation:sheen 6s ease-in-out infinite;animation-delay:var(--d,0s)}
+.pr::after,.banner::after{content:"";position:absolute;top:-10%;left:0;width:46%;height:120%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.75),transparent);transform:translateX(-160%) skewX(-18deg);will-change:transform;animation:sheen 6s ease-in-out infinite;animation-delay:var(--d,0s)}
 @keyframes sheen{0%,70%{transform:translateX(-160%) skewX(-18deg)}100%{transform:translateX(330%) skewX(-18deg)}}
 .legend{position:absolute;right:30px;top:0}
 
@@ -106,7 +106,7 @@ svg{display:block}
 .deal .pbadge small{font-size:15px;letter-spacing:2px}
 .deal .pbadge b{font-size:50px;line-height:1}
 .deal .pbadge b sup{font-size:.45em;vertical-align:top}
-.deal .pbadge::after{content:"";position:absolute;top:-10%;left:0;width:40%;height:120%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.55),transparent);transform:translateX(-160%) skewX(-18deg);animation:sheen 6s ease-in-out infinite;animation-delay:var(--d,0s)}
+.deal .pbadge::after{content:"";position:absolute;top:-10%;left:0;width:40%;height:120%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.55),transparent);transform:translateX(-160%) skewX(-18deg);will-change:transform;animation:sheen 6s ease-in-out infinite;animation-delay:var(--d,0s)}
 .bkfst{position:absolute;left:30px;top:566px;width:1210px;display:grid;grid-template-columns:595px 595px;gap:12px 20px}
 .item{height:138px;border-radius:14px;background:var(--cream);border-left:10px solid var(--yellow);display:flex;align-items:center;padding-right:16px;box-shadow:0 4px 0 rgba(0,0,0,.28)}
 .item .ico{flex:none;width:150px;height:110px;display:flex;align-items:center;justify-content:center}
@@ -137,7 +137,7 @@ svg{display:block}
 @keyframes blink{50%{opacity:.15}}
 .vside{position:absolute;left:1270px;top:720px;width:10px;height:360px;background:var(--yellow)}
 .corner{position:absolute;left:1280px;top:720px;width:640px;height:360px;background:#000;overflow:hidden}
-.poster{position:absolute;left:0;top:0;width:640px;height:360px;opacity:0;transition:opacity .6s ease;background:radial-gradient(circle at 50% 60%,#00a81c,var(--green-d));overflow:hidden}
+.poster{will-change:opacity;position:absolute;left:0;top:0;width:640px;height:360px;opacity:0;transition:opacity .6s ease;background:radial-gradient(circle at 50% 60%,#00a81c,var(--green-d));overflow:hidden}
 .poster.show{opacity:1}
 .poster .art{position:absolute;left:70px;top:70px;width:500px;height:250px}
 .poster .ph{position:absolute;left:0;top:18px;width:100%;text-align:center;font-size:38px;letter-spacing:5px;color:var(--yellow);text-transform:uppercase}

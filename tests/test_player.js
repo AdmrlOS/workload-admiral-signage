@@ -14,7 +14,9 @@ async function harness(entries, options={}) {
     appendChild(node) { node.isConnected=true; this.children.push(node); events.push('append:'+node.tagName); }
     remove() { this.isConnected=false; events.push('remove:'+this.tagName); }
     removeAttribute(key) { if(key==='src') { this._src=''; events.push('release:'+this.tagName); } }
-    load() {}
+    addEventListener(type,fn) { (this.listeners??={})[type]=fn; }
+    removeEventListener(type) { delete this.listeners?.[type]; }
+    load() { if(options.preflight && this.src) queueMicrotask(()=>this.listeners?.loadeddata?.()); }
     pause() {}
     set src(value) { this._src=value; if(this.tagName==='IMG') queueMicrotask(() => this.onload?.()); if(this.tagName==='IFRAME' && !options.manualHtml) queueMicrotask(() => (listeners.message||[]).forEach((fn) => fn({source:this.contentWindow,data:{type:'signage-ready'}}))); }
     get src() { return this._src; }
@@ -36,16 +38,43 @@ async function harness(entries, options={}) {
   }
   const stage=new Element('div'), body=new Element('body'), head=new Element('head'), status=new Element('div');
   const window={parent:{postMessage(){}},addEventListener:(type,fn) => (listeners[type]??=[]).push(fn),removeEventListener:(type,fn) => { listeners[type]=(listeners[type]||[]).filter((f)=>f!==fn); }};
-    if(options.native) window.signageNative={send:message=>events.push(message)};
-    const context={console:{...console,log:(...a)=>{logs.push(a.map(String).join(' '));console.log(...a);}}, URL,URLSearchParams,Promise,Date,Map,Image:class extends Element { constructor(){super('img');} },
+    if(options.native) window.signageNative={preflight:!!options.preflight,send:message=>events.push(message)};
+    let fakeNow=1_700_000_000_000; class FakeDate extends Date { constructor(...a){ super(...(a.length?a:[fakeNow])); } static now(){ return fakeNow; } }
+    const context={console:{...console,log:(...a)=>{logs.push(a.map(String).join(' '));console.log(...a);}}, URL,URLSearchParams,Promise,Date:FakeDate,Map,Image:class extends Element { constructor(){super('img');} },
     window,document:{body,head,createElement:(tag)=>new Element(tag),getElementById:(id)=>id==='stage'?stage:status,addEventListener(){}},
     location:{origin:'http://signage.test',href:'http://127.0.0.1:8080/player/',search:options.search||''},setTimeout:timeout,clearTimeout:(id)=>timers.delete(id),requestAnimationFrame:(fn)=>queueMicrotask(fn),
     fetch:async(url)=>{ if(options.networkFailure?.() && url==='/api/playlist') throw new Error('offline'); return {ok:true,json:async()=>({entries,revision,now:Date.now()/1000,next_change:null})}; }};
   vm.runInNewContext(readFileSync('www/player/player.js','utf8'),context);
   const settle=async()=>{ for(let i=0;i<80;i++) await Promise.resolve(); };
   await settle();
-  return {events,nodes,timers,logs,settle,native:data=>{(listeners['signage-native']||[]).forEach(fn=>fn({detail:data}));},message:(node,type)=>{(listeners.message||[]).forEach(fn=>fn({source:node.contentWindow,data:{type}}));},hide:()=>{(listeners.pagehide||[]).forEach(fn=>fn());},setPlaylist:(next)=>{entries=next;revision++;},run:async(ms)=>{ const pair=Array.from(timers).find(([,t])=>t.ms===ms); assert.ok(pair,`Missing timer ${ms}`); timers.delete(pair[0]); for (const n of nodes) if (n._playing && options.advance !== false) n._t += ms/1000; pair[1].fn(); await settle(); }};
+  return {events,nodes,timers,logs,settle,native:data=>{(listeners['signage-native']||[]).forEach(fn=>fn({detail:data}));},message:(node,type)=>{(listeners.message||[]).forEach(fn=>fn({source:node.contentWindow,data:{type}}));},hide:()=>{(listeners.pagehide||[]).forEach(fn=>fn());},setPlaylist:(next)=>{entries=next;revision++;},run:async(ms)=>{ const pair=Array.from(timers).find(([,t])=>t.ms===ms); assert.ok(pair,`Missing timer ${ms}`); timers.delete(pair[0]); fakeNow+=ms; for (const n of nodes) if (n._playing && options.advance !== false) n._t += ms/1000; pair[1].fn(); await settle(); }};
 }
+test('native startup prepares next context before first media clock starts',async()=>{
+ const h=await harness([entry('a','video'),entry('b','video')],{native:true,preflight:true});
+ const reservation=h.events.find(e=>e.type==='native-stage'); assert.ok(reservation,'next context must initialize before timed playback');
+ assert.equal(h.events.some(e=>typeof e==='string' && e.startsWith('play:')),false);
+ h.native({event:'prepared',request:reservation.request,generation:'2'}); await h.settle();
+ assert.ok(h.events.includes('play:/a'));
+});
+
+test('media clock is declared running only after the pool and next native page are prepared',async()=>{
+ const h=await harness([entry('a','video'),entry('b','video')],{native:true,preflight:true});
+ const reservation=h.events.find(e=>e.type==='native-stage');
+ assert.equal(h.events.some(e=>e.type==='native-playback'),false);
+ h.native({event:'prepared',request:reservation.request,generation:'2'}); await h.settle();
+ const order=h.events.map(e=>e.type==='native-playback' ? 'guard:'+e.running : e);
+ assert.ok(order.indexOf('guard:true')>=0 && order.indexOf('guard:true')<order.indexOf('play:/a'));
+});
+
+test('startup playlist polls preserve the pending preparation barrier',async()=>{
+ const h=await harness([entry('a','video'),entry('b','video')],{native:true,preflight:true});
+ const reservation=h.events.find(e=>e.type==='native-stage');
+ await h.run(2000);
+ assert.equal(h.events.some(e=>e.type==='native-cancel'),false);
+ h.native({event:'prepared',request:reservation.request,generation:'2'});await h.settle();
+ assert.ok(h.events.includes('play:/a'));
+});
+
 test('native two-client handoff never creates an incoming DOM sink or releases old before matching flip',async()=>{
  const h=await harness([entry('a','video'),entry('b','video')],{native:true});
  const reservation=h.events.find(e=>e.type==='native-stage'); assert.ok(reservation);

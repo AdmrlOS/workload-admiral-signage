@@ -29,7 +29,9 @@ static int drmModeAtomicCommit(int fd,drmModeAtomicReq *r,uint32_t flags,void *d
 #define ADD(o,p,v) do { if(drmModeAtomicAddProperty(request,o,p,v)<0) valid=FALSE; } while(0)
 static gboolean add_ui_state(Browser *b,drmModeAtomicReq *r,Frame *f){(void)b;assert(f->ready);r->properties++;return TRUE;}
 static gboolean frame_ready(Frame *f){return f->ready;}
+static void recycle_stage_view(Browser *b,Browser *v){(void)b;(void)v;}
 static void destroy_stage_view(Browser *b){(void)b;}
+static void retain_or_destroy_staged(Browser *b,Browser *v){(void)b;(void)v;}
 static void release_frame(Browser *b,Frame *f){(void)b;(void)f;}
 static gboolean signage_drm_broker_video_tx_idle(guint64 g){(void)g;return TRUE;}
 static gboolean signage_drm_broker_video_connected(guint64 g){(void)g;return TRUE;}

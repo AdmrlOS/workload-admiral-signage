@@ -187,6 +187,26 @@
       <div class="vframe"><i></i>Now showing</div><div class="vside"></div>
       <div class="corner" id="cornerHost"><div class="poster" id="poster"><div class="ph">Fresh today</div><div class="art">${sub(['lettuce', 'tomato', 'cheese', 'turkey', 'ranch'])}</div><div class="pf">Made your way at SUBSTATION</div></div></div>`;
   }
+  async function preparePosterBitmap() {
+    const poster=$('#poster');
+    if (!poster || poster.dataset.bitmap) return;
+    const defs=document.querySelector('svg defs').innerHTML;
+    // Rasterize the existing static artwork at its native 2x display size.
+    // No rAF/opacity warmup is treated as GPU readiness; decode finishes before
+    // ui-ready, while the broker still separately validates the real UI export.
+    const artwork=sub(['lettuce','tomato','cheese','turkey','ranch']);
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 640 360"><defs>${defs}<radialGradient id="poster-bg" cx="50%" cy="60%" r="65%"><stop stop-color="#00a81c"/><stop offset="1" stop-color="#005f0e"/></radialGradient></defs><rect width="640" height="360" fill="url(#poster-bg)"/><g transform="translate(70 70)">${artwork.replace('<svg ', '<svg width="500" height="250" ')}</g><g fill="#FFC20D" font-family="DejaVu Sans Condensed,sans-serif" text-anchor="middle"><text x="320" y="52" font-size="38" letter-spacing="5">Fresh today</text><text x="320" y="337" fill="white" font-size="23" letter-spacing="3">Made your way at SUBSTATION</text></g></svg>`;
+    const url=URL.createObjectURL(new Blob([svg],{type:'image/svg+xml'}));
+    try {
+      const vector=new Image();vector.src=url;await vector.decode();
+      const canvas=document.createElement('canvas');canvas.width=1280;canvas.height=720;
+      canvas.getContext('2d').drawImage(vector,0,0);
+      const image=new Image();image.src=canvas.toDataURL('image/png');
+      await image.decode(); image.style.cssText='width:100%;height:100%';
+      poster.replaceChildren(image);poster.dataset.bitmap='1';
+    } finally { URL.revokeObjectURL(url); }
+  }
+
   function buildMarks() {
     $('#bugMark').innerHTML = wordmark(false);
     $('#curtainMark').innerHTML = wordmark(true);
@@ -230,13 +250,21 @@
   function loadVideo(v, src) {
     return new Promise((resolve) => {
       let done = false;
-      const fin = (ok, why) => { if (done) return; done = true; clearTimeout(tm); v.removeEventListener('canplay', onc); v.removeEventListener('error', one); resolve({ ok, why }); };
-      const onc = () => fin(true, 'canplay');
+      const native = Q.has('native_stage');
+      // Metadata permits layout only. The native gate independently requires
+      // the PAUSED DMA-BUF, UI export fence and real atomic TEST_ONLY.
+      const readyEvent = native ? 'loadedmetadata' : 'canplay';
+      const fin = (ok, why) => { if (done) return; done = true; clearTimeout(tm); v.removeEventListener(readyEvent, onc); v.removeEventListener('error', one); resolve({ ok, why }); };
+      const onc = () => fin(true, readyEvent);
       const one = () => fin(false, 'error');
-      const tm = setTimeout(() => fin(!Q.has('native_stage'), 'timeout'), CFG.canplayTimeout);
-      v.addEventListener('canplay', onc); v.addEventListener('error', one);
+      const tm = setTimeout(() => fin(!native, 'timeout'), native ? 15000 : CFG.canplayTimeout);
+      v.addEventListener(readyEvent, onc); v.addEventListener('error', one);
       v.src = src;
       v.load();
+      // WPE holepunch may withhold DOM media readiness until presentation.
+      // This prepares artwork only; native PREPARED still requires a retained
+      // decoded first frame and TEST_ONLY, so no DOM event certifies scanout.
+      if (native) fin(true, 'native-ui-only');
     });
   }
   // Start playback; resolves 'playing' | 'error' | 'stall'.
@@ -300,7 +328,7 @@
          No looping => no black flash/decoder restart on the plane, and no opacity on the <video>. */
       async play({ v, poster, failed }, stop) {
         const total = sleep(CFG.cdur);
-        const showPoster = async () => { poster.classList.add('show'); await sleep(700); killVideo(); log('poster-shown'); };
+        const showPoster = async () => { poster.classList.add('show'); await sleep(700); if (!Q.has('native_stage')) killVideo(); log('poster-shown'); };
         const clip = (async () => {
           if (failed) { await showPoster(); return; }
           const ended = new Promise((res) => { v.onended = () => { log('video-ended', { pos: +v.currentTime.toFixed(2) }); res('ended'); }; v.onerror = () => res('error'); });
@@ -364,15 +392,22 @@
   buildA(); buildC(); buildMarks();
   const boot = async () => {
     if (Q.has('native_stage')) {
+      console.log('[native-menu] boot');
       const name=/^[BC]$/.test(only) ? only:'C';
       curtain.style.display='none'; show(name);
       const {ctx,stop,R}=await runScene(name);
-      if(ctx.failed || !ctx.v || ctx.v.readyState<2) {
+      if(ctx.failed || !ctx.v) {
         log('native-next-not-ready'); return;
       }
       if(document.fonts) await document.fonts.ready;
+      await preparePosterBitmap();
       await Promise.all(Array.from(document.images,image=>image.decode ? image.decode():Promise.resolve()));
-      window.addEventListener('signage-activated',()=>{ R.play(ctx,stop); },{once:true});
+      document.getAnimations().forEach(a=>a.pause());
+      window.addEventListener('signage-activated',()=>{
+        document.getAnimations().forEach(a=>a.play());
+        R.play(ctx,stop);
+      },{once:true});
+      console.log('[native-menu] ui-ready', !!window.signageNative);
       window.signageNative?.send({type:'ui-ready'});
       return;
     }

@@ -76,7 +76,8 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE("sink",
 static void
 write_status(AdmiralSink *self, gboolean force)
 {
-    gint64 now = g_get_monotonic_time();
+    gint64 status_started = g_get_monotonic_time();
+    gint64 now = status_started;
     if (!force && now - self->last_status < G_USEC_PER_SEC)
         return;
     self->last_status = now;
@@ -131,6 +132,8 @@ write_status(AdmiralSink *self, gboolean force)
             unlink(temp);
     }
     g_free(temp); g_free(data); json_node_free(node); g_object_unref(g); g_object_unref(b);
+    if (g_getenv("SIGNAGE_TRANSITION_TRACE") && g_get_monotonic_time()-status_started>10000)
+        g_message("Transition sink-status mono=%" G_GINT64_FORMAT " elapsed_us=%" G_GINT64_FORMAT " force=%d",status_started,g_get_monotonic_time()-status_started,force);
 #undef STRING_FIELD
 #undef INT_FIELD
 #undef BOOL_FIELD
@@ -181,6 +184,8 @@ get_drm_fd(AdmiralSink *self, gboolean keep_socket)
         }
         g_free(uri);
     }
+    g_message("Standby handshake: pipeline=%s requested=%" G_GUINT64_FORMAT,
+        self->pipeline ? G_OBJECT_TYPE_NAME(self->pipeline) : "none", requested);
     if (send(sock, &requested, sizeof(requested), MSG_NOSIGNAL) != sizeof(requested)) { close(sock); return FALSE; }
     gchar payload[4096] = {0};
     union { struct cmsghdr align; gchar bytes[CMSG_SPACE(sizeof(gint))]; } control;
@@ -492,6 +497,10 @@ create_kms_child(AdmiralSink *self, gboolean browser_commits)
 {
     self->kms = browser_commits ? g_object_new(admiral_plane_sink_get_type(), "name", "admiral-video-plane", NULL)
                                 : gst_element_factory_make("kmssink", "admiral-video-plane");
+    /* Preserve GstVideoOverlay ABI for WebKit's probe, but never let the
+     * unparented placeholder open/discover DRM. It cannot receive media;
+     * parented setup removes it and installs the configured real sink. */
+    if (self->kms && self->fd < 0) gst_element_set_locked_state(self->kms, TRUE);
     self->browser_commits = browser_commits && self->kms;
     if (!self->kms) return FALSE;
     self->filter = gst_element_factory_make("capsfilter", "admiral-video-caps");
@@ -499,8 +508,23 @@ create_kms_child(AdmiralSink *self, gboolean browser_commits)
     self->queue = gst_element_factory_make("queue", "admiral-video-delivery");
     if (!self->queue) return FALSE;
     /* Decode independently of KMS credit waits; bounded, never leaky. */
-    g_object_set(self->queue, "max-size-buffers", 4u, "max-size-bytes", 0u,
-                 "max-size-time", (guint64)0, "leaky", 0, NULL);
+    /* A fixed four-buffer queue is only ~170 ms at 24 fps: a ~220 ms decoder
+     * hiccup (seen while the next page's decoder opens) starves the sink, the
+     * late frames are dropped, and sink QoS then makes the decoder drop the
+     * following frames. Bound by time AND bytes instead: small/low-rate frames
+     * gain slack, while 4K frames (~12.4 MB NV12) still stop at four buffers. */
+    guint64 queue_ms = 600, queue_mb = 48;
+    const gchar *env_ms = g_getenv("SIGNAGE_DELIVERY_QUEUE_MS");
+    const gchar *env_mb = g_getenv("SIGNAGE_DELIVERY_QUEUE_MB");
+    if (env_ms && *env_ms) queue_ms = g_ascii_strtoull(env_ms, NULL, 10);
+    if (env_mb && *env_mb) queue_mb = g_ascii_strtoull(env_mb, NULL, 10);
+    if (queue_ms && queue_mb)
+        g_object_set(self->queue, "max-size-buffers", 0u,
+                     "max-size-bytes", (guint)(queue_mb * 1000 * 1000),
+                     "max-size-time", queue_ms * GST_MSECOND, "leaky", 0, NULL);
+    else
+        g_object_set(self->queue, "max-size-buffers", 4u, "max-size-bytes", 0u,
+                     "max-size-time", (guint64)0, "leaky", 0, NULL);
     gst_bin_add_many(GST_BIN(self), self->filter, self->queue, self->kms, NULL);
     if (!gst_element_link_many(self->filter, self->queue, self->kms, NULL)) return FALSE;
     GstPad *pad = gst_element_get_static_pad(self->kms, "sink");
@@ -537,16 +561,27 @@ admiral_sink_handle_message(GstBin *bin, GstMessage *message)
     GST_BIN_CLASS(admiral_sink_parent_class)->handle_message(bin, message);
 }
 
+static gboolean
+admiral_sink_needs_setup(GstStateChange transition, gboolean parented, gint fd)
+{
+    return parented && fd < 0 &&
+        (transition == GST_STATE_CHANGE_NULL_TO_READY ||
+         transition == GST_STATE_CHANGE_READY_TO_PAUSED);
+}
+
 static GstStateChangeReturn
 admiral_sink_change_state(GstElement *element, GstStateChange transition)
 {
     AdmiralSink *self = (AdmiralSink *)element;
     /* WebKit can initialize the sink before adding it to playbin. Retry once
      * parentage exists instead of permanently observing our own private bin. */
-    if (transition == GST_STATE_CHANGE_READY_TO_PAUSED ||
+    /* WebKit probes READY while the sink is unparented. Do not claim an
+     * ordinary active connection before the URI-bearing playbin exists. */
+    if (transition == GST_STATE_CHANGE_NULL_TO_READY ||
+        transition == GST_STATE_CHANGE_READY_TO_PAUSED ||
         transition == GST_STATE_CHANGE_PAUSED_TO_PLAYING)
         watch_pipeline(self);
-    if (transition == GST_STATE_CHANGE_NULL_TO_READY) {
+    if (admiral_sink_needs_setup(transition, self->pipeline != NULL, self->fd)) {
         /* WebKit may reuse this sink after a failed URL or playback attempt.
          * A stopped kmssink retains the driver name derived from its old fd,
          * so retire it before releasing the broker fd and start a fresh child.
@@ -663,7 +698,10 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
         g_mutex_unlock(&self->lock);
         watch_pipeline(self);
     }
+    gint64 state_started=g_get_monotonic_time();
     GstStateChangeReturn result = GST_ELEMENT_CLASS(admiral_sink_parent_class)->change_state(element, transition);
+    if (g_getenv("SIGNAGE_TRANSITION_TRACE"))
+        g_message("Transition sink-state mono=%" G_GINT64_FORMAT " elapsed_us=%" G_GINT64_FORMAT " transition=%d",state_started,g_get_monotonic_time()-state_started,transition);
     if (result == GST_STATE_CHANGE_FAILURE) {
         fail_sink(self, "kmssink state change failed; inspect GStreamer and DRM logs");
         release_resources(self); return result;
@@ -776,7 +814,8 @@ admiral_sink_init(AdmiralSink *self)
     self->state = g_strdup("created");
     GST_OBJECT_FLAG_SET(self, GST_ELEMENT_FLAG_SINK);
     self->broker_socket = -1;
-    /* A placeholder until NULL->READY knows which sink the broker supports. */
+    /* Unparented WebKit READY probe: no DRM opens, no broker claim and no
+     * decoded output. Replaced before parented preroll can receive buffers. */
     create_kms_child(self, FALSE);
 }
 

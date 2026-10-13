@@ -39,6 +39,14 @@ class ServerTests(unittest.TestCase):
         cls.thread.join()
         cls.temp.cleanup()
 
+    def test_native_builtin_ignores_persistent_seed_and_cache(self):
+        folder = server.APP_ROOT / 'www/menuboard'
+        folder.mkdir(exist_ok=True)
+        (folder / 'menuboard.js').write_text('new native lifecycle')
+        with urlopen(self.base + '/native-builtin/menuboard/menuboard.js') as response:
+            self.assertEqual(response.read(), b'new native lifecycle')
+            self.assertEqual(response.headers['Cache-Control'], 'no-store')
+
     def test_media_range_and_suffix(self):
         for header, body, content_range in (("bytes=2-4", b"234", "bytes 2-4/10"),
                 ("bytes=-3", b"789", "bytes 7-9/10"), ("bytes=8-", b"89", "bytes 8-9/10")):

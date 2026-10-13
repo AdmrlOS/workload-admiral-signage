@@ -25,6 +25,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sys/syscall.h>
 #include <wayland-server-core.h>
 #include <wpe/fdo.h>
 #include <wpe/fdo-egl.h>
@@ -36,6 +38,23 @@
 #include "input.h"
 #include "split-scanout.h"
 #include "../native/drm-broker.h"
+#include <execinfo.h>
+#include <dlfcn.h>
+
+/* In-playback WebKit guard. Once the player declares the media clock running
+ * ("native-playback"), WebView creation is a contract violation (the bounded
+ * pool is built before the clock starts) and every pooled load_uri is timed
+ * against a budget. SIGNAGE_PLAYBACK_WEBKIT=strict refuses creation (an
+ * explicit not-ready, the failed-ready policy) instead of blocking the loop. */
+typedef struct {
+    gboolean running, strict;
+    guint64 created_total, created_in_playback, refused_in_playback;
+    guint64 loads_total, loads_in_playback, loads_over_budget, cancel_recycled;
+    gint64 max_load_us;
+} PlaybackGuard;
+static PlaybackGuard playback_guard;
+static struct { guint64 deferred, revived, reimport_waits, evicted_aged; gint64 max_wait_us; } handle_stats;
+#define PLAYBACK_LOAD_BUDGET_US 4000
 #include "../native/standby-protocol.h"
 
 #define VERSION "0.1.0"
@@ -59,7 +78,22 @@ typedef struct {
     uint8_t n_planes;
     ScanoutBuffer *scanout; /* pool buffer (GPU copy); its fb is owned by the pool */
     int fence_fd;           /* GPU copy completion (IN_FENCE_FD), or -1 */
+    gint64 exported_us;     /* monotonic time WPE exported it (flip trace) */
 } Frame;
+
+/* Opt-in (SIGNAGE_FLIP_TRACE) bounded ring: export -> commit -> kernel vblank
+ * timestamp -> userspace receipt. Written with plain stores on the main loop;
+ * only anomalies are logged, so it does not perturb the flip path. */
+typedef struct { gint64 exported, submitted, commit_us; gboolean ui, video; } FlipTraceEntry;
+static FlipTraceEntry flip_trace_cur;
+static unsigned flip_trace_last_seq;
+static gint64 flip_trace_last_kernel_us;
+static int flip_trace_enabled = -1;
+static gboolean flip_trace_on(void)
+{
+    if (flip_trace_enabled < 0) flip_trace_enabled = g_getenv("SIGNAGE_FLIP_TRACE") != NULL;
+    return flip_trace_enabled;
+}
 
 /* A WPE buffer imported as a GLES texture, cached until WPE destroys the buffer. */
 typedef struct {
@@ -168,7 +202,8 @@ typedef struct {
     int exit_code;
     const char *uri;
     void *root; /* standby renderer: shared committer, never a DRM event consumer */
-    void *staged_view, *visible_view, *retiring_view;
+    void *staged_view, *visible_view, *retiring_view, *spare_view;
+    gint64 last_visible_export;
     gboolean stage_ui_ready, activation_requested, orchestrator_hidden;
     guint64 stage_request, stage_ui_generation, dead_generation, cancelled_generation;
     guint stage_tick;
@@ -206,6 +241,18 @@ static void write_status(Browser *browser)
     JSON_INT("video_presented_total", browser->video.shown);
     JSON_INT("video_replaced_total", browser->video.replaced);
     JSON_INT("video_rejected_total", browser->video.rejected);
+    JSON_BOOL("playback_running", playback_guard.running);
+    JSON_INT("webkit_created_total", playback_guard.created_total);
+    JSON_INT("webkit_created_in_playback", playback_guard.created_in_playback);
+    JSON_INT("webkit_refused_in_playback", playback_guard.refused_in_playback);
+    JSON_INT("webkit_loads_in_playback", playback_guard.loads_in_playback);
+    JSON_INT("webkit_loads_over_budget", playback_guard.loads_over_budget);
+    JSON_INT("webkit_max_load_us", playback_guard.max_load_us);
+    JSON_INT("webkit_cancel_recycled", playback_guard.cancel_recycled);
+    JSON_INT("gem_close_deferred", handle_stats.deferred);
+    JSON_INT("gem_handle_revived", handle_stats.revived);
+    JSON_INT("gem_reimport_waits", handle_stats.reimport_waits);
+    JSON_INT("gem_reimport_max_wait_us", handle_stats.max_wait_us);
     JSON_STRING("device", browser->device);
     JSON_STRING("uri", browser->uri);
     JSON_STRING("error", browser->failure);
@@ -492,8 +539,111 @@ static gboolean open_display(Browser *browser)
     return TRUE;
 }
 
+/* ---- GEM handle lifetime -------------------------------------------------
+ * The final GEM_CLOSE of an imported 4K dma-buf unmaps its IOMMU mapping
+ * synchronously (measured 57-240 ms in the main-thread kernel stack:
+ * drm_gem_dma_free -> dma_buf_unmap_attachment -> iommu_unmap_fast), which
+ * blocks DRM event dispatch while video plays.  Releasing a frame therefore no
+ * longer closes its handle: the import stays mapped in a bounded keep-alive set
+ * (WPE re-exports the same few buffers, and drmPrimeFDToHandle returns the same
+ * live handle), and handles that age out or overflow the bound are closed by a
+ * dedicated reaper thread.  A handle number queued for closing is never reused
+ * by the main thread until its ioctl has returned. */
+#define HANDLE_KEEPALIVE_MAX 12
+#define HANDLE_KEEPALIVE_US (10 * G_USEC_PER_SEC)
+
+typedef struct { uint32_t handle; gint64 since_us; } IdleHandle;
+static GQueue idle_handles = G_QUEUE_INIT;        /* main thread only; head = newest */
+static GHashTable *idle_set;                       /* handle -> IdleHandle*, main thread only */
+static GMutex reap_lock;
+static GCond reap_cond;
+static GQueue reap_queue = G_QUEUE_INIT;           /* handles awaiting GEM_CLOSE */
+static GHashTable *reap_closing;                   /* queued or in-ioctl handles */
+static int reap_fd = -1;
+static gboolean reap_started;
+
+static void *reap_thread(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        g_mutex_lock(&reap_lock);
+        while (g_queue_is_empty(&reap_queue)) g_cond_wait(&reap_cond, &reap_lock);
+        uint32_t handle = GPOINTER_TO_UINT(g_queue_pop_tail(&reap_queue));
+        g_mutex_unlock(&reap_lock);
+        struct drm_gem_close close_request = { .handle = handle };
+        drmIoctl(reap_fd, DRM_IOCTL_GEM_CLOSE, &close_request);
+        g_mutex_lock(&reap_lock);
+        g_hash_table_remove(reap_closing, GUINT_TO_POINTER(handle));
+        g_cond_broadcast(&reap_cond);
+        g_mutex_unlock(&reap_lock);
+    }
+    return NULL;
+}
+
+static void reap_enqueue(int fd, uint32_t handle)
+{
+    if (!reap_started) {
+        reap_fd = fd;
+        reap_closing = g_hash_table_new(g_direct_hash, g_direct_equal);
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, reap_thread, NULL) != 0) {
+            struct drm_gem_close close_request = { .handle = handle };
+            drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &close_request); /* no thread: close inline */
+            return;
+        }
+        pthread_detach(thread);
+        reap_started = TRUE;
+    }
+    g_mutex_lock(&reap_lock);
+    g_hash_table_add(reap_closing, GUINT_TO_POINTER(handle));
+    g_queue_push_head(&reap_queue, GUINT_TO_POINTER(handle));
+    g_cond_broadcast(&reap_cond);
+    g_mutex_unlock(&reap_lock);
+    handle_stats.deferred++;
+}
+
+/* Called after drmPrimeFDToHandle: returns TRUE when the handle was queued for
+ * closing and the caller must re-import after the close has finished. */
+static gboolean reap_blocks(uint32_t handle)
+{
+    if (!reap_started) return FALSE;
+    gint64 started = g_get_monotonic_time();
+    gboolean waited = FALSE;
+    g_mutex_lock(&reap_lock);
+    while (g_hash_table_contains(reap_closing, GUINT_TO_POINTER(handle))) { waited = TRUE; g_cond_wait(&reap_cond, &reap_lock); }
+    g_mutex_unlock(&reap_lock);
+    if (waited) {
+        gint64 elapsed = g_get_monotonic_time() - started;
+        handle_stats.reimport_waits++;
+        if (elapsed > handle_stats.max_wait_us) handle_stats.max_wait_us = elapsed;
+    }
+    return waited;
+}
+
+static void idle_remove(uint32_t handle)
+{
+    if (!idle_set) return;
+    IdleHandle *entry = g_hash_table_lookup(idle_set, GUINT_TO_POINTER(handle));
+    if (!entry) return;
+    g_queue_remove(&idle_handles, entry);
+    g_hash_table_remove(idle_set, GUINT_TO_POINTER(handle));
+    g_free(entry);
+    handle_stats.revived++;
+}
+
+static void idle_evict_oldest(Browser *browser, gboolean aged)
+{
+    IdleHandle *entry = g_queue_pop_tail(&idle_handles);
+    if (!entry) return;
+    g_hash_table_remove(idle_set, GUINT_TO_POINTER(entry->handle));
+    reap_enqueue(browser->fd, entry->handle);
+    if (aged) handle_stats.evicted_aged++;
+    g_free(entry);
+}
+
 static void handle_ref(Browser *browser, uint32_t handle)
 {
+    idle_remove(handle);
     guint count = GPOINTER_TO_UINT(g_hash_table_lookup(browser->handles, GUINT_TO_POINTER(handle)));
     g_hash_table_insert(browser->handles, GUINT_TO_POINTER(handle), GUINT_TO_POINTER(count + 1));
 }
@@ -504,9 +654,24 @@ static void handle_unref(Browser *browser, uint32_t handle)
     if (count > 1) g_hash_table_insert(browser->handles, GUINT_TO_POINTER(handle), GUINT_TO_POINTER(count - 1));
     else {
         g_hash_table_remove(browser->handles, GUINT_TO_POINTER(handle));
-        struct drm_gem_close close_request = { .handle = handle };
-        drmIoctl(browser->fd, DRM_IOCTL_GEM_CLOSE, &close_request);
+        if (!idle_set) idle_set = g_hash_table_new(g_direct_hash, g_direct_equal);
+        if (g_hash_table_contains(idle_set, GUINT_TO_POINTER(handle))) return;
+        IdleHandle *entry = g_new0(IdleHandle, 1);
+        entry->handle = handle; entry->since_us = g_get_monotonic_time();
+        g_queue_push_head(&idle_handles, entry);
+        g_hash_table_insert(idle_set, GUINT_TO_POINTER(handle), entry);
+        while (g_queue_get_length(&idle_handles) > HANDLE_KEEPALIVE_MAX) idle_evict_oldest(browser, FALSE);
     }
+}
+
+static gboolean idle_handle_age_tick(gpointer data)
+{
+    Browser *browser = data;
+    gint64 now = g_get_monotonic_time();
+    for (IdleHandle *oldest = g_queue_peek_tail(&idle_handles); oldest && now - oldest->since_us > HANDLE_KEEPALIVE_US;
+         oldest = g_queue_peek_tail(&idle_handles))
+        idle_evict_oldest(browser, TRUE);
+    return G_SOURCE_CONTINUE;
 }
 
 static Frame *frame_new(void)
@@ -677,6 +842,13 @@ static gboolean submit_commit(Browser *browser)
             }
             browser->commit_pending = TRUE;
             browser->submitted_at = g_get_monotonic_time();
+            if (flip_trace_on()) {
+                flip_trace_cur.exported = frame ? frame->exported_us : 0;
+                flip_trace_cur.submitted = browser->submitted_at;
+                flip_trace_cur.commit_us = elapsed;
+                flip_trace_cur.ui = frame != NULL;
+                flip_trace_cur.video = with_video;
+            }
             if (with_video) {
                 browser->stats.video_commits++;
                 video->pending = video->next;
@@ -840,9 +1012,26 @@ static void report_stats(Browser *browser)
 
 static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigned microseconds, void *data)
 {
-    (void)fd; (void)sequence; (void)seconds; (void)microseconds;
+    (void)fd;
     Browser *browser = data;
     if (!browser->commit_pending) return;
+    if (flip_trace_on()) {
+        gint64 received = g_get_monotonic_time();
+        gint64 kernel = (gint64)seconds * 1000000 + microseconds; /* CLOCK_MONOTONIC when the driver reports it */
+        gint64 to_kernel = kernel - flip_trace_cur.submitted, to_user = received - kernel;
+        unsigned missed = flip_trace_last_seq && sequence - flip_trace_last_seq > 1 ? sequence - flip_trace_last_seq - 1 : 0;
+        /* kernel stamp lags one vblank on this driver (constant ~16.7 ms), so key on submit->receipt only */
+        if (received - flip_trace_cur.submitted > 40000)
+            g_message("Flip trace ui=%d video=%d export_to_commit_us=%" G_GINT64_FORMAT " commit_call_us=%" G_GINT64_FORMAT
+                      " submit_to_stamp_us=%" G_GINT64_FORMAT " stamp_to_receipt_us=%" G_GINT64_FORMAT
+                      " submit_to_receipt_us=%" G_GINT64_FORMAT " seq=%u missed_vblanks=%u vblank_interval_us=%" G_GINT64_FORMAT " mono=%" G_GINT64_FORMAT,
+                      flip_trace_cur.ui, flip_trace_cur.video,
+                      flip_trace_cur.exported ? flip_trace_cur.submitted - flip_trace_cur.exported : -1,
+                      flip_trace_cur.commit_us, to_kernel, to_user, received - flip_trace_cur.submitted, sequence, missed,
+                      flip_trace_last_kernel_us ? kernel - flip_trace_last_kernel_us : -1, received);
+        flip_trace_last_seq = sequence;
+        flip_trace_last_kernel_us = kernel;
+    }
     browser->commit_pending = FALSE;
     gint64 latency = g_get_monotonic_time() - browser->submitted_at;
     browser->stats.flips++;
@@ -900,6 +1089,13 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
     if (browser->dead_generation && browser->dead_generation == signage_drm_broker_video_generation() &&
         !browser->visible_view && !video->current.fb && !video->pending_valid && !video->dirty && g_queue_is_empty(&video->waiting)) {
         signage_drm_broker_video_retired(browser->dead_generation); browser->dead_generation=0;
+    }
+    if (browser->current && browser->current->owner) {
+        static gint64 last_ui_flip;
+        gint64 now_ui=g_get_monotonic_time();
+        if (last_ui_flip && now_ui-last_ui_flip>25000)
+            g_message("Native UI interval mono=%" G_GINT64_FORMAT " gap_us=%" G_GINT64_FORMAT " phase=%d",now_ui,now_ui-last_ui_flip,video->gate.phase);
+        last_ui_flip=now_ui;
     }
     standby_progress(browser);
     submit_commit(browser);
@@ -1056,6 +1252,8 @@ static Frame *import_direct(Browser *browser, struct wpe_view_backend_exportable
     if (valid) step = "drmPrimeFDToHandle";
     for (unsigned i = 0; valid && i < resource->n_planes; i++) {
         if (drmPrimeFDToHandle(browser->fd, resource->fds[i], &frame->handles[i]) != 0) { saved_errno = errno; valid = FALSE; break; }
+        if (reap_blocks(frame->handles[i]) &&
+            drmPrimeFDToHandle(browser->fd, resource->fds[i], &frame->handles[i]) != 0) { saved_errno = errno; valid = FALSE; break; }
         gboolean unique = TRUE;
         for (unsigned j = 0; j < i; j++) if (frame->handles[j] == frame->handles[i]) unique = FALSE;
         if (unique) handle_ref(browser, frame->handles[i]);
@@ -1597,6 +1795,15 @@ static Frame *copy_frame(Browser *browser, struct wpe_view_backend_exportable_fd
 static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dmabuf_resource *resource)
 {
     Browser *browser = data;
+    gint64 export_started = g_get_monotonic_time();
+
+    Browser *timing_root = browser->root ? browser->root : browser;
+    gboolean visible_export = browser->root ? timing_root->visible_view == browser : !browser->orchestrator_hidden;
+    if (g_getenv("SIGNAGE_TRANSITION_TRACE") && visible_export) {
+        if (browser->last_visible_export && export_started-browser->last_visible_export > 25000)
+            g_message("Transition export mono=%" G_GINT64_FORMAT " gap_us=%" G_GINT64_FORMAT " phase=%d", export_started, export_started-browser->last_visible_export, timing_root->video.gate.phase);
+        browser->last_visible_export = export_started;
+    }
     Frame *frame = NULL;
     if (browser->root) {
         Browser *root = browser->root;
@@ -1624,7 +1831,10 @@ static void export_dmabuf(void *data, struct wpe_view_backend_exportable_fdo_dma
         }
     }
     if (!frame && !(frame = copy_frame(browser, resource))) return;
+    if (g_getenv("SIGNAGE_TRANSITION_TRACE") && g_get_monotonic_time()-export_started > 10000)
+        g_message("Transition import mono=%" G_GINT64_FORMAT " elapsed_us=%" G_GINT64_FORMAT, export_started, g_get_monotonic_time()-export_started);
     frame->owner = browser;
+    frame->exported_us = export_started;
     if (browser->root) {
         Browser *root = browser->root;
         if (root->video.gate.phase==SIGNAGE_STANDBY_COMMITTING && root->visible_view==browser) {
@@ -1742,6 +1952,15 @@ static void configure_sandbox(void)
 {
     if (g_file_test(SIGNAGE_VIDEO_RUNTIME_DIR, G_FILE_TEST_IS_DIR)) {
         webkit_web_context_add_path_to_sandbox(webkit_web_context_get_default(), SIGNAGE_VIDEO_RUNTIME_DIR, FALSE);
+        const char *registry = g_getenv("GST_REGISTRY");
+        if (registry && g_path_is_absolute(registry) && !strstr(registry, "..")) {
+            char *registry_dir = g_path_get_dirname(registry);
+            webkit_web_context_add_path_to_sandbox(webkit_web_context_get_default(), registry_dir, FALSE);
+            g_free(registry_dir);
+        }
+        const char *ledger = g_getenv("SIGNAGE_VIDEO_LEDGER_DIR");
+        if (ledger && g_str_has_prefix(ledger, "/run/") && !strstr(ledger, ".."))
+            webkit_web_context_add_path_to_sandbox(webkit_web_context_get_default(), ledger, FALSE);
         g_message("WebKit sandbox: bound %s (DRM broker socket, video status)", SIGNAGE_VIDEO_RUNTIME_DIR);
     }
 
@@ -1771,6 +1990,10 @@ static void configure_sandbox(void)
 }
 
 #include "standby-renderer.h"
+
+/* WebKit's default destroy notifier destroys the libwpe backend, but FDO's
+ * exportable owns that same backend. Keep it until exported frames retire. */
+static void retain_exportable_backend(gpointer data G_GNUC_UNUSED) {}
 
 static gboolean initialize_webkit(Browser *browser)
 {
@@ -1810,8 +2033,16 @@ static gboolean initialize_webkit(Browser *browser)
     if (!browser->exportable) { fail(browser, "Cannot create the WPE exportable backend"); return FALSE; }
     browser->backend = wpe_view_backend_exportable_fdo_get_view_backend(browser->exportable);
     if (!browser->root) configure_sandbox();
-    WebKitWebViewBackend *backend = webkit_web_view_backend_new(browser->backend, NULL, NULL);
+    WebKitWebViewBackend *backend = webkit_web_view_backend_new(browser->backend, retain_exportable_backend, NULL);
+    gint64 view_started=g_get_monotonic_time();
+    playback_guard.created_total++;
+    if (playback_guard.running) {
+        playback_guard.created_in_playback++;
+        g_warning("Playback guard: WebView creation during active playback (%" G_GUINT64_FORMAT ")", playback_guard.created_in_playback);
+    }
     browser->view = webkit_web_view_new(backend);
+    if (g_getenv("SIGNAGE_TRANSITION_TRACE"))
+        g_message("Transition webview-new mono=%" G_GINT64_FORMAT " elapsed_us=%" G_GINT64_FORMAT,view_started,g_get_monotonic_time()-view_started);
     if (!browser->view) { fail(browser, "Cannot create the WebKit web view"); return FALSE; }
     configure_native_bridge(browser);
     /* Dispatch after WebKit installs its backend client, before navigation. */
@@ -1837,12 +2068,25 @@ static gboolean initialize_webkit(Browser *browser)
     wpe_view_backend_set_target_refresh_rate(browser->backend, mode_refresh(&browser->mode) * 1000);
     /* libwpe pointer/axis positions are physical; WebKit divides by device scale. */
     if (!browser->root) browser->input = signage_input_start(browser->backend, browser->ui_width, browser->ui_height);
+    gint64 load_started=g_get_monotonic_time();
     webkit_web_view_load_uri(browser->view, browser->uri);
+    if (g_getenv("SIGNAGE_TRANSITION_TRACE"))
+        g_message("Transition load-uri mono=%" G_GINT64_FORMAT " elapsed_us=%" G_GINT64_FORMAT,load_started,g_get_monotonic_time()-load_started);
     return TRUE;
+}
+
+static void reap_drain(void)
+{
+    if (!reap_started) return;
+    gint64 deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+    g_mutex_lock(&reap_lock);
+    while (g_hash_table_size(reap_closing) && g_cond_wait_until(&reap_cond, &reap_lock, deadline)) { }
+    g_mutex_unlock(&reap_lock);
 }
 
 static void cleanup(Browser *browser)
 {
+    reap_drain();
     if (browser->stage_tick) g_source_remove(browser->stage_tick);
     if (browser->fd_source) g_source_remove(browser->fd_source);
     if (browser->watchdog_source) g_source_remove(browser->watchdog_source);
@@ -1903,6 +2147,7 @@ static void cleanup(Browser *browser)
         for (GList *item = retired; item; item = item->next) release_frame(browser, item->data);
         g_list_free(retired);
     }
+    destroy_stage_view(browser->spare_view); browser->spare_view=NULL;
     destroy_stage_view(browser->staged_view); browser->staged_view=NULL;
     destroy_stage_view(browser->retiring_view); browser->retiring_view=NULL;
     destroy_stage_view(browser->visible_view); browser->visible_view=NULL;
@@ -1950,6 +2195,196 @@ static void help(void)
          "No window manager or Cog dependency. Native touchscreen input is not implemented.");
 }
 
+
+/* Opt-in (SIGNAGE_STALL_TRACE) main-loop stall attribution. A 4 ms main-loop
+ * heartbeat is compared by a watchdog thread; when the loop is late by >40 ms it
+ * samples the main thread's kernel state (syscall, pc, fd, wchan, CPU ticks)
+ * every 10 ms and prints one summary when the loop recovers. No logging or disk
+ * writes occur while the stall is in progress. */
+static volatile gint64 stall_heartbeat_us;
+static pid_t stall_main_tid;
+static pthread_t stall_main_thread;
+/* Main-thread user stack captured by SIGUSR2 while the loop is late. The
+ * handler only calls backtrace() into this static buffer (libgcc is preloaded
+ * at start so no allocation happens inside the signal). */
+#define STALL_FRAMES 24
+static void *stall_frames[STALL_FRAMES];
+static volatile sig_atomic_t stall_frame_count;
+
+static void stall_stack_signal(int signo)
+{
+    (void)signo;
+    int saved = errno;
+    stall_frame_count = backtrace(stall_frames, STALL_FRAMES);
+    errno = saved;
+}
+
+static void stall_format_stack(char *out, size_t size, void **frames, int count)
+{
+    size_t used = 0;
+    out[0] = 0;
+    for (int i = 0; i < count && used + 80 < size; i++) {
+        Dl_info info;
+        const char *module = "?", *name = NULL;
+        unsigned long offset = 0;
+        if (dladdr(frames[i], &info)) {
+            const char *base = info.dli_fname ? strrchr(info.dli_fname, '/') : NULL;
+            module = info.dli_fname ? (base ? base + 1 : info.dli_fname) : "?";
+            name = info.dli_sname;
+            offset = (unsigned long)((char *)frames[i] - (char *)(name ? info.dli_saddr : info.dli_fbase));
+        }
+        used += (size_t)snprintf(out + used, size - used, "%s%s%s%s+0x%lx", i ? " < " : "", module, name ? ":" : "", name ? name : "", offset);
+    }
+}
+
+static gboolean stall_beat(gpointer data)
+{
+    (void)data;
+    stall_heartbeat_us = g_get_monotonic_time();
+    return G_SOURCE_CONTINUE;
+}
+
+static void stall_read(const char *name, char *out, size_t size)
+{
+    char path[96];
+    snprintf(path, sizeof path, "/proc/self/task/%d/%s", (int)stall_main_tid, name);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t n = fd >= 0 ? read(fd, out, size - 1) : -1;
+    if (fd >= 0) close(fd);
+    out[n > 0 ? n : 0] = 0;
+    for (char *c = out; *c; c++) if (*c == '\n') *c = ' ';
+}
+
+/* Thread state + fault/context-switch counters distinguish a blocked page fault
+ * (D state, majflt/minflt moving, voluntary switches) from preemption
+ * (R state, involuntary switches) when no user stack can be delivered. */
+typedef struct { char state; unsigned long minflt, majflt; unsigned long long vol, invol; unsigned long long psi_mem, psi_io, psi_cpu; } StallCounters;
+
+static unsigned long long stall_psi_total(const char *name)
+{
+    char path[48], buf[256];
+    snprintf(path, sizeof path, "/proc/pressure/%s", name);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t n = fd >= 0 ? read(fd, buf, sizeof buf - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    const char *t = strstr(buf, "total=");
+    return t ? strtoull(t + 6, NULL, 10) : 0;
+}
+
+static void stall_counters(StallCounters *c)
+{
+    char stat[512], status[2048];
+    memset(c, 0, sizeof *c);
+    stall_read("stat", stat, sizeof stat);
+    char *p = strrchr(stat, ')');
+    if (p) sscanf(p + 2, "%c %*d %*d %*d %*d %*d %*u %lu %*u %lu", &c->state, &c->minflt, &c->majflt);
+    stall_read("status", status, sizeof status);
+    const char *v = strstr(status, "voluntary_ctxt_switches:");
+    if (v) c->vol = strtoull(v + 24, NULL, 10);
+    const char *nv = strstr(status, "nonvoluntary_ctxt_switches:");
+    if (nv) c->invol = strtoull(nv + 27, NULL, 10);
+    c->psi_mem = stall_psi_total("memory"); c->psi_io = stall_psi_total("io"); c->psi_cpu = stall_psi_total("cpu");
+}
+
+static void stall_where(const char *syscall_text, char *out, size_t size)
+{
+    unsigned long long nr = 0, args[6] = {0}, sp = 0, pc = 0;
+    out[0] = 0;
+    if (sscanf(syscall_text, "%llu %llx %llx %llx %llx %llx %llx %llx %llx", &nr, &args[0], &args[1], &args[2], &args[3], &args[4], &args[5], &sp, &pc) < 9) return;
+    FILE *maps = fopen("/proc/self/maps", "re");
+    char line[512];
+    while (maps && fgets(line, sizeof line, maps)) {
+        unsigned long long lo, hi, off;
+        char perms[8], file[320] = "";
+        if (sscanf(line, "%llx-%llx %7s %llx %*s %*s %319[^\n]", &lo, &hi, perms, &off, file) >= 4 && pc >= lo && pc < hi) {
+            const char *base = strrchr(file, '/');
+            snprintf(out, size, "nr=%llu fd/a0=%llu pc=%s+0x%llx", nr, args[0], base ? base + 1 : file, pc - lo + off);
+            break;
+        }
+    }
+    if (maps) fclose(maps);
+}
+
+static void *stall_watchdog(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        usleep(5000);
+        gint64 last = stall_heartbeat_us;
+        gint64 now = g_get_monotonic_time();
+        if (!last || now - last < 40000) continue;
+        enum { MAX_SAMPLES = 40, MAX_STACKS = 4 };
+        char samples[MAX_SAMPLES][240];
+        static char stacks[MAX_STACKS][1536], kstack[512];
+        unsigned count = 0, nstacks = 0;
+        gint64 next_stack_us = 0;
+        gint64 started = last, tick_cpu0 = 0;
+        char stat[512];
+        stall_read("stat", stat, sizeof stat);
+        { char *p = strrchr(stat, ')'); unsigned long ut = 0, st = 0; if (p && sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) == 2) tick_cpu0 = (gint64)(ut + st); }
+        gint64 cpu_now = tick_cpu0;
+        StallCounters c0, c1;
+        stall_counters(&c0);
+        char first_state[96] = "";
+        while (stall_heartbeat_us == last) {
+            gint64 elapsed_now = g_get_monotonic_time() - started;
+            if (nstacks < MAX_STACKS && elapsed_now >= next_stack_us) {
+                stall_frame_count = 0;
+                pthread_kill(stall_main_thread, SIGUSR2);
+                for (int wait = 0; wait < 20 && !stall_frame_count && stall_heartbeat_us == last; wait++) usleep(500);
+                if (stall_frame_count > 0) stall_format_stack(stacks[nstacks++], sizeof stacks[0], stall_frames, stall_frame_count);
+                next_stack_us = elapsed_now + 60000;
+            }
+            if (!kstack[0]) stall_read("stack", kstack, sizeof kstack);
+            if (count < MAX_SAMPLES) {
+                char sc[160], wchan[64], where[120], link[96] = "", target[128] = "";
+                stall_read("syscall", sc, sizeof sc);
+                stall_read("wchan", wchan, sizeof wchan);
+                stall_where(sc, where, sizeof where);
+                unsigned long long a0 = 0;
+                if (sscanf(sc, "%*d %llx", &a0) == 1) {
+                    snprintf(link, sizeof link, "/proc/self/fd/%llu", a0);
+                    ssize_t n = readlink(link, target, sizeof target - 1);
+                    target[n > 0 ? n : 0] = 0;
+                }
+                snprintf(samples[count], sizeof samples[count], "+%ldms %s wchan=%s fd=%s", (long)((g_get_monotonic_time() - started) / 1000),
+                         where[0] ? where : "running/user", wchan, target);
+                count++;
+            }
+            usleep(10000);
+        }
+        stall_read("stat", stat, sizeof stat);
+        { char *p = strrchr(stat, ')'); unsigned long ut = 0, st = 0; if (p && sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) == 2) cpu_now = (gint64)(ut + st); }
+        g_message("Main-loop stall mono=%" G_GINT64_FORMAT " late_us=%" G_GINT64_FORMAT " cpu_ticks=%" G_GINT64_FORMAT " samples=%u",
+                  started, g_get_monotonic_time() - started, cpu_now - tick_cpu0, count);
+        for (unsigned i = 0; i < count; i += (count > 12 ? count / 12 : 1)) g_message("  stall sample %s", samples[i]);
+        stall_counters(&c1);
+        (void)first_state;
+        g_message("  stall thread state=%c->%c minflt+%lu majflt+%lu vol_switches+%llu invol_switches+%llu psi_us mem+%llu io+%llu cpu+%llu stacks_delivered=%u",
+                  c0.state, c1.state, c1.minflt - c0.minflt, c1.majflt - c0.majflt, c1.vol - c0.vol, c1.invol - c0.invol,
+                  c1.psi_mem - c0.psi_mem, c1.psi_io - c0.psi_io, c1.psi_cpu - c0.psi_cpu, nstacks);
+        for (unsigned i = 0; i < nstacks; i++) g_message("  stall user-stack[%u] %s", i, stacks[i]);
+        if (kstack[0]) g_message("  stall kernel-stack %s", kstack);
+        kstack[0] = 0;
+    }
+    return NULL;
+}
+
+static void stall_trace_start(void)
+{
+    if (!g_getenv("SIGNAGE_STALL_TRACE")) return;
+    stall_main_tid = (pid_t)syscall(SYS_gettid);
+    stall_main_thread = pthread_self();
+    { void *warm[2]; (void)backtrace(warm, 2); }
+    signal(SIGUSR2, stall_stack_signal);
+    stall_heartbeat_us = g_get_monotonic_time();
+    g_timeout_add(4, stall_beat, NULL);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, stall_watchdog, NULL) == 0) pthread_detach(thread);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "--version")) {
@@ -1963,6 +2398,7 @@ int main(int argc, char **argv)
     browser.frame_complete_early = g_strcmp0(g_getenv("SIGNAGE_FRAME_CALLBACK"), "flip") != 0;
     browser.handles = g_hash_table_new(g_direct_hash, g_direct_equal);
     browser.loop = g_main_loop_new(NULL, FALSE);
+    stall_trace_start();
     if (!open_display(&browser)) {
         fail(&browser, "No connected atomic DRM display with ARGB8888 primary plane; check /dev/dri access, DRM master, connector and DE35 support");
         cleanup(&browser);
@@ -1993,6 +2429,7 @@ int main(int argc, char **argv)
     select_split_plane(&browser);
     browser.fd_source = g_unix_fd_add(browser.fd, G_IO_IN | G_IO_ERR | G_IO_HUP, drm_ready, &browser);
     browser.watchdog_source = g_timeout_add_seconds(1, watchdog, &browser);
+    g_timeout_add_seconds(2, idle_handle_age_tick, &browser);
     browser.sigterm_source = g_unix_signal_add(SIGTERM, quit_signal, &browser);
     browser.sigint_source = g_unix_signal_add(SIGINT, quit_signal, &browser);
     write_status(&browser);

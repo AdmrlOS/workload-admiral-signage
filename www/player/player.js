@@ -26,9 +26,9 @@
     const data=event.detail;
     if(data.event==='ended' && current?.native && data.generation===nativeActiveGeneration) { advance(); return; }
     if(!nativeStage || data.request!==nativeStage.request) return;
-    if(data.event==='prepared') { nativeStage.generation=data.generation; nativeStage.ready=true; }
+    if(data.event==='prepared') { nativeStage.generation=data.generation; nativeStage.ready=true; nativeStage.prepared?.(true); }
     else if(data.event==='not-ready' || data.event==='cancelled' || data.event==='failed') {
-      nativeStage.error=data.event; nativeStage.resolve?.(false);
+      nativeStage.error=data.event; nativeStage.resolve?.(false); nativeStage.prepared?.(false);
     } else if(data.event==='activated' && data.generation===nativeStage.generation) nativeStage.resolve?.(true);
 
   });
@@ -36,7 +36,7 @@
   if (preview) document.body.classList.add('preview');
   let playlist = [], current = null, transitioning = false, requested = false, timer = 0, pollTimer = 0, boundaryTimer = 0, clockTimer = 0;
   let lastPoll = 0, previousRevision = null, stopped = false;
-  let staged = null, stageGeneration = 0, cacheWindow = '';
+  let staged = null, stageGeneration = 0, cacheWindow = '', preparingInitial=false;
   const images = new Map();
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve,ms));
   // Hand-off timeline marks for on-device timing: ?debug=1 or localStorage.signageDebug='1'. No-op otherwise.
@@ -59,7 +59,7 @@
   }
   const signature = (entry) => JSON.stringify(entry);
   function cancelStage() {
-    if(nativeStage) { nativeSend({type:'native-cancel'}); nativeStage.resolve?.(false); nativeStage=null; }
+    if(nativeStage) { nativeSend({type:'native-cancel'}); nativeStage.resolve?.(false); nativeStage.prepared?.(false); nativeStage=null; }
     stageGeneration++;
     if (staged) { remove(staged.item); staged=null; }
   }
@@ -81,7 +81,13 @@
         (next.asset.url!==current.entry.asset.url || current.native)) {
       const uri=next.asset.kind==='video' ? new URL('/player/',location.href) : new URL(next.asset.url,location.href);
       if(next.asset.kind==='video') uri.searchParams.set('native_surface',new URL(next.asset.url,location.href).href);
-      else uri.searchParams.set('native_stage','1');
+      else {
+        // Built-in seeds persist in /data and WebKit caches JS for an hour.
+        // Stage the matching image's lifecycle without mutating published data.
+        if (next.asset.builtin && uri.pathname==='/content/menuboard/index.html')
+          uri.pathname='/native-builtin/menuboard/index.html';
+        uri.searchParams.set('native_stage','1');
+      }
       const slot={key:signature(next),request:++nativeRequest,ready:false,generation:null};
       nativeStage=slot;
       nativeSend({type:'native-stage',request:slot.request,uri:uri.href});
@@ -192,6 +198,25 @@
           };
         });
         stage.appendChild(node); node.src=a.url; dbg('src set', {id:a.id});
+        if (!current && window.signageNative?.preflight && playlist.length>1) {
+          // Establish the outgoing PAUSED pipeline and broker generation before
+          // staging. No media clock runs until actual next-context PREPARED.
+          const preroll=new Promise((resolve,reject)=>{
+            const loaded=()=>{node.removeEventListener('loadeddata',loaded);resolve();};
+            node.addEventListener('loadeddata',loaded,{once:true});
+            node.onerror=()=>reject(new Error('Initial video preroll failed'));
+          });
+          node.load(); await preroll;
+          preparingInitial=true;
+          current=item; lookahead(); current=null;
+          nativeSend({type:'native-warm-pool'});
+          if (!nativeStage) throw new Error('Startup standby unavailable');
+          const slot=nativeStage;
+          if (!slot.ready) await new Promise(resolve=>{slot.prepared=resolve;});
+          if (stopped || slot.error || nativeStage!==slot) throw new Error('Startup preparation cancelled');
+          // Pool and next native page exist; from here WebView creation is a violation.
+          nativeSend({type:'native-playback',running:true});
+        }
         node.play().catch(() => { if(node.onerror) node.onerror(); });
       } else if (a.kind === 'image') {
         await imageReady(a.url); node.src=a.url; stage.appendChild(node); ready=paint();
@@ -328,6 +353,7 @@
         lookahead();
       } else { document.getElementById('now-playing').textContent='Retrying content…'; timer=setTimeout(() => advance(),5000); }
     } finally {
+      preparingInitial=false;
       transitioning=false;
       if (requested) { requested=false; reconcile(); }
     }
@@ -350,7 +376,7 @@
       clearTimeout(clockTimer);
       if(data.next_change) clockTimer=setTimeout(() => { const now=data.now+(Date.now()-lastPoll)/1000; playlist=playlist.filter((e) => !e.end || new Date(e.end).getTime()/1000>now); reconcile(); },Math.max(25,Math.min(2147483647,(data.next_change-data.now)*1000+30)));
       warm(playlist[0]);
-      if(!current) lookahead();
+      if(!current && !preparingInitial) lookahead();
       if((staged && !playlist.some(e=>signature(e)===staged.key)) ||
           (nativeStage && !playlist.some(e=>signature(e)===nativeStage.key))) cancelStage();
       reconcile();
@@ -361,6 +387,6 @@
   const showControls=() => { if(preview) return; document.body.classList.add('controls'); clearTimeout(controlsTimer); controlsTimer=setTimeout(() => document.body.classList.remove('controls'),2500); };
   document.addEventListener('pointermove',showControls); document.addEventListener('keydown',showControls);
   document.getElementById('fullscreen').onclick=() => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.();
-  window.addEventListener('pagehide',() => { stopped=true; clearTimeout(timer); clearTimeout(pollTimer); clearTimeout(boundaryTimer); clearTimeout(clockTimer); cancelStage(); remove(current); });
+  window.addEventListener('pagehide',() => { nativeSend({type:'native-playback',running:false}); stopped=true; clearTimeout(timer); clearTimeout(pollTimer); clearTimeout(boundaryTimer); clearTimeout(clockTimer); cancelStage(); remove(current); });
   poll();
 })();

@@ -234,7 +234,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json_response(configuration(), head)
         if path == "/api/status":
             return self.json_response(STATUS, head)
-        if path.startswith('/content/'):
+        if path.startswith('/native-builtin/menuboard/'):
+            name = path.removeprefix('/native-builtin/')
+            roots = [APP_ROOT / 'www']
+        elif path.startswith('/content/'):
             name = path.removeprefix('/content/')
             roots = [DATA_ROOT / 'content']
         elif path.startswith("/media/"):
