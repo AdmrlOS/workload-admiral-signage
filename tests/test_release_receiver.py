@@ -26,7 +26,8 @@ typedef struct { guint32 type, fb, serial; } SignageVideoMessage;
 typedef struct { guint32 serial; } HeldFrame;
 typedef struct { GMutex lock; GCond receiver_wake; gboolean receiver_stop, disconnected;
 int socket; GHashTable *held, *unpresented, *identities, *presented_pts; guint32 awaiting_fb, awaiting_serial; guint64 presented_total; gboolean trace_presented;
-guint8 incoming[sizeof(SignageVideoMessage)]; gsize incoming_length; } AdmiralPlaneSink;
+guint8 incoming[sizeof(SignageVideoMessage)]; gsize incoming_length;
+guint32 last_presented_serial; gboolean presentation_failed; } AdmiralPlaneSink;
 ''' + parser + r'''
 int main(void) {
 for (int iteration=0; iteration<100; iteration++) {

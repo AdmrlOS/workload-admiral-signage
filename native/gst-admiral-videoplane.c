@@ -54,6 +54,8 @@ typedef struct {
     GHashTable *held;         /* fb -> HeldFrame, until the browser releases it */
     GstBuffer *last;          /* re-shown when the rectangle changes */
     guint32 last_fb, serial;
+    guint32 last_presented_serial;
+    gboolean presentation_failed; /* cancellation is not successful EOS */
     gboolean hidden;
     gboolean flushing;
     guint32 awaiting_fb, awaiting_serial;
@@ -132,6 +134,7 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
         self->incoming_length = 0;
         if (message.type == SIGNAGE_VIDEO_CANCELLED) {
             if (message.fb && GPOINTER_TO_UINT(g_hash_table_lookup(self->unpresented, GUINT_TO_POINTER(message.serial))) == message.fb) {
+                self->presentation_failed = TRUE;
                 g_hash_table_remove(self->unpresented, GUINT_TO_POINTER(message.serial));
                 g_hash_table_remove(self->identities, GUINT_TO_POINTER(message.serial));
                 g_cond_broadcast(&self->receiver_wake);
@@ -155,6 +158,7 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
                 }
                 g_hash_table_remove(self->identities, GUINT_TO_POINTER(message.serial));
                 self->awaiting_fb = self->awaiting_serial = 0;
+                self->last_presented_serial = message.serial;
                 self->presented_total++;
                 g_cond_broadcast(&self->receiver_wake);
             }
@@ -424,7 +428,16 @@ admiral_plane_sink_show_frame(GstVideoSink *video_sink, GstBuffer *buffer)
 
 static GstFlowReturn wait_presented(AdmiralPlaneSink *self)
 {
-    return wait_credit(self, 0);
+    GstFlowReturn result = wait_credit(self, 0);
+    if (result == GST_FLOW_OK && (!self->serial || self->presentation_failed ||
+                                 self->last_presented_serial != self->serial)) {
+        GST_ELEMENT_ERROR(self, RESOURCE, WRITE,
+            ("Video EOS endpoint was not successfully presented"),
+            ("final=%u presented=%u cancelled=%d", self->serial,
+             self->last_presented_serial, self->presentation_failed));
+        return GST_FLOW_ERROR;
+    }
+    return result;
 }
 
 static gboolean admiral_plane_sink_query(GstElement *element, GstQuery *query)
@@ -491,6 +504,8 @@ static gboolean admiral_plane_sink_event(GstBaseSink *base, GstEvent *event)
     }
     if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
         g_mutex_lock(&self->lock);
+        self->presentation_failed = FALSE;
+        self->last_presented_serial = 0;
         g_hash_table_remove_all(self->presented_pts);
         g_mutex_unlock(&self->lock);
     }
@@ -586,6 +601,8 @@ admiral_plane_sink_start(GstBaseSink *base)
     gboolean ok = self->fd >= 0 && self->socket >= 0 && self->mode_width > 0 && self->mode_height > 0;
     self->disconnected = FALSE;
     self->flushing = FALSE;
+    self->presentation_failed = FALSE;
+    self->last_presented_serial = 0;
     self->awaiting_fb = self->awaiting_serial = 0;
     self->presented_total = 0;
     g_hash_table_remove_all(self->unpresented);
