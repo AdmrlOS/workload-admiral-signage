@@ -39,9 +39,16 @@ its existing browser staging path, which is not a physical-vblank guarantee.
 
 ## Admission and explicit failure
 
-Defaults fail closed. The board owner must certify additional decoder DPB + UI
-scanout/copy pool + allocator reserve and set `SIGNAGE_STANDBY_CONTEXTS` (at least
-2) and `SIGNAGE_STANDBY_CMA_BYTES` (measured additional bound in bytes). Admission
+Admission fails closed when `SIGNAGE_STANDBY_CONTEXTS` (at least 2) and
+`SIGNAGE_STANDBY_CMA_BYTES` (additional decoder DPB + UI scanout/copy pool +
+allocator reserve, bytes) are absent. The entrypoint now supplies the 4K60 bound
+measured on the T527 board (86 MiB DPB + 98 MiB UI BOs + 36 MiB reserve) plus a
+per-path bound, as defaults an operator can override. Before this, the managed OCI
+had neither variable, so every `native-stage` was answered `not-ready`.
+
+The player never parks on a refusal: a not-ready/failed/cancelled stage, a lost
+readiness notice (20 s bound) or a failed activation degrades to the explicit
+serial path (non-gapless), and refusals back off 1 s doubling to 30 s per entry. Admission
 reads live CmaFree, keeps native 3840x2160 / scale 1 / 60Hz and never reduces
 resolution/rate or disables QoS. Compressed RAM cache is not CMA admission.
 No arbitrary guessed board memory threshold is shipped.

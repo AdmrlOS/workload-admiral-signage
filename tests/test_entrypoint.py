@@ -32,6 +32,18 @@ class DecoderConfigTests(unittest.TestCase):
             entrypoint.decoder_config({"SIGNAGE_DECODER": "v4l2slh264dec,nonsense"})
 
 
+class StandbyAdmissionTests(unittest.TestCase):
+    def test_managed_environment_is_admitted_by_default(self):
+        env = entrypoint.standby_defaults({})
+        self.assertEqual(env["SIGNAGE_STANDBY_CONTEXTS"], "2")
+        self.assertGreater(int(env["SIGNAGE_STANDBY_CMA_BYTES"]), 0)
+        self.assertIn("/player/", env["SIGNAGE_STANDBY_CMA_BY_PATH"])
+
+    def test_operator_values_win(self):
+        env = entrypoint.standby_defaults({"SIGNAGE_STANDBY_CMA_BYTES": "1", "SIGNAGE_STANDBY_CONTEXTS": "3"})
+        self.assertEqual(list(env), ["SIGNAGE_STANDBY_CMA_BY_PATH"])
+
+
 class CacheTests(unittest.TestCase):
     def test_caches_are_writable_and_registry_is_keyed(self):
         import os

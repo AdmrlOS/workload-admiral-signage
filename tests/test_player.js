@@ -372,3 +372,49 @@ test('hand-off has no fixed dwell timer',async()=>{
   await h.run(1000);
   assert.equal(Array.from(h.timers.values()).some((t)=>t.ms===750),false);
 });
+
+test('refused native standby at startup still starts the first video (no 0-commit deadlock)',async()=>{
+  const h=await harness([entry('a','video'),entry('b','video')],{native:true,preflight:true});
+  const reservation=h.events.find(e=>e.type==='native-stage'); assert.ok(reservation);
+  assert.equal(h.events.includes('play:/a'),false);
+  h.native({event:'not-ready',request:reservation.request,generation:'0'}); await h.settle();
+  assert.ok(h.events.includes('play:/a'),'first video must start after a capacity refusal');
+  assert.equal(h.events.some(e=>e.type==='native-playback' && e.running),false,'no guard claimed without a prepared successor');
+});
+
+test('refused native standby at EOS falls back to the serial path, never retries forever',async()=>{
+  const h=await harness([entry('a','video'),entry('b','video')],{native:true});
+  const reservation=h.events.find(e=>e.type==='native-stage'); assert.ok(reservation);
+  h.native({event:'not-ready',request:reservation.request,generation:'0'});
+  const old=h.nodes.find(n=>n.tagName==='VIDEO'); old._ended=true; old.onended(); await h.settle();
+  assert.equal(h.events.some(e=>e.type==='native-activate'),false);
+  assert.ok(h.events.includes('release:VIDEO'),'outgoing is released by the serial hand-off');
+  assert.ok(h.events.includes('play:/b'),'next clip plays via the serial path');
+});
+
+test('transient refusal is retried with backoff, permanent refusal does not thrash every poll',async()=>{
+  const h=await harness([entry('a','video'),entry('b','video')],{native:true});
+  const stages=()=>h.events.filter(e=>e.type==='native-stage');
+  let r=stages()[0]; assert.ok(r);
+  h.native({event:'not-ready',request:r.request,generation:'0'}); await h.settle();
+  const n0=stages().length;
+  await h.run(2000);                        // poll after >=1 s backoff: staged again
+  assert.equal(stages().length,n0+1,'first refusal is retried on the next poll');
+  r=stages()[stages().length-1];
+  h.native({event:'not-ready',request:r.request,generation:'0'}); await h.settle();
+  const n1=stages().length;
+  await h.run(2000);                        // 2nd refusal backs off 2 s: still allowed at +2 s
+  const n2=stages().length;
+  r=stages()[stages().length-1];
+  h.native({event:'not-ready',request:r.request,generation:'0'}); await h.settle();
+  await h.run(2000);                        // 3rd refusal backs off 4 s: no restage at +2 s
+  assert.equal(stages().length,n2,'backoff grows instead of re-staging on every poll');
+  assert.ok(n1>=n0+1);
+});
+
+test('lost native readiness notice is bounded: waits then serial fallback',async()=>{
+  const h=await harness([entry('a','video'),entry('b','video')],{native:true});
+  const old=h.nodes.find(n=>n.tagName==='VIDEO'); old._ended=true; old.onended(); await h.settle();
+  assert.equal(h.events.includes('play:/b'),false,'still waiting inside the bound');
+  assert.ok(h.timers.size>0);
+});

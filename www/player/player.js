@@ -21,14 +21,27 @@
     return;
   }
   let nativeStage=null, nativeRequest=0, nativeActiveGeneration=null;
+  // Native standby admission is fail-closed (capacity/TEST_ONLY/deadline). A refusal must never
+  // park playback: remember it briefly so lookahead does not re-stage every poll, and let advance()
+  // take the explicit, non-gapless serial path instead of retrying the same refusal forever.
+  // A refusal can be transient (the previous generation is still retiring right after an activation)
+  // or permanent (capacity). Back off 1,2,4..30 s per entry instead of re-staging on every poll.
+  const NATIVE_REFUSAL_MIN_MS=1000, NATIVE_REFUSAL_MAX_MS=30000, NATIVE_PREROLL_BOUND_MS=20000;
+  let nativeRefused={key:null,until:0,count:0};
+  const nativeRefusedFor=key=>nativeRefused.key===key && Date.now()<nativeRefused.until;
+  function noteNativeRefusal(key) {
+    const count=nativeRefused.key===key ? nativeRefused.count+1 : 1;
+    nativeRefused={key,count,until:Date.now()+Math.min(NATIVE_REFUSAL_MAX_MS,NATIVE_REFUSAL_MIN_MS*2**(count-1))};
+  }
   function nativeSend(message) { window.signageNative?.send(message); }
   window.addEventListener('signage-native',event=>{
     const data=event.detail;
     if(data.event==='ended' && current?.native && data.generation===nativeActiveGeneration) { advance(); return; }
     if(!nativeStage || data.request!==nativeStage.request) return;
-    if(data.event==='prepared') { nativeStage.generation=data.generation; nativeStage.ready=true; nativeStage.prepared?.(true); }
+    if(data.event==='prepared') { nativeRefused={key:null,until:0,count:0}; nativeStage.generation=data.generation; nativeStage.ready=true; nativeStage.prepared?.(true); }
     else if(data.event==='not-ready' || data.event==='cancelled' || data.event==='failed') {
-      nativeStage.error=data.event; nativeStage.resolve?.(false); nativeStage.prepared?.(false);
+      nativeStage.error=data.event; noteNativeRefusal(nativeStage.key);
+      console.warn('Native standby refused:',data.event); nativeStage.resolve?.(false); nativeStage.prepared?.(false);
     } else if(data.event==='activated' && data.generation===nativeStage.generation) nativeStage.resolve?.(true);
 
   });
@@ -75,7 +88,7 @@
     warm(next);
     if((staged && staged.key===signature(next)) || (nativeStage && !nativeStage.error && nativeStage.key===signature(next))) return;
     cancelStage();
-    if(window.signageNative && current && next &&
+    if(window.signageNative && current && next && !nativeRefusedFor(signature(next)) &&
         (next.asset.kind==='video' || next.asset.kind==='html') &&
         (current.entry.asset.kind==='video' || current.native) &&
         (next.asset.url!==current.entry.asset.url || current.native)) {
@@ -210,12 +223,21 @@
           preparingInitial=true;
           current=item; lookahead(); current=null;
           nativeSend({type:'native-warm-pool'});
-          if (!nativeStage) throw new Error('Startup standby unavailable');
           const slot=nativeStage;
-          if (!slot.ready) await new Promise(resolve=>{slot.prepared=resolve;});
-          if (stopped || slot.error || nativeStage!==slot) throw new Error('Startup preparation cancelled');
-          // Pool and next native page exist; from here WebView creation is a violation.
-          nativeSend({type:'native-playback',running:true});
+          if (slot && !slot.ready && !slot.error) {
+            const bound=setTimeout(()=>slot.prepared?.(false),NATIVE_PREROLL_BOUND_MS);
+            await new Promise(resolve=>{slot.prepared=resolve;}); clearTimeout(bound);
+          }
+          if (stopped) throw new Error('Startup preparation cancelled');
+          if (!slot || slot.error || !slot.ready || nativeStage!==slot) {
+            // Standby refused or unready: start the first video without a staged successor
+            // (later transitions use the explicit serial path) instead of never starting.
+            console.warn('Startup standby unavailable: starting without gapless successor',slot?.error || 'not ready');
+            if (nativeStage) cancelStage();
+          } else {
+            // Pool and next native page exist; from here WebView creation is a violation.
+            nativeSend({type:'native-playback',running:true});
+          }
         }
         node.play().catch(() => { if(node.onerror) node.onerror(); });
       } else if (a.kind === 'image') {
@@ -301,10 +323,19 @@
       }
       if(nativeStage && nativeStage.key===signature(candidate)) {
         const slot=nativeStage;
-        if(!slot.ready || slot.error) {
-          console.warn('Native next-not-ready: retaining outgoing surface',slot.error || 'preroll pending');
+        slot.waitSince ??= Date.now();
+        const waited=Date.now()-slot.waitSince;
+        if(!slot.error && !slot.ready && waited<NATIVE_PREROLL_BOUND_MS) {
+          // Native reports not-ready itself at its own 15 s deadline; this bound only guards a lost notice.
           timer=setTimeout(()=>advance(forceId),100); return;
         }
+        if(slot.error || !slot.ready) {
+          // Bounded: outgoing surface was retained while waiting; now degrade to the serial (non-gapless) path.
+          console.warn('Native next-not-ready: serial fallback',slot.error || 'preroll timeout');
+          if(!slot.error) noteNativeRefusal(slot.key);
+          cancelStage();
+          // fall through to the serial path below
+        } else {
         const activated=new Promise(resolve=>{slot.resolve=resolve;});
         nativeSend({type:'native-activate',generation:slot.generation});
         if(await activated) {
@@ -317,7 +348,11 @@
           if(candidate.asset.kind!=='video') timer=setTimeout(()=>advance(),(candidate.duration || 120)*1000);
           lookahead(); return;
         }
-        console.warn('Native activation failed; outgoing surface retained'); return;
+        // Activation refused: never park on the outgoing surface. Degrade explicitly (non-gapless).
+        console.warn('Native activation failed; serial fallback');
+        noteNativeRefusal(slot.key);
+        if(nativeStage===slot) cancelStage();
+        }
       }
       // A staged media-free page is ready before the outgoing sink is released.
       // Reveal and removal share one browser paint task; rAF is not KMS proof.

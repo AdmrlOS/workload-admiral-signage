@@ -40,6 +40,26 @@ def decoder_config(environ):
 PAGES = {"": "", "displaylab": "", "menuboard": "menuboard/", "player": "player/", "studio": "studio/"}
 
 
+# Native standby admission (browser/standby-renderer.h standby_capacity) fails closed when
+# SIGNAGE_STANDBY_CONTEXTS / SIGNAGE_STANDBY_CMA_BYTES are unset: every native-stage is then
+# answered "not-ready" and a mixed playlist can never hand off. Ship the board-measured bound so the
+# managed OCI is admitted without per-board hand-set environment. Composition of the 4K60 bound
+# (additional to the active context): 4K decoder DPB 86 MiB + 3 native UI scanout BOs 98 MiB +
+# 36 MiB allocator reserve = 230686720 bytes; menuboard stage needs only the UI/copy pool (64 MiB).
+# Live CmaFree is still checked per stage, and any refusal degrades to the serial path in player.js.
+STANDBY_CONTEXTS = "2"
+STANDBY_CMA_BYTES = "230686720"
+STANDBY_CMA_BY_PATH = '{"/native-builtin/menuboard/index.html":67108864,"/player/":230686720}'
+
+
+def standby_defaults(environ):
+    """Return admission variables to add; explicit operator values always win."""
+    defaults = {"SIGNAGE_STANDBY_CONTEXTS": STANDBY_CONTEXTS,
+                "SIGNAGE_STANDBY_CMA_BYTES": STANDBY_CMA_BYTES,
+                "SIGNAGE_STANDBY_CMA_BY_PATH": STANDBY_CMA_BY_PATH}
+    return {k: v for k, v in defaults.items() if k not in environ}
+
+
 def start_url(environ):
     """Browser start URL: SIGNAGE_URL wins, else SIGNAGE_PAGE picks a bundled page."""
     if environ.get("SIGNAGE_URL"):
@@ -112,6 +132,7 @@ def configure():
     os.environ.setdefault("SIGNAGE_DECODER", decoder)
     os.environ.setdefault("GST_PLUGIN_FEATURE_RANK", ranks)
     os.environ["SIGNAGE_URL"] = start_url(os.environ)
+    os.environ.update(standby_defaults(os.environ))
     return data
 
 
