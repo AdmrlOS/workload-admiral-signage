@@ -64,7 +64,7 @@
     try { await engine.ready; } catch(_) { return false; }
     if(engineState==='released') {
       const back=new Promise(resolve=>{ const fn=()=>{ engine.removeEventListener('engine-ready',fn); resolve(); }; engine.addEventListener('engine-ready',fn); });
-      await engine.transport.command('acquire'); await back; engineState='ready';
+      await engine.acquire(); await back; engineState='ready';
     }
     return engineState==='ready';
   }
@@ -262,7 +262,7 @@
       item.started=resolve;
       item.watchdog=setTimeout(()=>reject(new Error('Engine video did not start')),15000);
     });
-    const ack=await engine.transport.command('acquire').then(()=>engine.play(entry.asset.url,{at:current?.engine ? 'now' : 'boundary'}));
+    const ack=await engine.acquire().then(()=>engine.play(entry.asset.url,{at:current?.engine ? 'now' : 'boundary'}));
     if(!ack.ok) { clearTimeout(item.watchdog); throw new Error('Engine refused video: '+ack.code); }
     item.playId=ack.play_id;
     if(engineRecent.includes(item.playId)) item.started(); else engineWaiters.set(item.playId,item.started);

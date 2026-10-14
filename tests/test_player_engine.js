@@ -29,6 +29,7 @@ async function harness(entries) {
     ready: new Promise((r) => { resolveReady = r; }),
     addEventListener: (t, fn) => (engineListeners[t] ??= []).push(fn), removeEventListener() {},
     transport: {command: async (cmd) => { events.push('engine:' + cmd); return {ok: true}; }},
+    acquire: async () => { events.push('engine:acquire'); return {ok: true}; },
     play: async (url, o = {}) => { const id = ++playSeq; events.push(`engine:play:${url}:${o.at}:${id}`); return {ok: true, play_id: id}; },
     cancel: async (url) => { events.push('engine:cancel:' + url); return {ok: true}; },
     hide: async () => { events.push('engine:hide'); return {ok: true}; },

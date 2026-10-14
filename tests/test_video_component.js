@@ -203,3 +203,22 @@ test('a rectangle the engine refused is retried, never remembered as sent', asyn
   assert.equal(env.posted.length, sent, 'acknowledged rectangle is not re-sent');
   video.destroy();
 });
+
+test('re-acquiring after another page held the engine re-sends our unchanged rectangle before play', async () => {
+  const env = fakeEnv();
+  const video = new api.SignageVideo(box(0, 0, 1920, 1080), env, {client: 'player'});
+  await settle();
+  const rects = () => env.posted.filter((p) => p.body?.cmd === 'rect').length;
+  assert.equal(rects(), 1);
+  video.trackNow(); await settle();
+  assert.equal(rects(), 1, 'unchanged rectangle is not re-sent while we keep ownership');
+  // another client (iframe PiP) acquired and set a small rectangle; the player takes the engine back
+  const ack = await video.acquire(); await settle();
+  assert.equal(ack.ok, true);
+  assert.equal(rects(), 2, 'rectangle re-sent after re-acquire');
+  const order = env.posted.filter((p) => p.body).map((p) => p.body.cmd);
+  assert.ok(order.lastIndexOf('rect') > order.lastIndexOf('acquire'), 'rect follows the acquire');
+  await video.play('/media/x.mp4'); 
+  assert.equal(env.posted.filter((p) => p.body?.cmd === 'play').length, 1);
+  video.destroy();
+});

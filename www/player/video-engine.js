@@ -161,6 +161,14 @@
         if (ack?.ok) { this.lastRect = key; this.trackNow(); } /* re-checks a size change meanwhile */
       }, () => { this.rectBusy = false; });
     }
+    /* (Re)take ownership of the engine. The engine keeps ONE rectangle shared by whoever owns
+     * it, so after another page/iframe held it (e.g. a picture-in-picture menu) the geometry it
+     * left behind is not ours: forget what we think was sent and send it again before any play. */
+    acquire() {
+      return Promise.resolve(this.rectPromise).catch(() => {})
+        .then(() => this.transport.command('acquire'))
+        .then((ack) => { if (ack?.ok) { this.lastRect = ''; this.trackNow(); } return ack; });
+    }
     play(url, options = {}) {
       const playId = (this.playId = this.playId + 1) + Math.floor(Math.random() * 1e6) * 1000;
       this.trackNow();
