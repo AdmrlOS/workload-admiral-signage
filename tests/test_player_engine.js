@@ -60,7 +60,7 @@ test('engine assets play through one engine and are queued gaplessly, without an
   assert.equal(h.events.some((e) => e.startsWith('engine:play')), false, 'no timed playback before engine preflight');
   await h.ready();
   const first = h.lastPlay();
-  assert.match(first, /^engine:play:\/media\/a\.mp4:boundary:/);
+  assert.match(first, /^engine:play:\/media\/a\.mp4:now:/, 'a serial start is a switch now, never a queue behind whatever the engine still holds');
   h.fire('started', {play_id: h.playId(first), asset: 'a'}); await h.settle();
   const queued = h.lastPlay();
   assert.match(queued, /^engine:play:\/media\/b\.mp4:boundary:/, 'next item is queued on the engine timeline while A plays');

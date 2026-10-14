@@ -227,6 +227,7 @@
           fields = {...fields, x: fields.x + Math.round(r.left * dpr), y: fields.y + Math.round(r.top * dpr)};
         }
         const ack = await entry.transport.command(data.cmd, fields).catch(() => ({ok: false, code: 'proxy'}));
+        try { this.hooks?.command?.({client: key, cmd: data.cmd, fields, ack, acked: Date.now(), frameSrc: entry.frame.getAttribute?.('src') || null}); } catch (_) { /* accounting only */ }
         event.source.postMessage({type: 'signage-video-host', reply: data.id, ack}, '*');
       } else if (data.op === 'close') this.drop(key);
     }

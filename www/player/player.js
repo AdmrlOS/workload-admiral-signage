@@ -39,6 +39,25 @@
   // on the engine timeline (at:'boundary') and confirmed by the first PRESENTED frame.
   let engine=null, engineBox=null, engineState='off', engineNext=null, engineHost=null;
   const engineRecent=[], engineWaiters=new Map();
+  // Every engine play request, whoever issues it, is accounted from request to first PRESENTED:
+  // serial (per page), owner token (engine client id), playlist entry, engine disposition
+  // (started/switching/queued/loading), activated, started (first PRESENTED frame) and outcome.
+  // Validation reads window.signageEngineLedger instead of inferring from skips in the log.
+  const engineLedger=[]; let engineSerial=0, enginePreparing=0;
+  window.signageEngineLedger=engineLedger;
+  function ledgerOpen(entry,via,at) {
+    const rec={serial:++engineSerial,via,entry:entry?.id ?? null,asset:entry?.asset?.id ?? null,owner:engine?.client ?? null,at,
+      requested:Date.now(),playId:null,disposition:null,code:null,acked:null,activated:null,started:null,superseded:null,
+      retries:0,outcome:'pending'};
+    engineLedger.push(rec); if(engineLedger.length>400) engineLedger.shift();
+    return rec;
+  }
+  function ledgerClose(rec,outcome,detail) {
+    if(!rec || (rec.outcome!=='pending' && rec.outcome!=='queued')) return;
+    rec.outcome=outcome; rec.closed=Date.now(); if(detail) rec.detail=detail;
+    try { console.log('[engine-ledger] '+JSON.stringify(rec)); } catch(_) { /* never let accounting break playback */ }
+  }
+  const ledgerFor=playId=>{ for(let i=engineLedger.length-1;i>=0;i--) if(engineLedger[i].playId===playId) return engineLedger[i]; return null; };
   const engineCapable=entry=>!!(entry && entry.asset.kind==='video' && entry.asset.engine && engineState!=='failed');
   // The built-in menuboard creates its videos through the engine adapter, so it needs the engine
   // controller even when no playlist item is itself an engine video.
@@ -54,6 +73,8 @@
     engine.addEventListener('engine-disconnected',()=>{ if(engineState==='ready') engineState='starting'; });
     engine.addEventListener('engine-ready',()=>{ if(engineState!=='failed') engineState='ready'; });
     engine.addEventListener('started',event=>engineStarted(event.detail));
+    engine.addEventListener('activated',event=>{ const rec=ledgerFor(event.detail.play_id); if(rec) rec.activated=Date.now(); dbg('engine activated',{play_id:event.detail.play_id,asset:event.detail.asset}); });
+    engine.addEventListener('superseded',event=>engineSuperseded(event.detail));
     engine.addEventListener('ended',event=>engineEnded(event.detail));
     engine.addEventListener('waiting',event=>dbg('engine waiting',{asset:event.detail.asset}));
     return engine;
@@ -73,9 +94,20 @@
     if(!engine || engineState!=='ready') return;
     engineNext=null; await engine.release().catch(()=>{}); engineState='released';
   }
+  function engineSuperseded(event) {
+    const rec=ledgerFor(event.play_id);
+    if(rec) { rec.superseded={by_play_id:event.by_play_id ?? null,by_client:event.by_client ?? null,by_asset:event.by_asset ?? null,t:Date.now()}; }
+    dbg('engine superseded',event);
+    // A request of OURS replaced before it ever started can never start: fail it now with the
+    // cause instead of letting the watchdog report a generic "did not start" 15 s later.
+    engineWaiters.get(event.play_id)?.reject(new Error('Engine request superseded by '+(event.by_asset||'?')+' ('+(event.by_client||'?')+')'));
+  }
   function engineStarted(event) {
+    const rec=ledgerFor(event.play_id);
+    if(rec && !rec.started) rec.started=Date.now();
     engineRecent.push(event.play_id); if(engineRecent.length>16) engineRecent.shift();
-    engineWaiters.get(event.play_id)?.(); engineWaiters.delete(event.play_id);
+    engineWaiters.get(event.play_id)?.resolve(); engineWaiters.delete(event.play_id);
+    if(rec && rec.via==='gapless' && rec.outcome==='queued') ledgerClose(rec,'started');
     if(engineNext && event.play_id===engineNext.playId && current?.engine) {
       // Gapless handoff already happened on the engine timeline; follow it.
       const entry=engineNext.entry; engineNext=null;
@@ -141,10 +173,13 @@
     warm(next);
     if(current?.engine) {
       if(engineNext && engineNext.key!==signature(next)) { engine.cancel(engineNext.entry.asset.url); engineNext=null; }
-      if(!engineNext && engineCapable(next) && engineState==='ready') {
-        const slot={key:signature(next),entry:next,playId:null}; engineNext=slot;
+      if(!engineNext && !enginePreparing && engineCapable(next) && engineState==='ready') {
+        const slot={key:signature(next),entry:next,playId:null,rec:ledgerOpen(next,'gapless','boundary')}; engineNext=slot;
         engine.play(next.asset.url,{at:'boundary'}).then(ack=>{
-          if(engineNext!==slot) return;
+          slot.rec.acked=Date.now(); slot.rec.disposition=ack.message || (ack.ok ? 'accepted' : 'refused'); slot.rec.code=ack.code ?? null;
+          if(ack.ok) { slot.rec.playId=ack.play_id; slot.rec.outcome='queued'; }
+          else ledgerClose(slot.rec,'refused',ack.code);
+          if(engineNext!==slot) { if(ack.ok) slot.rec.detail='replaced before acknowledgement'; return; }
           if(ack.ok) slot.playId=ack.play_id; else { engineNext=null; console.warn('Engine refused next item:',ack.code); }
         });
       }
@@ -256,17 +291,54 @@
       await held;
     }
   }
+  // Serial (non-gapless) start of an engine entry: the player has decided to switch to THIS clip now.
+  // It is requested at:'now' (a flushing switch inside the same pipeline, same decoder), never
+  // queued at a boundary: the engine's current clip may be a stale, hidden or paused remnant of an
+  // item the player already left (menuboard iframe, scheduled cut, watchdog), which would never
+  // reach a boundary and would starve the request until the readiness watchdog skipped the entry.
   async function prepareEngine(entry) {
     const item={entry,node:engineBox,engine:true,held:false,watchdog:0,poll:0,fired:false,playId:null};
+    const rec=ledgerOpen(entry,'serial','now');
+    enginePreparing++;
+    // The serial path owns the engine now; a gapless request queued for a clip we are leaving
+    // would race this one (its own play_id would then never start).
+    engineNext=null;
+    let fail=null;
     const started=new Promise((resolve,reject)=>{
-      item.started=resolve;
-      item.watchdog=setTimeout(()=>reject(new Error('Engine video did not start')),15000);
+      item.started=resolve; fail=reject;
+      item.watchdog=setTimeout(()=>{
+        const stage=rec.started ? 'started' : rec.activated ? 'activated' : rec.disposition || (rec.acked ? 'acknowledged' : 'unacknowledged');
+        reject(new Error('Engine video did not start ('+stage+')'));
+      },15000);
     });
-    const ack=await engine.acquire().then(()=>engine.play(entry.asset.url,{at:current?.engine ? 'now' : 'boundary'}));
-    if(!ack.ok) { clearTimeout(item.watchdog); throw new Error('Engine refused video: '+ack.code); }
-    item.playId=ack.play_id;
-    if(engineRecent.includes(item.playId)) item.started(); else engineWaiters.set(item.playId,item.started);
-    try { await started; } finally { clearTimeout(item.watchdog); engineWaiters.delete(item.playId); }
+    started.catch(()=>{});
+    try {
+      let ack;
+      // A late command of the page we are leaving (menuboard iframe) can take ownership between our
+      // acquire and play: that surfaces as not-owner. Re-acquire and re-send, bounded, never silently.
+      for(let attempt=0;attempt<3;attempt++) {
+        const owned=await engine.acquire();
+        if(owned && owned.ok===false) { rec.retries=attempt+1; rec.code=owned.code; if(attempt<2) continue; throw new Error('Engine refused ownership: '+owned.code); }
+        ack=await engine.play(entry.asset.url,{at:'now'});
+        if(ack.ok || ack.code!=='not-owner' || attempt===2) break;
+        rec.retries=attempt+1;
+      }
+      rec.acked=Date.now(); rec.disposition=ack.message || (ack.ok ? 'accepted' : 'refused'); rec.code=ack.code ?? rec.code;
+      if(!ack.ok) throw new Error('Engine refused video: '+ack.code);
+      item.playId=ack.play_id; rec.playId=ack.play_id;
+      if(engineRecent.includes(item.playId)) { rec.started=rec.started || Date.now(); item.started(); }
+      else engineWaiters.set(item.playId,{resolve:item.started,reject:fail});
+      await started;
+      ledgerClose(rec,'started');
+    } catch(error) {
+      // Leave nothing of this request behind: a queued remnant would start later, over whatever
+      // the player moved on to, or supersede the next entry's own request.
+      if(rec.playId!==null && !rec.started) Promise.resolve(engine.cancel(entry.asset.url)).catch(()=>{});
+      ledgerClose(rec,'failed',error.message);
+      throw error;
+    } finally {
+      enginePreparing--; clearTimeout(item.watchdog); if(item.playId!==null) engineWaiters.delete(item.playId);
+    }
     if(current?.engine) current.keepEngine=true; // the box now shows the new instance
     return item;
   }
@@ -516,6 +588,14 @@
       if(!engineHost && window.SignageVideo && engine) {
         engineHost=window.SignageVideo.host();
         engineHost.hooks={
+          // Page-hosted controllers (menuboard iframes) command the same engine through this proxy:
+          // account their play requests with the owner token they used, next to the player's own.
+          command:info=>{
+            if(info.cmd!=='play' && info.cmd!=='acquire' && info.cmd!=='release') return;
+            const rec=ledgerOpen(info.entry||{id:info.frameSrc||null,asset:{id:info.fields?.asset?.url||null}},'frame:'+info.cmd,info.fields?.at||null);
+            rec.owner=info.client; rec.playId=info.ack?.play_id ?? null; rec.acked=info.acked; rec.disposition=info.ack?.message || (info.ack?.ok ? 'accepted' : 'refused'); rec.code=info.ack?.code ?? null;
+            if(info.cmd==='play' && info.ack?.ok) rec.outcome='queued'; else ledgerClose(rec,info.ack?.ok ? 'ok' : 'refused',info.ack?.code);
+          },
           open:frame=>{ if(frame.dataset) frame.dataset.engineFrame='1'; engineSurface(); },
           close:frame=>{ if(frame.dataset) delete frame.dataset.engineFrame; engineSurface(); }
         };
