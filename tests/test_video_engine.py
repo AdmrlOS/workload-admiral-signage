@@ -213,6 +213,10 @@ class VideoEngineTests(EngineCase):
         status = e.status()
         self.assertEqual((status['alloc_queries'], status['caps_events']), (1, 1), 'decoder pool must never renegotiate')
         self.assertEqual(status['presented_total'], 360)
+        # late-frame accounting is REPORTED with the policy it was measured under (the appsink used
+        # by this test has QoS off; the production plane sink is asserted on in native-engine-sink)
+        self.assertIn('qos_enabled', status); self.assertEqual((status['qos_dropped'], status['qos_late_events']), (0, 0), status)
+        self.assertIn('qos_messages', status); self.assertIn('max_lateness_ns', status)
 
     def test_same_clip_loop_has_no_end_and_no_gap(self):
         e = self.engine

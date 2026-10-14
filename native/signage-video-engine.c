@@ -18,6 +18,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
+#include <gst/base/gstbasesink.h>
 #include <gst/video/video.h>
 #include <gio/gio.h>
 #include <gio/gunixsocketaddress.h>
@@ -104,6 +105,13 @@ typedef struct {
     gint rect[4]; gboolean have_rect;
     gint alloc_queries, caps_events, sink_buffers; /* atomic */
     guint64 presented_total, rebuilds;
+    /* Late-frame accounting from the pipeline's own QoS messages (sink and decoder). Never
+     * suppressed: these are the numbers that make "0 drops" mean something. */
+    guint64 qos_messages, qos_late_messages, qos_dropped_total;
+    gint64 qos_max_jitter_ns;
+    gint qos_events, qos_late_events; /* atomic: upstream QoS events leaving the sink */
+    gint64 qos_event_max_jitter_ns;   /* atomic */
+    GHashTable *qos_dropped_by; /* source element name -> its cumulative dropped count */
     guint rebuild_source;
     gchar *state;
     /* asset cache */
@@ -777,6 +785,22 @@ static void destroy_pipeline(Engine *e)
 static gboolean bus_message(GstBus *bus, GstMessage *message, gpointer data);
 static void schedule_rebuild(Engine *e, guint ms);
 
+static GstPadProbeReturn qos_event_probe(GstPad *pad, GstPadProbeInfo *info, gpointer data)
+{
+    (void)pad;
+    Engine *e = data;
+    GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+    if (event && GST_EVENT_TYPE(event) == GST_EVENT_QOS) {
+        GstQOSType type; gdouble proportion; GstClockTimeDiff diff; GstClockTime timestamp;
+        gst_event_parse_qos(event, &type, &proportion, &diff, &timestamp);
+        g_atomic_int_inc(&e->qos_events);
+        if (diff > 5 * GST_MSECOND) g_atomic_int_inc(&e->qos_late_events);
+        gint64 seen = __atomic_load_n(&e->qos_event_max_jitter_ns, __ATOMIC_RELAXED);
+        while (diff > seen && !__atomic_compare_exchange_n(&e->qos_event_max_jitter_ns, &seen, (gint64)diff, FALSE, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+    }
+    return GST_PAD_PROBE_OK;
+}
+
 static gboolean build_pipeline(Engine *e)
 {
     e->pipeline = gst_pipeline_new("signage-video-engine");
@@ -826,6 +850,7 @@ static gboolean build_pipeline(Engine *e)
     gst_object_unref(pad);
     pad = gst_element_get_static_pad(e->sink, "sink");
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, sink_probe, e, NULL);
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, qos_event_probe, e, NULL);
     gst_object_unref(pad);
     GstBus *bus = gst_element_get_bus(e->pipeline);
     gst_bus_add_watch(bus, bus_message, e);
@@ -977,6 +1002,24 @@ static gboolean bus_message(GstBus *bus, GstMessage *message, gpointer data)
         if (!e->recovering) { e->recovering = TRUE; g_idle_add(recover, e); }
         break;
     }
+    case GST_MESSAGE_QOS: {
+        gint64 jitter = 0; gdouble proportion = 1.0; gint quality = 0;
+        gst_message_parse_qos_values(message, &jitter, &proportion, &quality);
+        GstFormat format = GST_FORMAT_UNDEFINED; guint64 processed = 0, dropped = 0;
+        gst_message_parse_qos_stats(message, &format, &processed, &dropped);
+        e->qos_messages++;
+        if (jitter > 5 * GST_MSECOND) e->qos_late_messages++;
+        if (jitter > e->qos_max_jitter_ns) e->qos_max_jitter_ns = jitter;
+        if (dropped != (guint64)-1 && GST_MESSAGE_SRC(message)) {
+            if (!e->qos_dropped_by) e->qos_dropped_by = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+            guint64 *slot = g_hash_table_lookup(e->qos_dropped_by, GST_OBJECT_NAME(GST_MESSAGE_SRC(message)));
+            if (!slot) { slot = g_new0(guint64, 1); g_hash_table_insert(e->qos_dropped_by, g_strdup(GST_OBJECT_NAME(GST_MESSAGE_SRC(message))), slot); }
+            if (dropped > *slot) { e->qos_dropped_total += dropped - *slot; *slot = dropped; }
+            if (dropped) g_warning("Engine QoS: %s dropped=%" G_GUINT64_FORMAT " processed=%" G_GUINT64_FORMAT " jitter=%.1f ms",
+                                   GST_OBJECT_NAME(GST_MESSAGE_SRC(message)), dropped, processed, jitter / 1e6);
+        }
+        break;
+    }
     case GST_MESSAGE_EOS:
         g_warning("Engine pipeline unexpectedly reached EOS");
         break;
@@ -1016,6 +1059,23 @@ static void emit_status(Engine *e, gint64 seq)
     ADD_INT(b, "caps_events", g_atomic_int_get(&e->caps_events));
     ADD_INT(b, "presented_total", e->presented_total);
     ADD_INT(b, "rebuilds", e->rebuilds);
+    {   /* what the late-frame policy actually is, and what it has done */
+        GstElement *plane = e->pipeline ? gst_bin_get_by_name(GST_BIN(e->pipeline), "admiral-video-plane") : NULL;
+        GstElement *policy = plane ? plane : e->sink;
+        if (policy && GST_IS_BASE_SINK(policy)) {
+            ADD_BOOL(b, "qos_enabled", gst_base_sink_is_qos_enabled(GST_BASE_SINK(policy)));
+            ADD_INT(b, "max_lateness_ns", gst_base_sink_get_max_lateness(GST_BASE_SINK(policy)));
+            ADD_BOOL(b, "sink_sync", gst_base_sink_get_sync(GST_BASE_SINK(policy)));
+        }
+        if (plane) gst_object_unref(plane);
+        ADD_INT(b, "qos_messages", e->qos_messages);
+        ADD_INT(b, "qos_late_messages", e->qos_late_messages);
+        ADD_INT(b, "qos_dropped", e->qos_dropped_total);
+        ADD_INT(b, "qos_max_jitter_ns", e->qos_max_jitter_ns);
+        ADD_INT(b, "qos_events", g_atomic_int_get(&e->qos_events));
+        ADD_INT(b, "qos_late_events", g_atomic_int_get(&e->qos_late_events));
+        ADD_INT(b, "qos_event_max_jitter_ns", __atomic_load_n(&e->qos_event_max_jitter_ns, __ATOMIC_RELAXED));
+    }
     if (e->have_rect) {
         json_builder_set_member_name(b, "rect"); json_builder_begin_array(b);
         for (int k = 0; k < 4; k++) json_builder_add_int_value(b, e->rect[k]);
