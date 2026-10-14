@@ -81,11 +81,10 @@ typedef struct {
     ScanoutBuffer *scanout; /* pool buffer (GPU copy); its fb is owned by the pool */
     int fence_fd;           /* GPU copy completion (IN_FENCE_FD), or -1 */
     gint64 exported_us;     /* monotonic time WPE exported it (flip trace) */
-} Frame;
     int dmabuf_fd;          /* dup of the direct-scanout dma-buf, for implicit-fence readiness, or -1 */
     gboolean render_done;   /* WPE's GPU rendering into the dma-buf is known complete */
+} Frame;
 
-/* Opt-in (SIGNAGE_FLIP_TRACE) bounded ring: export -> commit -> kernel vblank
 /* linux/dma-buf.h (6.0+); declared here so older build sysroots still compile. */
 #ifndef DMA_BUF_IOCTL_EXPORT_SYNC_FILE
 struct signage_dma_buf_export_sync_file { uint32_t flags; int32_t fd; };
@@ -96,6 +95,7 @@ struct signage_dma_buf_export_sync_file { uint32_t flags; int32_t fd; };
 #define DMA_BUF_SYNC_READ_FLAG DMA_BUF_SYNC_READ
 #endif
 
+/* Opt-in (SIGNAGE_FLIP_TRACE) bounded ring: export -> commit -> kernel vblank
  * timestamp -> userspace receipt. Written with plain stores on the main loop;
  * only anomalies are logged, so it does not perturb the flip path. */
 typedef struct { gint64 exported, submitted, commit_us; gboolean ui, video; } FlipTraceEntry;
@@ -692,13 +692,13 @@ static Frame *frame_new(void)
 {
     Frame *frame = g_new0(Frame, 1);
     frame->fence_fd = -1;
-    return frame;
     frame->dmabuf_fd = -1;
+    return frame;
 }
 
 static gboolean frame_ready(const Frame *frame);
-static gboolean retry_fence(gpointer data);
 static gboolean frame_render_done(Frame *frame);
+static gboolean retry_fence(gpointer data);
 
 static void release_frame(Browser *browser, Frame *frame)
 {
@@ -710,8 +710,8 @@ static void release_frame(Browser *browser, Frame *frame)
         return; /* GPU is still sampling WPE's storage */
     }
     if (frame->fence_fd >= 0) close(frame->fence_fd);
-    if (frame->fb && !frame->scanout) drmModeRmFB(browser->fd, frame->fb);
     if (frame->dmabuf_fd >= 0) close(frame->dmabuf_fd);
+    if (frame->fb && !frame->scanout) drmModeRmFB(browser->fd, frame->fb);
     for (unsigned i = 0; i < frame->n_planes; i++) {
         gboolean unique = TRUE;
         for (unsigned j = 0; j < i; j++) if (frame->handles[j] == frame->handles[i]) unique = FALSE;
@@ -801,7 +801,6 @@ static void retire_dead_generation_if_idle(Browser *browser)
 
 /* Never enqueue an unsignalled UI fence on the CRTC: it would stall video too.
  * Poll only; retain the queued UI and the last completed primary state. */
-static gboolean frame_ready(const Frame *frame)
 /* Direct scanout hands the kernel WPE's own dma-buf with only an IMPLICIT fence (the GPU may
  * still be drawing). The kernel then blocks the whole atomic commit on that fence, and a UI
  * frame that takes two vblanks to render also holds the video plane's update for two vblanks
@@ -826,6 +825,7 @@ static gboolean frame_render_done(Frame *frame)
     return done;
 }
 
+static gboolean frame_ready(const Frame *frame)
 {
     if (!frame || frame->fence_fd < 0) return TRUE;
     struct pollfd fence = { .fd = frame->fence_fd, .events = POLLIN };
@@ -1349,8 +1349,8 @@ static Frame *import_direct(Browser *browser, struct wpe_view_backend_exportable
     }
     if (valid) {
         frame->resource = resource->buffer_resource;
-        return frame;
         frame->dmabuf_fd = resource->n_planes ? fcntl(resource->fds[0], F_DUPFD_CLOEXEC, 3) : -1;
+        return frame;
     }
     *reason = g_strdup_printf("%s failed: %s; size=%ux%u (UI %ux%u) format=0x%08x planes=%u modifier=0x%016" PRIx64,
                               step, g_strerror(saved_errno), resource->width, resource->height, browser->ui_width, browser->ui_height,
