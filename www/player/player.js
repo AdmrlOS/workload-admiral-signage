@@ -554,7 +554,11 @@
       // Serial video fallback is explicitly non-gapless: no spare decoder is
       // supported by the broker. Never disguise a frozen poster as motion.
       const nextPoster = candidate && candidate.asset.kind === 'video' ? candidate.asset.poster : null;
-      try { await hold(current, nextPoster); } catch (_) { /* Retain its visible surface while attempting the next item. */ }
+      // With the persistent engine a page owns no decoder, so freezing it (pausing every animation)
+      // before the next item is loaded only shows a stuck frame for the whole load. Keep it live,
+      // build the next item underneath, and swap in one step.
+      const keepLive = !!engine && current?.node?.tagName === 'IFRAME';
+      if (!keepLive) { try { await hold(current, nextPoster); } catch (_) { /* Retain its visible surface while attempting the next item. */ } }
       let next = null;
       const attempts=playlist.length;
       for (let i=0;i<attempts;i++) {

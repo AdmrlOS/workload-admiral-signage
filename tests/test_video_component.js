@@ -240,3 +240,19 @@ test('rect inside a CSS-zoomed fixed canvas is scaled by the body zoom (WPE repo
   const zoomed = {ownerDocument: mkDoc(133.33), getBoundingClientRect: () => ({left: 1706.67, top: 960, right: 2560, bottom: 1440})};
   assert.deepEqual(api.physicalRect(zoomed, env), {x: 1707, y: 960, w: 853, h: 480});
 });
+
+test('an iframe page component clips a hole through its opaque page at the box and closes it on destroy', async () => {
+  const env = fakeEnv({dpr: 1});
+  env.parent = {}; /* inside an iframe */
+  const style = () => { const m = new Map(); return {setProperty: (k, v) => m.set(k, v), getPropertyValue: (k) => m.get(k) || '', removeProperty: (k) => m.delete(k), m}; };
+  const doc = {documentElement: {style: style()}, body: {style: style(), getBoundingClientRect: () => ({left: 0, top: 0})}};
+  doc.defaultView = {getComputedStyle: () => ({zoom: '1'})};
+  const el = {style: {}, ownerDocument: doc, getBoundingClientRect: () => ({left: 1280, top: 720, right: 1920, bottom: 1080})};
+  const video = new api.SignageVideo(el, env, {client: 'pip', transport: {addEventListener() {}, open: async () => {}, command: async () => ({ok: true}), close() {}}});
+  await settle(); await settle();
+  assert.match(doc.body.style.getPropertyValue('clip-path'), /evenodd.*1280px 720px, 1920px 720px, 1920px 1080px, 1280px 1080px/);
+  assert.equal(doc.documentElement.style.getPropertyValue('background'), 'transparent');
+  video.destroy();
+  assert.equal(doc.body.style.getPropertyValue('clip-path'), '');
+  assert.equal(doc.documentElement.style.getPropertyValue('background'), '');
+});

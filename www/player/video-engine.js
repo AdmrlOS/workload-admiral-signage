@@ -117,6 +117,32 @@
     return {x, y, w: Math.max(0, Math.round((r.right * s + offset.x) * dpr) - x), h: Math.max(0, Math.round((r.bottom * s + offset.y) * dpr) - y)};
   }
 
+  /* The video plane is BELOW the page, so every page layer over the box must be transparent.
+   * Opaque page backgrounds (html/body, scene gradients, the box's own parents) would hide it:
+   * clear the root backgrounds and clip a hole through <body> exactly at the box. */
+  function punchHole(element, scale) {
+    const doc = element.ownerDocument, body = doc?.body;
+    if (!body?.style || !doc.documentElement?.style) return '';
+    const zoom = parseFloat(doc.defaultView?.getComputedStyle?.(body).zoom) || 1, k = scale / zoom;
+    const e = element.getBoundingClientRect(), b = body.getBoundingClientRect();
+    const [x1, y1, x2, y2] = [(e.left - b.left) * k, (e.top - b.top) * k, (e.right - b.left) * k, (e.bottom - b.top) * k]
+      .map((v) => Math.round(v * 100) / 100 + 'px');
+    const far = '-100000px -100000px, 100000px -100000px, 100000px 100000px, -100000px 100000px, -100000px -100000px';
+    const clip = `polygon(evenodd, ${far}, ${x1} ${y1}, ${x2} ${y1}, ${x2} ${y2}, ${x1} ${y2}, ${x1} ${y1})`;
+    if (body.style.getPropertyValue('clip-path') !== clip) {
+      doc.documentElement.style.setProperty('background', 'transparent', 'important');
+      body.style.setProperty('background', 'transparent', 'important');
+      body.style.setProperty('clip-path', clip, 'important');
+    }
+    return clip;
+  }
+  function closeHole(element) {
+    const doc = element?.ownerDocument;
+    if (!doc?.body?.style) return;
+    doc.body.style.removeProperty('clip-path'); doc.body.style.removeProperty('background');
+    doc.documentElement?.style?.removeProperty('background');
+  }
+
   /* One controller per page instance; only one independent video at a time. */
   class SignageVideo extends Emitter {
     constructor(element, env, options = {}) {
@@ -170,6 +196,7 @@
       if (!this.element || this.closed || !this.acquired) return;
       const rect = physicalRect(this.element, this.env);
       if (rect.w <= 0 || rect.h <= 0) return;
+      if (this.env.parent && this.env.parent !== this.env.window) punchHole(this.element, bodyZoom(this.element));
       const key = JSON.stringify(rect);
       if (key === this.lastRect || this.rectBusy) return;
       /* Remember a rectangle only once the engine acknowledged it: a rect sent while the engine
@@ -209,6 +236,7 @@
     destroy() {
       if (this.closed) return;
       this.closed = true; this.env.clearTimeout(this._timer); this._ro?.disconnect();
+      closeHole(this.element);
       this.transport.command('hide').catch?.(() => {});
       this.transport.close();
     }
