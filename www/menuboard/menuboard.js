@@ -393,6 +393,9 @@
 
   /* ---------------- boot ---------------- */
   buildA(); buildC(); buildMarks();
+  // A frozen single scene never uses the curtain: drop it before the first paint, so the page
+  // reports ready with the real menu on screen instead of the green splash.
+  if (/^[ABC]$/.test(only) && freeze && !Q.has('native_stage')) curtain.style.display = 'none';
   const boot = async () => {
     if (Q.has('native_stage')) {
       console.log('[native-menu] boot');
