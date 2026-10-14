@@ -9,7 +9,7 @@ IMAGE=${SIGNAGE_TEST_IMAGE:-admiral-signage-toolchain:local}
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker buildx build --platform linux/arm64 --target toolchain --load -t "$IMAGE" "$ROOT"
 fi
-exec docker run --rm --platform linux/arm64 -e SIGNAGE_TEST_PATTERN="${1:-}" -e SIGNAGE_SLOW="${SIGNAGE_SLOW:-}" \
+exec docker run --rm --platform linux/arm64 -e SIGNAGE_TEST_PATTERN="${1:-}" -e SIGNAGE_SLOW="${SIGNAGE_SLOW:-}" -e SIGNAGE_RT_STRICT="${SIGNAGE_RT_STRICT:-}" \
     -e GST_DEBUG=1 -e G_MESSAGES_DEBUG= -v "$ROOT:/src:ro" "$IMAGE" bash -euo pipefail -c '
 cp -a /src /work && cd /work
 SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
