@@ -2,6 +2,8 @@
  * Engine-mode plane sink behaviour against the actual Gst source (no DRM/decoder).
  * Built with ASAN/UBSAN by tests/run-native-tests.sh in the ARM64 toolchain image.
  */
+#define _GNU_SOURCE
+#include <sys/mman.h>
 #include "../native/gst-admiral-videoplane.c"
 #include <assert.h>
 #include <fcntl.h>
@@ -175,6 +177,75 @@ int main(int argc, char **argv)
         }
         assert(n == 2 && seen[0] == 50000000 && seen[1] == 66666666);
         g_mutex_lock(&self->lock); assert(self->last_presented); g_mutex_unlock(&self->lock);
+        gst_element_set_bus(GST_ELEMENT(self), NULL); gst_object_unref(bus);
+        finish(self, s[1]);
+    }
+
+    /* 8. END TO END through the real show_locked(): rectangle changes (including while the frame
+     *    is still pending), full->PiP->full, hide/show restore and an off-screen frame that
+     *    returns on screen. Every PTS is reported PRESENTED exactly once, in order; re-shows are
+     *    geometry only and each of them still consumes and returns a credit. */
+    {
+        AdmiralPlaneSink *self = new_sink(s, TRUE);
+        GstBus *bus = gst_bus_new();
+        gst_element_set_bus(GST_ELEMENT(self), bus);
+        GstAllocator *alloc = gst_dmabuf_allocator_new();
+        GstBuffer *frames[3]; guint32 fbs[3]; guint64 ptss[3] = { 0, 16666666, 33333333 };
+        for (int i = 0; i < 3; i++) {
+            int fd = memfd_create("frame", 0); assert(fd >= 0 && ftruncate(fd, 64 * 32 * 3 / 2) == 0);
+            frames[i] = gst_buffer_new(); gst_buffer_append_memory(frames[i], gst_dmabuf_allocator_alloc(alloc, fd, 64 * 32 * 3 / 2));
+            GST_BUFFER_PTS(frames[i]) = ptss[i]; GST_BUFFER_DURATION(frames[i]) = 16666666;
+            struct stat st; assert(fstat(fd, &st) == 0);
+            GString *key = g_string_new(NULL);
+            for (guint p = 0; p < 2; p++)
+                g_string_append_printf(key, "%lu:%u:%u;", (unsigned long)st.st_ino, (guint)GST_VIDEO_INFO_PLANE_OFFSET(&self->info, p), (guint)GST_VIDEO_INFO_PLANE_STRIDE(&self->info, p));
+            g_string_append_printf(key, "%dx%d", GST_VIDEO_INFO_WIDTH(&self->info), GST_VIDEO_INFO_HEIGHT(&self->info));
+            fbs[i] = 100 + i;
+            g_mutex_lock(&self->lock); g_hash_table_insert(self->framebuffers, g_string_free(key, FALSE), GUINT_TO_POINTER(fbs[i])); g_mutex_unlock(&self->lock);
+        }
+        GstVideoOverlay *overlay = GST_VIDEO_OVERLAY(self);
+        SignageVideoMessage got; guint32 pending[8]; int npending = 0;
+#define EXPECT(t, fbv) do { assert(readable(s[1], 500)); assert(recv(s[1], &got, sizeof got, MSG_WAITALL) == sizeof got); \
+    assert(got.type == (t)); if (fbv) assert(got.fb == (fbv)); } while (0)
+#define SHOWN(fbv) do { EXPECT(SIGNAGE_VIDEO_SHOW, fbv); pending[npending++] = got.serial; } while (0)
+#define PRESENT(fbv) do { assert(npending > 0); SignageVideoMessage pm = { .type = SIGNAGE_VIDEO_PRESENTED, .fb = (fbv), .serial = pending[0] }; \
+    memmove(pending, pending + 1, --npending * sizeof pending[0]); assert(send(s[1], &pm, sizeof pm, 0) == sizeof pm); g_usleep(20000); } while (0)
+        gst_video_overlay_set_render_rectangle(overlay, 0, 0, 3840, 2160);
+        assert(admiral_plane_sink_show_frame(GST_VIDEO_SINK(self), frames[0]) == GST_FLOW_OK);
+        SHOWN(fbs[0]);
+        /* rectangle change while frame 0 is still pending (not yet PRESENTED) */
+        gst_video_overlay_set_render_rectangle(overlay, 2400, 100, 1200, 675);
+        SHOWN(fbs[0]);
+        PRESENT(fbs[0]); PRESENT(fbs[0]);
+        /* PiP -> full -> PiP, each ack'd before the next (credit returns every time) */
+        gst_video_overlay_set_render_rectangle(overlay, 0, 0, 3840, 2160); SHOWN(fbs[0]); PRESENT(fbs[0]);
+        gst_video_overlay_set_render_rectangle(overlay, 2400, 100, 1200, 675); SHOWN(fbs[0]); PRESENT(fbs[0]);
+        /* hide / restore */
+        admiral_plane_sink_set_visible(GST_ELEMENT(self), FALSE); EXPECT(SIGNAGE_VIDEO_HIDE, 0);
+        admiral_plane_sink_set_visible(GST_ELEMENT(self), TRUE); SHOWN(fbs[0]); PRESENT(fbs[0]);
+        /* a genuinely new frame, then a rectangle change while it is pending */
+        assert(admiral_plane_sink_show_frame(GST_VIDEO_SINK(self), frames[1]) == GST_FLOW_OK); SHOWN(fbs[1]);
+        gst_video_overlay_set_render_rectangle(overlay, 0, 0, 3840, 2160); SHOWN(fbs[1]);
+        PRESENT(fbs[1]); PRESENT(fbs[1]);
+        /* cancelled re-show: no PRESENTED, credit returned (the next re-show must not time out) */
+        gst_video_overlay_set_render_rectangle(overlay, 2400, 100, 1200, 675); SHOWN(fbs[1]);
+        { SignageVideoMessage cm = { .type = SIGNAGE_VIDEO_CANCELLED, .fb = fbs[1], .serial = pending[0] }; npending = 0;
+          assert(send(s[1], &cm, sizeof cm, 0) == sizeof cm); g_usleep(30000); }
+        /* a frame that arrives while entirely off screen, then comes on screen */
+        gst_video_overlay_set_render_rectangle(overlay, 5000, 5000, 100, 100);
+        assert(admiral_plane_sink_show_frame(GST_VIDEO_SINK(self), frames[2]) == GST_FLOW_OK);
+        gst_video_overlay_set_render_rectangle(overlay, 0, 0, 3840, 2160);
+        { while (readable(s[1], 30)) { assert(recv(s[1], &got, sizeof got, MSG_WAITALL) == sizeof got);
+            if (got.type == SIGNAGE_VIDEO_SHOW) { assert(got.fb == fbs[2]); pending[npending++] = got.serial; } } }
+        assert(npending == 1); PRESENT(fbs[2]);
+        guint64 seen[8]; int n = 0;
+        for (GstMessage *m; n < 8 && (m = gst_bus_timed_pop_filtered(bus, 200 * GST_MSECOND, GST_MESSAGE_ELEMENT)); ) {
+            guint64 pts = 0; assert(gst_structure_get_uint64(gst_message_get_structure(m), "pts", &pts)); seen[n++] = pts; gst_message_unref(m);
+        }
+        assert(n == 3 && seen[0] == 0 && seen[1] == 16666666 && seen[2] == 33333333);
+        g_mutex_lock(&self->lock); assert(g_hash_table_size(self->unpresented) == 0 && g_hash_table_size(self->identities) == 0); g_mutex_unlock(&self->lock);
+        for (int i = 0; i < 3; i++) gst_buffer_unref(frames[i]);
+        gst_object_unref(alloc);
         gst_element_set_bus(GST_ELEMENT(self), NULL); gst_object_unref(bus);
         finish(self, s[1]);
     }

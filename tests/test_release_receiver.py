@@ -30,7 +30,7 @@ typedef struct { guint32 serial; } HeldFrame;
 typedef struct { GMutex lock; GCond receiver_wake; gboolean receiver_stop, disconnected;
 int socket; GHashTable *held, *unpresented, *identities, *presented_pts; guint32 awaiting_fb, awaiting_serial; guint64 presented_total; gboolean trace_presented;
 guint8 incoming[sizeof(SignageVideoMessage)]; gsize incoming_length; VideoLedger *ledger; GMutex ledger_lock;
-guint32 last_fb, serial, last_presented_serial; gboolean presentation_failed, standby, prepared, activated_preroll; guint64 generation; gboolean engine; GArray *notify; } AdmiralPlaneSink;
+guint32 last_fb, serial, last_presented_serial; gboolean last_presented, last_identity_sent, presentation_failed, standby, prepared, activated_preroll; guint64 generation; gboolean engine; GArray *notify; } AdmiralPlaneSink;
 static void note_presented(AdmiralPlaneSink *s, guint64 p, guint32 a, guint32 b) { (void)s; (void)p; (void)a; (void)b; }
 static void post_presented_unlocked(AdmiralPlaneSink *s) { (void)s; }
 ''' + parser + r'''

@@ -27,7 +27,7 @@ frame.fence_fd=-1; assert(frame_ready(&frame)); assert(frame_ready(0)); return 0
             (path/'test.c').write_text(harness)
             subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(path/'test.c'),'-o',str(path/'test')],check=True)
             subprocess.run([str(path/'test')],check=True)
-        self.assertIn('if (frame && !frame_ready(frame))', source)
+        self.assertIn('if (frame && (!frame_ready(frame) || !frame_render_done(frame)))', source)
         self.assertIn('if (!video->dirty) return TRUE;', source)
 
     def test_release_receiver_independent_of_render_and_joined(self):

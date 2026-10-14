@@ -57,7 +57,8 @@ typedef struct {
     GHashTable *framebuffers; /* "inode:offsets:strides" -> fb */
     GHashTable *held;         /* fb -> HeldFrame, until the browser releases it */
     GstBuffer *last;          /* re-shown when the rectangle changes */
-    gboolean last_presented;  /* `last` already produced a PRESENTED identity: re-shows are geometry only */
+    gboolean last_presented;  /* PRESENTED was received for `last` */
+    gboolean last_identity_sent; /* a SHOW carrying `last`'s PTS identity was sent: every later re-show is geometry only */
     guint32 last_fb, serial;
     guint32 last_presented_serial;
     gboolean presentation_failed; /* cancellation is not successful EOS */
@@ -440,8 +441,8 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     }
     /* Re-SHOWing the frame already on screen (rectangle change, expose, visibility restore)
      * moves/refreshes the plane; it must not report a second PRESENTED identity for that PTS. */
-    gboolean reshow = self->engine && buffer == self->last && self->last_presented;
-    if (buffer != self->last) { gst_buffer_replace(&self->last, buffer); self->last_presented = FALSE; }
+    gboolean reshow = self->engine && buffer == self->last && self->last_identity_sent;
+    if (buffer != self->last) { gst_buffer_replace(&self->last, buffer); self->last_presented = FALSE; self->last_identity_sent = FALSE; }
     self->last_fb = fb;
     GstClockTime interval = GST_BUFFER_DURATION(buffer);
     if (!GST_CLOCK_TIME_IS_VALID(interval) || !interval) interval = GST_VIDEO_INFO_FPS_N(&self->info) > 0 ?
@@ -479,6 +480,7 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     if (message.serial <= 5) g_message("Video identity: serial=%u pts=%" G_GUINT64_FORMAT " duration=%" G_GUINT64_FORMAT, message.serial, *pts, GST_BUFFER_DURATION(buffer));
     g_hash_table_insert(self->identities, GUINT_TO_POINTER(message.serial), pts);
     if (!send_message(self, &message)) return GST_FLOW_ERROR;
+    if (!reshow) self->last_identity_sent = TRUE;
     if (self->ledger) {
         g_mutex_lock(&self->ledger_lock);
         video_ledger_record(self->ledger, g_get_monotonic_time(),
