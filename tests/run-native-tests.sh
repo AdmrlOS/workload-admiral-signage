@@ -18,7 +18,7 @@ PKGS="gstreamer-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gstreamer-app-1
 export ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 export GST_REGISTRY=/tmp/gst-registry.bin
 mkdir -p /tmp/bin
-for test in tests/native-engine-sink.c tests/native-engine-broker.c tests/native-engine-core.c; do
+for test in tests/native-engine-sink.c tests/native-engine-broker.c tests/native-engine-core.c tests/native-engine-realtime.c; do
     [ -f "$test" ] || continue
     case "$test" in *"${SIGNAGE_TEST_PATTERN}"*) ;; *) continue ;; esac
     name=$(basename "$test" .c)

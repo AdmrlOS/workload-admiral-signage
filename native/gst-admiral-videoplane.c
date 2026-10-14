@@ -53,6 +53,16 @@ typedef struct {
     gboolean have_info, disconnected, standby, prepared, activated_preroll;
     guint64 generation;
     guint64 last_interval_us;
+    /* Geometry-only refreshes (rectangle change, expose) of a stream that is delivering frames
+     * are folded into the next frame's SHOW instead of spending a display slot of their own:
+     * the plane takes one commit per vblank, so a separate re-SHOW at a source rate equal to
+     * the refresh rate delays every following frame by a whole vblank and the lateness never
+     * recovers (measured: p50 +76 ms, 454 late-QoS events, 7 frames dropped per 10 s with a
+     * rectangle change every 400 ms). An idle stream (paused/still frame) is refreshed by the
+     * receiver thread once no frame has arrived for the window. defer_us < 0: derive from the
+     * frame interval; 0: always refresh immediately. */
+    gint64 last_frame_us, defer_us;
+    gboolean geometry_pending;
     GstVideoRectangle render; /* CRTC coordinates; w == 0 means "whole mode" */
     GHashTable *framebuffers; /* "inode:offsets:strides" -> fb */
     GHashTable *held;         /* fb -> HeldFrame, until the browser releases it */
@@ -153,6 +163,9 @@ post_presented_unlocked(AdmiralPlaneSink *self)
     g_mutex_lock(&self->lock);
 }
 
+static gboolean stream_is_delivering(AdmiralPlaneSink *self, gint64 now);
+static GstFlowReturn reshow_last_locked(AdmiralPlaneSink *self);
+
 /* Reads RELEASED messages; waits up to timeout_ms for the first one. Lock held. */
 static void
 drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
@@ -245,6 +258,15 @@ static gpointer release_receiver(gpointer data)
         drain_releases(self, 0);
         post_presented_unlocked(self);
         if (self->receiver_stop) break;
+        /* Idle stream with a deferred geometry change: refresh it now. A credit is free, so
+         * the re-SHOW cannot block this thread (it is the one that drains acknowledgements). */
+        if (self->geometry_pending && !stream_is_delivering(self, g_get_monotonic_time())) {
+            self->geometry_pending = FALSE;
+            if (self->last && self->have_info && self->socket >= 0 && !self->disconnected && !self->flushing) {
+                if (g_hash_table_size(self->unpresented) <= 1) reshow_last_locked(self);
+                else self->geometry_pending = TRUE;
+            }
+        }
         g_cond_wait_until(&self->receiver_wake, &self->lock,
                           g_get_monotonic_time() + 5000);
     }
@@ -421,6 +443,24 @@ reshow_last_locked(AdmiralPlaneSink *self)
     return result;
 }
 
+/* True while real frames are arriving, so a geometry refresh can ride on the next one. */
+static gboolean
+stream_is_delivering(AdmiralPlaneSink *self, gint64 now)
+{
+    gint64 window = self->defer_us;
+    if (window < 0) window = MAX((gint64)(self->last_interval_us ? self->last_interval_us : 16667) * 5 / 2, 20000);
+    return self->engine && window > 0 && self->last_frame_us && now - self->last_frame_us < window;
+}
+
+/* Rectangle change / expose of the frame on screen. Lock held. */
+static GstFlowReturn
+refresh_geometry_locked(AdmiralPlaneSink *self)
+{
+    if (stream_is_delivering(self, g_get_monotonic_time())) { self->geometry_pending = TRUE; return GST_FLOW_OK; }
+    self->geometry_pending = FALSE;
+    return reshow_last_locked(self);
+}
+
 static GstFlowReturn
 show_locked(AdmiralPlaneSink *self, GstBuffer *buffer, gboolean reshow_call)
 {
@@ -499,6 +539,7 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer, gboolean reshow_call)
     g_hash_table_insert(self->identities, GUINT_TO_POINTER(message.serial), pts);
     if (!send_message(self, &message)) return GST_FLOW_ERROR;
     if (!reshow) self->last_identity_sent = TRUE;
+    if (!reshow_call) { self->last_frame_us = g_get_monotonic_time(); self->geometry_pending = FALSE; }
     if (self->ledger) {
         g_mutex_lock(&self->ledger_lock);
         video_ledger_record(self->ledger, g_get_monotonic_time(),
@@ -623,6 +664,32 @@ static GstPadProbeReturn ledger_upstream(GstPad *pad, GstPadProbeInfo *info, gpo
     return GST_PAD_PROBE_OK;
 }
 
+/* FLUSH_START bookkeeping (lock held). Serial is never reset: late outcomes cannot alias
+ * post-seek SHOWs. Held references stay until independent RELEASED retirement.
+ *
+ * An engine sink keeps its SHOW credits (`unpresented`) across the flush: the browser still
+ * owns those frames (one in flight, one queued) until it sends their PRESENTED/CANCELLED. The
+ * first post-flush SHOW would otherwise be a third outstanding frame and overflow the
+ * browser's two-slot FIFO, which disconnects the sink (observed after 48 min: engine abort
+ * -5 at a clip cut). The post-flush streaming thread simply waits for the browser's
+ * acknowledgements in wait_credit(), which is the intended backpressure. An HTML sink sends
+ * HIDE instead, which makes the browser cancel (and acknowledge) everything synchronously, so
+ * it may forget its credits. Only identities (PTS of the flushed timeline) are dropped. */
+static void
+flush_start_locked(AdmiralPlaneSink *self)
+{
+    self->flushing = TRUE;
+    if (!self->engine) {
+        SignageVideoMessage hide = { .type = SIGNAGE_VIDEO_HIDE };
+        /* The engine flushes for seeks and immediate switches inside one presentation:
+         * keep the last frame on the plane until the next SHOW replaces it. */
+        if (self->socket >= 0 && !self->disconnected) send_message(self, &hide);
+        g_hash_table_remove_all(self->unpresented);
+    }
+    g_hash_table_remove_all(self->identities);
+    g_cond_broadcast(&self->receiver_wake);
+}
+
 static gboolean admiral_plane_sink_query(GstElement *element, GstQuery *query)
 {
     GstBaseSink *base = GST_BASE_SINK(element);
@@ -681,16 +748,7 @@ static gboolean admiral_plane_sink_event(GstBaseSink *base, GstEvent *event)
     }
     if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_START) {
         g_mutex_lock(&self->lock);
-        self->flushing = TRUE;
-        SignageVideoMessage hide = { .type = SIGNAGE_VIDEO_HIDE };
-        /* The engine flushes for seeks and immediate switches inside one presentation:
-         * keep the last frame on the plane until the next SHOW replaces it. */
-        if (!self->engine && self->socket >= 0 && !self->disconnected) send_message(self, &hide);
-        /* Serial is never reset: late outcomes cannot alias post-seek SHOWs.
-         * Keep held references until independent RELEASED retirement. */
-        g_hash_table_remove_all(self->unpresented);
-        g_hash_table_remove_all(self->identities);
-        g_cond_broadcast(&self->receiver_wake);
+        flush_start_locked(self);
         g_mutex_unlock(&self->lock);
     }
     if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
@@ -822,6 +880,7 @@ admiral_plane_sink_start(GstBaseSink *base)
     g_hash_table_remove_all(self->identities);
     g_hash_table_remove_all(self->presented_pts);
     self->hidden = TRUE;
+    self->geometry_pending = FALSE;
     if (ok && !self->receiver) {
         self->receiver_stop = FALSE;
         self->receiver = g_thread_new("video-releases", release_receiver, self);
@@ -883,7 +942,7 @@ admiral_plane_sink_set_render_rectangle(GstVideoOverlay *overlay, gint x, gint y
     if (self->render.x != x || self->render.y != y || self->render.w != width || self->render.h != height) {
         self->render = (GstVideoRectangle){ x, y, width, height };
         GST_DEBUG_OBJECT(self, "Render rectangle %d,%d %dx%d", x, y, width, height);
-        if (self->last && self->have_info && self->socket >= 0 && !self->disconnected) reshow_last_locked(self);
+        if (self->last && self->have_info && self->socket >= 0 && !self->disconnected) refresh_geometry_locked(self);
     }
     g_mutex_unlock(&self->lock);
 }
@@ -893,7 +952,7 @@ admiral_plane_sink_expose(GstVideoOverlay *overlay)
 {
     AdmiralPlaneSink *self = (AdmiralPlaneSink *)overlay;
     g_mutex_lock(&self->lock);
-    if (self->last && self->have_info && self->socket >= 0 && !self->disconnected) reshow_last_locked(self);
+    if (self->last && self->have_info && self->socket >= 0 && !self->disconnected) refresh_geometry_locked(self);
     g_mutex_unlock(&self->lock);
 }
 
@@ -926,12 +985,11 @@ void admiral_plane_sink_set_engine(GstElement *element, gboolean engine)
     self->engine = engine;
     if (engine && !self->notify) self->notify = g_array_new(FALSE, FALSE, sizeof(PresentedNote));
     g_mutex_unlock(&self->lock);
-    /* The engine owns pacing (credits + appsrc timing) and promises every decoded frame is
-     * presented exactly once, in order. A late frame (rectangle change / commit stall) must
-     * therefore never be dropped by BaseSink's lateness check or made to drop decoder frames
-     * through upstream QoS. Hardware: rect changes lost 3-4 PTS per clip without this. */
-    gst_base_sink_set_qos_enabled(GST_BASE_SINK(self), !engine && g_strcmp0(g_getenv("SIGNAGE_VIDEO_QOS"), "0") != 0);
-    if (engine) gst_base_sink_set_max_lateness(GST_BASE_SINK(self), -1);
+    /* QoS and BaseSink's lateness policy stay at their defaults for the engine sink: a frame
+     * that really reaches the sink late must be reported upstream (and counted), never hidden.
+     * Frame loss on a rectangle change / commit stall is fixed at its cause (credit pacing),
+     * not by switching late-frame accounting off. SIGNAGE_VIDEO_QOS=0 / _MAX_LATENESS_MS
+     * remain explicit diagnostic knobs (applied in init) and are never set here. */
 }
 
 /* Engine visibility. Hiding removes the plane once (HIDE); the browser then retires the
@@ -1029,6 +1087,7 @@ admiral_plane_sink_init(AdmiralPlaneSink *self)
     g_cond_init(&self->receiver_wake);
     self->fd = self->socket = -1;
     self->hidden = TRUE;
+    self->defer_us = -1;
     /* Initial budget before CAPS/preroll, refined from source rate in set_caps.
      * Prevent playbin's first pre-preroll LATENCY query from selecting zero. */
     gst_base_sink_set_render_delay(GST_BASE_SINK(self), GST_SECOND / 30);

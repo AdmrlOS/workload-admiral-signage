@@ -738,6 +738,57 @@ static void release_frame(Browser *browser, Frame *frame)
         ADD(browser->primary, browser->plane_h, browser->mode.vdisplay); \
     } while (0)
 
+/* Bounded ring of video-channel events (SHOW arrivals, acknowledgements, HIDE) with the
+ * browser's slot occupancy. Nothing is written until a video channel is dropped; then the
+ * newest entries are dumped with the exact reason, so a rare disconnect carries its own
+ * queue/in-flight/generation trace instead of needing a blind hour-long repeat. */
+typedef struct { gint64 us; char kind; uint64_t generation; uint32_t serial, fb; uint8_t pending, next, waiting; } VideoTrace;
+#define VIDEO_TRACE_N 256
+static VideoTrace video_trace[VIDEO_TRACE_N];
+static unsigned video_trace_count;
+static VideoPlane *video_trace_plane;
+
+static unsigned video_slots_in_use(const VideoPlane *video)
+{
+    return (video->pending_valid && video->pending.fb && !video->pending.cancelled ? 1u : 0u) +
+           (video->dirty && video->next.fb ? 1u : 0u) + video->waiting.length;
+}
+
+static void video_trace_add(char kind, uint64_t generation, uint32_t fb, uint32_t serial)
+{
+    VideoTrace *t = &video_trace[video_trace_count++ % VIDEO_TRACE_N];
+    const VideoPlane *video = video_trace_plane;
+    *t = (VideoTrace){ .us = g_get_monotonic_time(), .kind = kind, .generation = generation, .serial = serial, .fb = fb };
+    if (video) {
+        t->pending = video->pending_valid && video->pending.fb && !video->pending.cancelled;
+        t->next = video->dirty && video->next.fb;
+        t->waiting = (uint8_t)MIN(video->waiting.length, 255u);
+    }
+}
+
+static void video_ack_traced(guint64 generation, uint32_t type, uint32_t fb, uint32_t serial)
+{
+    video_trace_add(type == SIGNAGE_VIDEO_PRESENTED ? 'P' : type == SIGNAGE_VIDEO_CANCELLED ? 'C' :
+                    type == SIGNAGE_VIDEO_RELEASED ? 'R' : type == SIGNAGE_VIDEO_ACTIVATED ? 'A' : 'a',
+                    generation, fb, serial);
+    signage_drm_broker_video_ack(generation, type, fb, serial);
+}
+
+static void video_disconnect_traced(guint64 generation, const char *reason)
+{
+    const VideoPlane *video = video_trace_plane;
+    g_warning("Video channel generation=%" G_GUINT64_FORMAT " dropped by the browser: %s (slots=%u pending=%d dirty=%d waiting=%u active=%" G_GUINT64_FORMAT ")",
+              generation, reason, video ? video_slots_in_use(video) : 0, video ? video->pending_valid : 0,
+              video ? video->dirty : 0, video ? video->waiting.length : 0, signage_drm_broker_video_generation());
+    unsigned total = MIN(video_trace_count, 48u);
+    for (unsigned i = 0; i < total; i++) {
+        const VideoTrace *t = &video_trace[(video_trace_count - total + i) % VIDEO_TRACE_N];
+        g_warning("  video-trace mono=%" G_GINT64_FORMAT " %c gen=%" G_GUINT64_FORMAT " serial=%u fb=%u pending=%u next=%u waiting=%u",
+                  t->us, t->kind, t->generation, t->serial, t->fb, t->pending, t->next, t->waiting);
+    }
+    signage_drm_broker_video_disconnect_generation(generation);
+}
+
 /* Tells the sink it may reuse fb once no video state slot refers to it. */
 static void video_release_if_unused(Browser *browser, uint32_t fb)
 {
@@ -750,7 +801,7 @@ static void video_release_if_unused(Browser *browser, uint32_t fb)
     if (!identity) return;
     guint64 generation = identity->generation; uint32_t serial = identity->serial;
     g_hash_table_remove(video->serials, GUINT_TO_POINTER(fb));
-    signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_RELEASED, fb, serial);
+    video_ack_traced(generation, SIGNAGE_VIDEO_RELEASED, fb, serial);
 }
 
 static gboolean submit_commit(Browser *browser);
@@ -939,7 +990,7 @@ static gboolean submit_commit(Browser *browser)
             g_warning("Atomic commit with video fb %u rejected: %s; dropping that video frame", video->next.fb, g_strerror(saved_errno));
             video->rejected++;
             uint32_t rejected = video->next.fb;
-            signage_drm_broker_video_ack(video->next.generation, SIGNAGE_VIDEO_CANCELLED, rejected, video->next.serial);
+            video_ack_traced(video->next.generation, SIGNAGE_VIDEO_CANCELLED, rejected, video->next.serial);
             if (video->gate.phase == SIGNAGE_STANDBY_COMMITTING) {
                 /* A failed activation is NOT allowed to put incoming UI on the old video. */
                 guint64 failed = video->next.generation;
@@ -1107,10 +1158,10 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
         video->current.flipped_us = g_get_monotonic_time();
         video->pending_valid = FALSE;
         if (video->current.fb && !video->current.cancelled)
-            signage_drm_broker_video_ack(video->current.generation, SIGNAGE_VIDEO_PRESENTED, video->current.fb, video->current.serial);
+            video_ack_traced(video->current.generation, SIGNAGE_VIDEO_PRESENTED, video->current.fb, video->current.serial);
         if (signage_standby_flipped(&video->gate, video->current.generation, video->current.serial, video->current.fb)) {
             signage_drm_broker_video_activate(video->current.generation);
-            signage_drm_broker_video_ack(video->current.generation, SIGNAGE_VIDEO_ACTIVATED, video->current.fb, video->current.serial);
+            video_ack_traced(video->current.generation, SIGNAGE_VIDEO_ACTIVATED, video->current.fb, video->current.serial);
             browser->retiring_view = browser->visible_view;
             browser->visible_view = browser->staged_view; browser->staged_view = NULL;
             browser->orchestrator_hidden = TRUE;
@@ -1194,7 +1245,7 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
         if (video->gate.phase == SIGNAGE_STANDBY_COMMITTING || video->gate.phase == SIGNAGE_STANDBY_RETIRING) return;
         uint32_t fb = video->standby.fb, serial = video->standby.serial;
         video->standby = (VideoState){0};
-        signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, fb, serial);
+        video_ack_traced(generation, SIGNAGE_VIDEO_CANCELLED, fb, serial);
         video_release_if_unused(browser, fb);
         signage_standby_cancel(&video->gate, generation);
         browser->cancelled_generation = generation;
@@ -1206,7 +1257,7 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
     }
     if (generation != signage_drm_broker_video_generation() && !incoming) {
         /* Retired peer HIDE cannot hide the new active stream. */
-        if (message->fb) signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, message->fb, message->serial);
+        if (message->fb) video_ack_traced(generation, SIGNAGE_VIDEO_CANCELLED, message->fb, message->serial);
         return;
     }
     if (message->type == SIGNAGE_VIDEO_SHOW) {
@@ -1217,7 +1268,7 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
         VideoState *owner = g_hash_table_lookup(video->serials, GUINT_TO_POINTER(state.fb));
         if (!state.fb || !state.serial || !state.src_w || !state.src_h || !state.crtc_w || !state.crtc_h ||
             (owner && owner->generation != generation)) {
-            signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, state.fb, state.serial);
+            video_ack_traced(generation, SIGNAGE_VIDEO_CANCELLED, state.fb, state.serial);
             if (state.fb && (!owner || owner->generation == generation)) {
                 remember_video(video, &state); video_release_if_unused(browser, state.fb);
             }
@@ -1225,14 +1276,14 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
         }
         if (incoming) {
             if (video->standby.fb || video->gate.phase != SIGNAGE_STANDBY_PREPARING) {
-                signage_drm_broker_video_disconnect_generation(generation); return;
+                video_disconnect_traced(generation, "standby SHOW outside PREPARING (duplicate or wrong phase)"); return;
             }
             remember_video(video, &state); video->standby=state;
             standby_progress(browser); return; /* NEVER queue standby on the active FIFO */
         }
-        if ((video->pending_valid && video->pending.fb && !video->pending.cancelled ? 1u:0u) +
-            (video->dirty && video->next.fb ? 1u:0u) + video->waiting.length >= 2) {
-            signage_drm_broker_video_disconnect_generation(generation); return;
+        video_trace_add('S', generation, state.fb, state.serial);
+        if (video_slots_in_use(video) >= 2) {
+            video_disconnect_traced(generation, "SHOW with both video slots occupied (sink exceeded its two credits)"); return;
         }
         video->endpoint=(VideoState){0}; video->endpoint_interval=0;
         video->gate.endpoint_presented=FALSE;
@@ -1241,19 +1292,20 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
         else { video->next=state; video->dirty=TRUE; }
         submit_commit(browser); return;
     }
+    video_trace_add(message->type == SIGNAGE_VIDEO_DISCONNECTED ? 'D' : 'H', generation, message->fb, message->serial);
     if (message->type == SIGNAGE_VIDEO_DISCONNECTED) browser->dead_generation = generation;
     /* Only this generation's HIDE/EOF terminalizes its presentation credits. */
     if (video->pending_valid && video->pending.generation == generation && video->pending.fb && !video->pending.cancelled) {
-        signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, video->pending.fb, video->pending.serial);
+        video_ack_traced(generation, SIGNAGE_VIDEO_CANCELLED, video->pending.fb, video->pending.serial);
         video->pending.cancelled=TRUE;
     }
     while (!g_queue_is_empty(&video->waiting)) {
         VideoState *discard=g_queue_pop_head(&video->waiting); uint32_t fb=discard->fb;
-        signage_drm_broker_video_ack(discard->generation,SIGNAGE_VIDEO_CANCELLED,fb,discard->serial);
+        video_ack_traced(discard->generation,SIGNAGE_VIDEO_CANCELLED,fb,discard->serial);
         g_free(discard); video_release_if_unused(browser,fb);
     }
     uint32_t replaced=video->dirty ? video->next.fb : 0;
-    if (replaced) signage_drm_broker_video_ack(video->next.generation,SIGNAGE_VIDEO_CANCELLED,replaced,video->next.serial);
+    if (replaced) video_ack_traced(video->next.generation,SIGNAGE_VIDEO_CANCELLED,replaced,video->next.serial);
     video->next=(VideoState){.generation=generation}; video->dirty=TRUE;
     video_release_if_unused(browser,replaced);
     submit_commit(browser);
@@ -1277,6 +1329,7 @@ static void setup_video_plane(Browser *browser)
         }
     }
     video->plane = plane;
+    video_trace_plane = video;
     video->serials = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
     g_message("Video plane %u is committed by the browser together with the UI (one atomic commit per vblank)", plane);
     browser->stats_source = g_timeout_add_seconds(1, (GSourceFunc)report_stats_tick, browser);

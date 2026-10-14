@@ -4,8 +4,8 @@
 #include "../native/drm-broker.c"
 #include <assert.h>
 
-static unsigned handled;
-static void handler(const SignageVideoMessage *message, gpointer data) { (void)message; (void)data; handled++; }
+static unsigned handled, disconnected_notices;
+static void handler(const SignageVideoMessage *message, gpointer data) { (void)data; handled++; if (message->type == SIGNAGE_VIDEO_DISCONNECTED) disconnected_notices++; }
 
 static GSocketConnection *pair(int *peer)
 {
@@ -83,6 +83,32 @@ int main(void)
     assert(meta && fd && strstr(meta, "\"role\":\"html\""));
     g_free(meta);
     assert(broker.active && broker.engine == 0);
+
+    /* 6. Acknowledgement queue: bounded (64), never silently discarded, and an overflow is an
+     *    explicit, notified disconnect of that generation. A peer that keeps reading is never
+     *    dropped however many acks flow (hardware: PRESENTED + RELEASED per frame = 120/s). */
+    {
+        guint64 gen = broker.active; BrokerClient *c = NULL;
+        for (unsigned i = 0; i < 2; i++) if (broker.clients[i].generation == gen) c = &broker.clients[i];
+        assert(c && c->client);
+        int sndbuf = 1024; /* small kernel buffer so a non-reading peer backs the queue up */
+        assert(setsockopt(g_socket_get_fd(g_socket_connection_get_socket(c->client)), SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf) == 0);
+        SignageVideoMessage in;
+        for (unsigned i = 1; i <= 20000; i++) { /* reading peer: drained after every ack */
+            signage_drm_broker_video_ack(gen, SIGNAGE_VIDEO_PRESENTED, 7, i);
+            assert(recv(again_peer, &in, sizeof in, MSG_WAITALL) == sizeof in && in.serial == i && in.type == SIGNAGE_VIDEO_PRESENTED);
+        }
+        assert(c->client && g_queue_is_empty(&c->outgoing) && disconnected_notices == 0);
+        unsigned sent = 0;
+        for (; sent < 5000 && c->client; sent++) signage_drm_broker_video_ack(gen, SIGNAGE_VIDEO_PRESENTED, 7, 30000 + sent);
+        assert(!c->client && "a peer that never reads must be dropped, not buffered without bound");
+        assert(disconnected_notices == 1 && "the drop must be notified exactly once");
+        assert(sent > 64 && sent < 5000);
+        /* the peer then sees an orderly sequence of whole records followed by EOF: nothing was discarded mid-stream */
+        unsigned got = 0; ssize_t n;
+        while ((n = recv(again_peer, &in, sizeof in, MSG_DONTWAIT | MSG_WAITALL)) == (ssize_t)sizeof in) { assert(in.serial == 30000 + got); got++; }
+        assert(got > 0 && got <= sent);
+    }
     for (unsigned i = 0; i < 2; i++) drop_client(&broker.clients[i], FALSE);
     close(again_peer); g_object_unref(again);
     g_free(broker.metadata); close(broker.fd);

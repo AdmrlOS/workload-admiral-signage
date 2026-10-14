@@ -29,7 +29,11 @@ static void signage_drm_broker_video_ack(guint64 gen,uint32_t type,uint32_t fb,u
  (void)gen; (void)fb; (void)serial; if(type==3) releases++; if(type==5) cancellations++;
 }
 static void signage_drm_broker_video_retired(guint64 gen) { (void)gen; }
+static void video_ack_traced(guint64 gen,uint32_t type,uint32_t fb,uint32_t serial) { signage_drm_broker_video_ack(gen,type,fb,serial); }
+static void video_trace_add(char kind,uint64_t gen,uint32_t fb,uint32_t serial) { (void)kind;(void)gen;(void)fb;(void)serial; }
+static unsigned video_slots_in_use(const VideoPlane *v) { return (v->pending_valid && v->pending.fb && !v->pending.cancelled ? 1u:0u) + (v->dirty && v->next.fb ? 1u:0u) + v->waiting.length; }
 static void signage_drm_broker_video_disconnect_generation(guint64 gen) { (void)gen; disconnects++; }
+static void video_disconnect_traced(guint64 gen,const char *why) { (void)why; signage_drm_broker_video_disconnect_generation(gen); }
 static void native_notice(Browser *b,const char *e,guint64 gen) { (void)b;(void)e;(void)gen; }
 static void standby_progress(Browser *b) { (void)b; }
 static gboolean submit_commit(Browser *b) { (void)b; return TRUE; }

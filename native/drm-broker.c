@@ -326,7 +326,8 @@ client_readable(GSocket *socket, GIOCondition condition G_GNUC_UNUSED, gpointer 
         if (message.generation != client->generation ||
             (message.type != SIGNAGE_VIDEO_SHOW && message.type != SIGNAGE_VIDEO_HIDE && message.type != SIGNAGE_VIDEO_ENDPOINT) ||
             (message.type == SIGNAGE_VIDEO_SHOW && (!message.serial || message.serial <= client->last_serial))) {
-            g_warning("Holepunch sink sent unknown message type %u; disconnecting it", message.type);
+            g_warning("Holepunch sink sent invalid message type=%u generation=%" G_GUINT64_FORMAT " (expected %" G_GUINT64_FORMAT ") serial=%u (last %u); disconnecting it",
+                      message.type, (guint64)message.generation, (guint64)client->generation, message.serial, client->last_serial);
             drop_client(client, TRUE);
             return G_SOURCE_REMOVE;
         }
@@ -483,7 +484,11 @@ static gboolean video_tx_drain(BrokerClient *client)
                          sizeof(tx->message) - tx->offset, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return TRUE;
-        if (n <= 0) { drop_client(client, TRUE); return FALSE; }
+        if (n <= 0) {
+            g_warning("Video channel generation=%" G_GUINT64_FORMAT " dropped: acknowledgement send failed (%s, %u queued)",
+                      client->generation, n < 0 ? g_strerror(errno) : "closed", client->outgoing.length);
+            drop_client(client, TRUE); return FALSE;
+        }
         tx->offset += (gsize)n;
         if (tx->offset == sizeof(tx->message)) g_free(g_queue_pop_head(&client->outgoing));
     }
@@ -512,7 +517,11 @@ signage_drm_broker_video_ack(guint64 generation, uint32_t type, uint32_t fb, uin
         return;
     /* Never drop half a stream record. Congestion is a normal disconnect/hide,
      * not a false retirement. Bound memory even for a peer that never reads. */
-    if (client->outgoing.length >= 64) { drop_client(client, TRUE); return; }
+    if (client->outgoing.length >= 64) {
+        g_warning("Video channel generation=%" G_GUINT64_FORMAT " dropped: %u acknowledgements queued to a peer that is not reading (type=%u fb=%u serial=%u)",
+                  generation, client->outgoing.length, type, fb, serial);
+        drop_client(client, TRUE); return;
+    }
     VideoTx *tx = g_new0(VideoTx, 1);
     tx->message = (SignageVideoMessage){ .type = type, .generation = generation, .fb = fb, .serial = serial };
     g_queue_push_tail(&client->outgoing, tx);

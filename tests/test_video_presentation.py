@@ -9,7 +9,7 @@ class VideoPresentationTests(unittest.TestCase):
         sink = (ROOT/'native/gst-admiral-videoplane.c').read_text()
         self.assertIn('SIGNAGE_VIDEO_PRESENTED = 4', header)
         flip = browser[browser.index('static void frame_presented('):browser.index('static void video_message(')]
-        self.assertIn('signage_drm_broker_video_ack(video->current.generation, SIGNAGE_VIDEO_PRESENTED, video->current.fb, video->current.serial)', flip)
+        self.assertIn('video_ack_traced(video->current.generation, SIGNAGE_VIDEO_PRESENTED, video->current.fb, video->current.serial)', flip)
         self.assertIn('wait_presented(self)', sink)
         self.assertIn('GST_EVENT_EOS', sink)
         self.assertIn('base->event = admiral_plane_sink_event;', sink)
@@ -29,12 +29,18 @@ class VideoPresentationTests(unittest.TestCase):
         self.assertIn('gst_base_sink_query_latency', query)
         self.assertIn('upstream_live', query)
         self.assertIn('!upstream_live', query)
-    def test_flush_fences_old_credits_and_serial_does_not_wrap(self):
+    def test_flush_keeps_engine_credits_and_serial_does_not_wrap(self):
         sink=(ROOT/'native/gst-admiral-videoplane.c').read_text()
         event=sink[sink.index('static gboolean admiral_plane_sink_event'):sink.index('static gboolean admiral_plane_sink_unlock')]
+        flush=sink[sink.index('flush_start_locked(AdmiralPlaneSink *self)\n{'):sink.index('static gboolean admiral_plane_sink_query')]
         self.assertIn('GST_EVENT_FLUSH_START',event)
-        self.assertIn('g_hash_table_remove_all(self->unpresented)',event)
-        self.assertIn('g_hash_table_remove_all(self->identities)',event)
+        self.assertIn('flush_start_locked(self)',event)
+        # An HTML sink HIDEs (the browser cancels everything) and may forget its credits; an
+        # engine sink must keep them: the browser still owns the frames it has not acknowledged.
+        self.assertIn('if (!self->engine) {',flush)
+        self.assertLess(flush.index('if (!self->engine) {'),flush.index('g_hash_table_remove_all(self->unpresented)'))
+        self.assertEqual(flush.count('g_hash_table_remove_all(self->unpresented)'),1)
+        self.assertIn('g_hash_table_remove_all(self->identities)',flush)
         show=sink[sink.index('show_locked('):sink.index('admiral_plane_sink_show_frame(')]
         self.assertIn('self->serial == G_MAXUINT32',show)
         self.assertNotIn('self->serial = 0',event)

@@ -22,6 +22,7 @@ static AdmiralPlaneSink *new_sink(int sockets[2], gboolean engine)
     admiral_plane_sink_configure(GST_ELEMENT(self), fd, sockets[0], 3840, 2160);
     close(fd); close(sockets[0]);
     admiral_plane_sink_set_engine(GST_ELEMENT(self), engine);
+    self->defer_us = 0; /* tests below exercise the immediate re-SHOW path; deferral has its own test */
     assert(admiral_plane_sink_start(GST_BASE_SINK(self)));
     GstCaps *caps = gst_caps_from_string("video/x-raw,format=NV12,width=64,height=32,framerate=60/1");
     assert(admiral_plane_sink_set_caps(GST_BASE_SINK(self), caps));
@@ -302,12 +303,93 @@ int main(int argc, char **argv)
         gst_buffer_unref(a); gst_buffer_unref(b); gst_object_unref(alloc);
         finish(self, s[1]);
     }
-    /* 9. An engine sink never drops late frames and never asks the decoder to (no QoS); an
-     *    HTML sink keeps the default late-frame behaviour. */
+    /* 9. QoS and lateness handling stay at the GStreamer defaults for the engine sink as for
+     *    an HTML sink: a frame that really arrives late is dropped/reported, never silently
+     *    delivered. (Suppressing it made "0 QoS drops" meaningless.) */
     for (int engine = 0; engine < 2; engine++) {
         AdmiralPlaneSink *self = new_sink(s, engine);
-        assert(gst_base_sink_is_qos_enabled(GST_BASE_SINK(self)) == !engine);
-        assert((gst_base_sink_get_max_lateness(GST_BASE_SINK(self)) == -1) == !!engine);
+        AdmiralPlaneSink *reference = g_object_new(admiral_plane_sink_get_type(), NULL);
+        assert(gst_base_sink_is_qos_enabled(GST_BASE_SINK(self)) == gst_base_sink_is_qos_enabled(GST_BASE_SINK(reference)));
+        assert(gst_base_sink_is_qos_enabled(GST_BASE_SINK(self)));
+        assert(gst_base_sink_get_max_lateness(GST_BASE_SINK(self)) == gst_base_sink_get_max_lateness(GST_BASE_SINK(reference)));
+        assert(gst_base_sink_get_sync(GST_BASE_SINK(self)));
+        gst_object_unref(reference);
+        finish(self, s[1]);
+    }
+
+    /* 11. A flush (clip cut / seek) must not make the sink forget SHOWs the browser still
+     *     owns. Hardware: after FLUSH the first SHOW was a THIRD outstanding frame, overflowed
+     *     the browser's two slots and the browser dropped the channel (engine abort -5).
+     *     The browser model below is the real acceptance rule (pending + queued >= 2 => drop). */
+    {
+        AdmiralPlaneSink *self = new_sink(s, TRUE);
+        GstAllocator *alloc = gst_dmabuf_allocator_new();
+        GstBuffer *a = dmabuf_frame(self, alloc, 0, 100), *b = dmabuf_frame(self, alloc, 16666666, 101), *c = dmabuf_frame(self, alloc, 33333333, 102);
+        gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(self), 0, 0, 3840, 2160);
+        assert(admiral_plane_sink_show_frame(GST_VIDEO_SINK(self), a) == GST_FLOW_OK);
+        assert(admiral_plane_sink_show_frame(GST_VIDEO_SINK(self), b) == GST_FLOW_OK); /* browser owns 2 */
+        g_mutex_lock(&self->lock);
+        flush_start_locked(self);
+        self->flushing = FALSE; /* FLUSH_STOP */
+        g_mutex_unlock(&self->lock);
+        SignageVideoMessage m; guint32 serials[3]; int outstanding = 0, max_outstanding = 0, n = 0;
+        while (readable(s[1], 20)) { assert(recv(s[1], &m, sizeof m, MSG_WAITALL) == sizeof m); serials[n++] = m.serial; outstanding++; }
+        assert(n == 2 && outstanding == 2);
+        RaceArgs sa = { self, c, 0, 0, 0, 0 };
+        GThread *ts = g_thread_new("stream", race_stream, &sa);
+        assert(!readable(s[1], 150) && "post-flush SHOW sent while the browser still owns two frames");
+        SignageVideoMessage pm = { .type = SIGNAGE_VIDEO_PRESENTED, .fb = 100, .serial = serials[0] };
+        assert(send(s[1], &pm, sizeof pm, 0) == sizeof pm); outstanding--;
+        assert(readable(s[1], 1000)); /* credit returned: the new frame goes out */
+        assert(recv(s[1], &m, sizeof m, MSG_WAITALL) == sizeof m && m.type == SIGNAGE_VIDEO_SHOW && m.fb == 102);
+        outstanding++; max_outstanding = MAX(max_outstanding, outstanding);
+        assert(max_outstanding <= 2);
+        g_thread_join(ts);
+        gst_buffer_unref(a); gst_buffer_unref(b); gst_buffer_unref(c); gst_object_unref(alloc);
+        finish(self, s[1]);
+    }
+    /* 11b. An HTML sink still forgets its credits on flush (it sends HIDE, which the browser
+     *      answers by cancelling everything). */
+    {
+        AdmiralPlaneSink *self = new_sink(s, FALSE);
+        g_mutex_lock(&self->lock);
+        g_hash_table_insert(self->unpresented, GUINT_TO_POINTER(1), GUINT_TO_POINTER(7));
+        flush_start_locked(self);
+        assert(g_hash_table_size(self->unpresented) == 0);
+        g_mutex_unlock(&self->lock);
+        finish(self, s[1]);
+    }
+    /* 12. Geometry refresh policy. While frames are arriving, a rectangle change costs no
+     *     display slot (the next frame's SHOW carries the new rectangle); an idle stream is
+     *     refreshed by the receiver thread. Hardware/realtime test: a separate re-SHOW at
+     *     source rate == refresh rate delayed every later frame by a vblank, forever. */
+    {
+        AdmiralPlaneSink *self = new_sink(s, TRUE);
+        self->defer_us = 120000;
+        GstAllocator *alloc = gst_dmabuf_allocator_new();
+        GstBuffer *a = dmabuf_frame(self, alloc, 0, 100), *b = dmabuf_frame(self, alloc, 16666666, 101);
+        GstVideoOverlay *overlay = GST_VIDEO_OVERLAY(self);
+        gst_video_overlay_set_render_rectangle(overlay, 0, 0, 3840, 2160);
+        assert(admiral_plane_sink_show_frame(GST_VIDEO_SINK(self), a) == GST_FLOW_OK);
+        SignageVideoMessage m, pm;
+        assert(recv(s[1], &m, sizeof m, MSG_WAITALL) == sizeof m && m.type == SIGNAGE_VIDEO_SHOW && m.fb == 100);
+        pm = (SignageVideoMessage){ .type = SIGNAGE_VIDEO_PRESENTED, .fb = 100, .serial = m.serial };
+        assert(send(s[1], &pm, sizeof pm, 0) == sizeof pm);
+        gst_video_overlay_set_render_rectangle(overlay, 2400, 100, 1200, 675);
+        assert(!readable(s[1], 40) && "rectangle change spent its own SHOW while frames are flowing");
+        assert(admiral_plane_sink_show_frame(GST_VIDEO_SINK(self), b) == GST_FLOW_OK);
+        assert(recv(s[1], &m, sizeof m, MSG_WAITALL) == sizeof m && m.type == SIGNAGE_VIDEO_SHOW && m.fb == 101);
+        assert(m.crtc_x == 2400 && m.crtc_w == 1200 && "next frame carries the new rectangle");
+        pm = (SignageVideoMessage){ .type = SIGNAGE_VIDEO_PRESENTED, .fb = 101, .serial = m.serial };
+        assert(send(s[1], &pm, sizeof pm, 0) == sizeof pm);
+        g_mutex_lock(&self->lock); assert(!self->geometry_pending); g_mutex_unlock(&self->lock);
+        /* now the stream goes idle: the refresh happens on its own after the window */
+        gst_video_overlay_set_render_rectangle(overlay, 0, 0, 3840, 2160);
+        assert(!readable(s[1], 40));
+        assert(readable(s[1], 600) && "idle stream never refreshed");
+        assert(recv(s[1], &m, sizeof m, MSG_WAITALL) == sizeof m && m.type == SIGNAGE_VIDEO_SHOW && m.fb == 101 && m.crtc_w == 3840);
+        assert(!readable(s[1], 80) && "refresh sent more than once");
+        gst_buffer_unref(a); gst_buffer_unref(b); gst_object_unref(alloc);
         finish(self, s[1]);
     }
     g_print("native-engine-sink: OK\n");
