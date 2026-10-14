@@ -548,7 +548,7 @@ static void feed_locked(Engine *e)
 
 /* Runs on appsrc's streaming thread: every previously pushed access unit has already gone
  * through h265parse and the decoder. When the timeline holds (nothing follows), drain the
- * decoder with a serialized DRAIN query (never EOS) so its pipelined last frames are output;
+ * decoder with a serialized still-frame event (never EOS) so its pipelined last frames are output;
  * the next clip starts with an IDR anyway. */
 static void need_data(GstAppSrc *src, guint length, gpointer data)
 {
@@ -557,14 +557,22 @@ static void need_data(GstAppSrc *src, guint length, gpointer data)
     g_atomic_int_set(&e->want, 1);
     g_mutex_lock(&e->lock);
     feed_locked(e);
-    gboolean drain = e->idle && !e->drained && !e->seek_pending && e->cur;
+    /* Buffers pushed by feed_locked() above are still queued in appsrc (this callback runs
+     * before appsrc pops them): an event sent now would overtake them. Drain only on a call
+     * that finds the queue empty, i.e. after every pushed AU went through parser+decoder. */
+    gboolean drain = e->idle && !e->drained && !e->seek_pending && e->cur &&
+                     gst_app_src_get_current_level_bytes(src) == 0;
     if (drain) e->drained = TRUE;
     g_mutex_unlock(&e->lock);
     if (drain) {
         GstPad *pad = gst_element_get_static_pad(GST_ELEMENT(src), "src");
-        GstQuery *query = gst_query_new_drain();
-        gst_pad_peer_query(pad, query);
-        gst_query_unref(query);
+        /* GstVideoDecoder (1.26) has no DRAIN-query handler, so that query was a no-op and the
+         * stateless decoders' one-frame output delay kept the last frame (and the whole
+         * startup preflight) waiting for a successor that never came. A still-frame event is
+         * serialized, is not EOS (no pad block, no STREAMOFF/REQBUFS) and makes GstVideoDecoder
+         * call the subclass drain, which outputs every queued picture. Hardware-verified. */
+        GstEvent *still = gst_video_event_new_still_frame(TRUE);
+        gst_pad_push_event(pad, still);
         gst_object_unref(pad);
     }
 }
@@ -886,7 +894,12 @@ static gboolean start_engine(gpointer data)
         e->visible = FALSE;
         apply_visibility(e);
         g_mutex_lock(&e->lock);
-        e->warm_limit = 1; /* the first IDR allocates the decoder pool */
+        /* The first IDR allocates the capture pool; a few more frames exercise the P-frame
+         * path (and the kernel's lazily allocated per-buffer MV-col buffers) before any
+         * timed playback. Hardware: those lazy allocations still total 9 small ones in the
+         * first ~15 s of playback and none afterwards, whatever is held here. */
+        e->warm_limit = (guint)MIN(MAX(env_u64("SIGNAGE_ENGINE_WARM_FRAMES", 12), 1), warm->n_aus);
+        g_atomic_int_set(&e->sink_buffers, 0);
         Instance *i = start_instance_locked(e, warm, 0, 0, NULL, FALSE, 0);
         i->warm = TRUE;
         g_mutex_unlock(&e->lock);

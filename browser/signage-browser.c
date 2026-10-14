@@ -773,6 +773,16 @@ static gboolean retry_fence(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* A disconnected sink's generation is retired once the video plane holds nothing of it. */
+static void retire_dead_generation_if_idle(Browser *browser)
+{
+    VideoPlane *video = &browser->video;
+    if (browser->dead_generation && browser->dead_generation == signage_drm_broker_video_generation() &&
+        !browser->visible_view && !video->current.fb && !video->pending_valid && !video->dirty && g_queue_is_empty(&video->waiting)) {
+        signage_drm_broker_video_retired(browser->dead_generation); browser->dead_generation = 0;
+    }
+}
+
 /* Never enqueue an unsignalled UI fence on the CRTC: it would stall video too.
  * Poll only; retain the queued UI and the last completed primary state. */
 static gboolean frame_ready(const Frame *frame)
@@ -794,6 +804,17 @@ static gboolean submit_commit(Browser *browser)
         video->next = *next;
         g_free(next);
         video->dirty = TRUE;
+    }
+    /* Hiding a plane that shows nothing (a persistent engine killed or released while its
+     * warm-up/hidden frames never reached scanout) has no visible effect, and a PAGE_FLIP_EVENT
+     * commit that only disables an already-disabled plane carries no CRTC: the kernel rejects it
+     * (EINVAL), no flip completes and the dead generation was never retired, so a restarted engine
+     * was refused forever on a static page. Drop the no-op and retire. */
+    if (video->dirty && !video->next.fb && !video->current.fb && !video->pending_valid && !browser->queued) {
+        video->dirty = FALSE;
+        retire_dead_generation_if_idle(browser);
+        if (g_queue_is_empty(&video->waiting)) return TRUE;
+        return submit_commit(browser);
     }
     if (browser->commit_pending || browser->retry_source || (!browser->queued && !video->dirty)) return TRUE;
     Frame *frame = browser->queued;

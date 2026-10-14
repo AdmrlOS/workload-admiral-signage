@@ -39,7 +39,7 @@ async function harness(entries) {
     SignageVideo: {attach: () => { events.push('engine:attach'); return fake; }, host: () => ({dropFrame: () => events.push('engine:drop-frame')})}};
   const stage = new Element('div'), status = new Element('div');
   const context = {console: {...console, log() {}}, URL, URLSearchParams, Promise, Date, Map, Image: class extends Element { constructor() { super('img'); } },
-    window, document: {body: new Element('body'), createElement: (t) => new Element(t), getElementById: (id) => id === 'stage' ? stage : status, addEventListener() {}},
+    window, document: {body: new Element('body'), documentElement: {classList: {toggle: (c, on) => events.push('root:' + c + ':' + on)}}, createElement: (t) => new Element(t), getElementById: (id) => id === 'stage' ? stage : status, addEventListener() {}},
     location: {origin: 'http://s', href: 'http://127.0.0.1:8080/player/', search: ''},
     setTimeout: (fn, ms) => { const id = ++serial; timers.set(id, {fn, ms}); return id; }, clearTimeout: (id) => timers.delete(id),
     requestAnimationFrame: (fn) => queueMicrotask(fn),
@@ -105,4 +105,16 @@ test('pagehide destroys the controller (stream closes -> engine hides and pauses
   await h.ready();
   h.hide();
   assert.ok(h.events.includes('engine:destroy'));
+});
+
+test('the page is transparent only while the engine video is the current surface (video plane lies below the page)', async () => {
+  const h = await harness([entry('a', 'video'), entry('page', 'html')]);
+  await h.ready();
+  const first = h.lastPlay();
+  h.fire('started', {play_id: h.playId(first), asset: 'a'}); await h.settle();
+  assert.equal(h.events.filter((e) => e.startsWith('root:engine-live')).at(-1), 'root:engine-live:true',
+    'html/body/standby must not paint over the video plane');
+  h.fire('ended', {play_id: h.playId(first), reason: 'complete'}); await h.settle();
+  assert.equal(h.events.filter((e) => e.startsWith('root:engine-live')).at(-1), 'root:engine-live:false',
+    'an HTML entry gets the normal opaque page again');
 });

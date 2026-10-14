@@ -111,14 +111,31 @@
       this.ready = new Promise((resolve, reject) => {
         this._resolveReady = resolve; this._rejectReady = reject;
       });
-      this.transport.open().then(() => this.transport.command('acquire'))
-        .then((ack) => { if (!ack?.ok) this._rejectReady(new Error(ack?.code || 'acquire failed')); })
+      this.acquired = false; this.rectBusy = false;
+      this.transport.open().then(() => this._acquire(options.acquireWaitMs ?? 90000))
+        .then((ack) => {
+          if (!ack?.ok) { this._rejectReady(new Error(ack?.code || 'acquire failed')); return; }
+          this.acquired = true; this.lastRect = ''; this.trackNow();
+        })
         .catch((error) => this._rejectReady(error));
       this._track();
     }
+    /* The engine process (GStreamer init + decoder preflight) takes seconds to tens of
+     * seconds after a cold start, and the page can load first: wait for it instead of
+     * permanently falling back to a second (legacy) decoder. Only "not up yet" codes retry. */
+    async _acquire(waitMs) {
+      const retry = new Set(['engine-unavailable', 'engine-disconnected', 'timeout', 'not-ready']);
+      const deadline = Date.now() + waitMs;
+      for (;;) {
+        const ack = await this.transport.command('acquire');
+        if (ack?.ok || !retry.has(ack?.code) || this.closed || Date.now() >= deadline) return ack;
+        await new Promise((resolve) => this.env.setTimeout(resolve, 500));
+      }
+    }
     _event(event) {
       if (!event || !event.event) return;
-      if (event.event === 'engine-ready') { this._resolveReady(event); this.trackNow(); }
+      if (event.event === 'engine-ready') { this._resolveReady(event); this.lastRect = ''; this.trackNow(); }
+      if (event.event === 'engine-disconnected') this.lastRect = '';
       if (event.event === 'preempted' && event.client === this.client) this.emit('preempted', event);
       else if (event.event !== 'preempted') this.emit(event.event, event);
     }
@@ -131,19 +148,26 @@
       }
     }
     trackNow() {
-      if (!this.element || this.closed) return;
+      if (!this.element || this.closed || !this.acquired) return;
       const rect = physicalRect(this.element, this.env);
       if (rect.w <= 0 || rect.h <= 0) return;
       const key = JSON.stringify(rect);
-      if (key === this.lastRect) return;
-      this.lastRect = key;
-      this.transport.command('rect', rect);
+      if (key === this.lastRect || this.rectBusy) return;
+      /* Remember a rectangle only once the engine acknowledged it: a rect sent while the engine
+       * was still starting (or after it restarted) must be re-sent, never silently dropped. */
+      this.rectBusy = true;
+      this.rectPromise = Promise.resolve(this.transport.command('rect', rect)).then((ack) => {
+        this.rectBusy = false;
+        if (ack?.ok) { this.lastRect = key; this.trackNow(); } /* re-checks a size change meanwhile */
+      }, () => { this.rectBusy = false; });
     }
     play(url, options = {}) {
       const playId = (this.playId = this.playId + 1) + Math.floor(Math.random() * 1e6) * 1000;
       this.trackNow();
-      return this.transport.command('play', {asset: {url}, at: options.at || 'boundary', loop: !!options.loop,
-                                             show: options.show !== false, play_id: playId})
+      /* The rectangle must be in place before the first frame can be shown. */
+      return (this.rectPromise || Promise.resolve())
+        .then(() => this.transport.command('play', {asset: {url}, at: options.at || 'boundary', loop: !!options.loop,
+                                                    show: options.show !== false, play_id: playId}))
         .then((ack) => ({...ack, play_id: ack?.play_id ?? playId}));
     }
     prepare(url) { return this.transport.command('prepare', {asset: {url}}); }
@@ -185,6 +209,7 @@
         const transport = this.makeTransport(key);
         transport.addEventListener('event', ({detail}) => event.source.postMessage({type: 'signage-video-host', event: detail}, '*'));
         this.frames.set(key, {transport, frame, source: event.source});
+        this.hooks?.open?.(frame);
         try { await transport.open(); } catch (_) { event.source.postMessage({type: 'signage-video-host', event: {event: 'engine-disconnected'}}, '*'); }
       } else if (data.op === 'command' && this.frames.has(key)) {
         const entry = this.frames.get(key);
@@ -197,7 +222,7 @@
         event.source.postMessage({type: 'signage-video-host', reply: data.id, ack}, '*');
       } else if (data.op === 'close') this.drop(key);
     }
-    drop(key) { const entry = this.frames.get(key); if (entry) { entry.transport.close(); this.frames.delete(key); } }
+    drop(key) { const entry = this.frames.get(key); if (entry) { entry.transport.close(); this.frames.delete(key); this.hooks?.close?.(entry.frame); } }
     /* Called when the player removes an iframe: its stream closes -> engine hides+pauses. */
     dropFrame(frame) { for (const [key, entry] of this.frames) if (entry.frame === frame) this.drop(key); }
   }

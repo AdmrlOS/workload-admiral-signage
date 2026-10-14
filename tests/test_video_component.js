@@ -43,6 +43,7 @@ test('top-level component acquires, waits for preflight and sends physical rect'
   const rect = env.posted.find((p) => p.body?.cmd === 'rect').body;
   assert.deepEqual({x: rect.x, y: rect.y, w: rect.w, h: rect.h}, {x: 21, y: 40, w: 1920, h: 1080});
   assert.equal(video.element.style.background, 'transparent');
+  await settle(); /* the rectangle is remembered only once the engine acknowledged it */
   const sent = env.posted.length;
   video.trackNow();
   assert.equal(env.posted.length, sent, 'unchanged rect is not resent');
@@ -151,4 +152,54 @@ test('engine video adapter gives existing page code video semantics without a me
   v.remove();
   assert.equal(env.posted.at(-1).body.cmd, 'hide');
   env.close();
+});
+
+test('acquire waits for an engine that is still starting instead of failing permanently', async () => {
+  const env = fakeEnv();
+  let attempts = 0;
+  const realFetch = env.fetch;
+  env.fetch = async (url, init = {}) => {
+    if (!url.startsWith('/api/video/events') && JSON.parse(init.body).cmd === 'acquire' && ++attempts < 4) {
+      env.posted.push({url, body: JSON.parse(init.body)});
+      return {json: async () => ({ok: false, code: 'engine-unavailable'})};
+    }
+    return realFetch(url, init);
+  };
+  env.setTimeout = (fn) => setTimeout(fn, 1);
+  const video = new api.SignageVideo(box(0, 0, 100, 100), env, {client: 'late'});
+  await new Promise((r) => setTimeout(r, 60));
+  env.send({event: 'engine-ready', warm: true});
+  assert.equal((await video.ready).warm, true);
+  assert.equal(attempts, 4, 'three refusals, then the engine accepted the acquire');
+  video.destroy();
+});
+
+test('a refused acquire that is not a startup condition rejects ready (legacy fallback)', async () => {
+  const env = fakeEnv();
+  const realFetch = env.fetch;
+  env.fetch = async (url, init = {}) => url.startsWith('/api/video/events') ? realFetch(url, init)
+    : {json: async () => ({ok: false, code: 'engine-disabled'})};
+  const video = new api.SignageVideo(box(0, 0, 100, 100), env, {client: 'x'});
+  await assert.rejects(video.ready, /engine-disabled/);
+  video.destroy();
+});
+
+test('a rectangle the engine refused is retried, never remembered as sent', async () => {
+  const env = fakeEnv();
+  let refusals = 1;
+  const realFetch = env.fetch;
+  env.fetch = async (url, init = {}) => {
+    if (!url.startsWith('/api/video/events') && JSON.parse(init.body).cmd === 'rect' && refusals-- > 0) {
+      env.posted.push({url, body: JSON.parse(init.body)});
+      return {json: async () => ({ok: false, code: 'not-ready'})};
+    }
+    return realFetch(url, init);
+  };
+  const video = new api.SignageVideo(box(0, 0, 100, 100), env, {client: 'r'});
+  await settle();
+  video.trackNow(); await settle(); video.trackNow(); await settle();
+  assert.equal(env.posted.filter((p) => p.body?.cmd === 'rect').length, 2, 'refused once, then re-sent and acknowledged');
+  const sent = env.posted.length; video.trackNow(); await settle();
+  assert.equal(env.posted.length, sent, 'acknowledged rectangle is not re-sent');
+  video.destroy();
 });

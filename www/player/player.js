@@ -176,7 +176,16 @@
       slot.ready=true; return item;
     }).catch(()=>{ if(staged===slot) staged=null; return null; });
   }
+  /* The engine's video plane lies BELOW the page: while it is the current surface every page layer
+   * in front of it (html/body background, the standby panel, an iframe element that hosts an
+   * engine component) must be transparent, or the page paints over the video. A plain <video>
+   * punched its own hole; the engine box cannot. Opaque again for every other entry. */
+  function engineSurface() {
+    const on = !!(current?.engine || (current?.node?.tagName === 'IFRAME' && current.node.dataset?.engineFrame === '1'));
+    document.documentElement?.classList?.toggle('engine-live', on);
+  }
   function notify(entry) {
+    engineSurface();
     const name = entry ? entry.asset.name : 'Waiting for scheduled content';
     document.getElementById('now-playing').textContent = name;
     window.parent.postMessage({type:'signage-status',empty:!entry,name},location.origin);
@@ -500,7 +509,13 @@
       const response=await fetch('/api/playlist',{cache:'no-store'}); if(!response.ok) throw new Error('Playlist unavailable');
       const data=await response.json(); playlist=data.entries; previousRevision=data.revision; lastPoll=Date.now();
       engineSetup();
-      if(!engineHost && window.SignageVideo && engine) engineHost=window.SignageVideo.host();
+      if(!engineHost && window.SignageVideo && engine) {
+        engineHost=window.SignageVideo.host();
+        engineHost.hooks={
+          open:frame=>{ if(frame.dataset) frame.dataset.engineFrame='1'; engineSurface(); },
+          close:frame=>{ if(frame.dataset) delete frame.dataset.engineFrame; engineSurface(); }
+        };
+      }
       clearTimeout(boundaryTimer);
       if(data.next_change) boundaryTimer=setTimeout(poll,Math.max(20,Math.min(2147483647,(data.next_change-data.now)*1000+25)));
       // Expired items stop locally even if a subsequent network request fails.
