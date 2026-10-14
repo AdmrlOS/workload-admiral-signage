@@ -66,8 +66,11 @@ PAGE_DEMOS = [
 
 def demo_entries(assets):
     available = {asset['id'] for asset in assets}
+    # Picture-in-picture (menuboard-pip) stays in the library but is not in the default loop:
+    # it is the weakest demo on the reference board. The 4K HEVC clip follows the promos, so the
+    # three normalized clips run back to back on the one decoder.
     order = [('welcome', 12), ('menuboard-main', 18), ('promo-a', 0),
-             ('menuboard-pip', 20), ('promo-b', 0)]
+             ('promo-b', 0), (DEMO_4K_ID, 0)]
     return [dict(id=uuid.uuid4().hex, asset_id=identity, duration=duration,
                  enabled=True, start=None, end=None)
             for identity, duration in order if identity in available]

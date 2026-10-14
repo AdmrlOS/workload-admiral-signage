@@ -43,14 +43,12 @@ class ContentTests(unittest.TestCase):
         content.update(self.root, self.app, self.state)
         self.assertEqual(content.read(self.root, self.app)['entries'], [])
 
-    def test_picture_in_picture_is_an_explicit_default_slot(self):
+    def test_picture_in_picture_is_in_the_library_but_not_the_default_loop(self):
         assets = {a['id']: a for a in self.state['assets']}
         self.assertIn('?scene=C', assets['menuboard-pip']['url'])
         self.assertIn('?scene=A', assets['menuboard-main']['url'])
         self.assertIn('menuboard', assets)  # The complete original demo remains available.
-        pip = next(e for e in self.state['entries'] if e['asset_id'] == 'menuboard-pip')
-        self.assertEqual(pip['duration'], 20)
-        self.assertTrue(pip['enabled'])
+        self.assertNotIn('menuboard-pip', [e['asset_id'] for e in self.state['entries']])
 
     def test_old_default_upgrades_but_edited_schedules_are_preserved(self):
         for edited in (False, True):
@@ -67,7 +65,7 @@ class ContentTests(unittest.TestCase):
             if edited:
                 self.assertEqual(state['entries'], original)
             else:
-                self.assertIn('menuboard-pip', [e['asset_id'] for e in state['entries']])
+                self.assertIn('menuboard-main', [e['asset_id'] for e in state['entries']])
 
     def test_seed_videos_prepared_once_and_preserved(self):
         (self.root / 'library.json').unlink()
@@ -79,7 +77,7 @@ class ContentTests(unittest.TestCase):
         self.assertEqual((self.root / 'media/promo-a.mp4').read_bytes(), b'video')
         self.assertIn('promo-a', [e['asset_id'] for e in state['entries']])
 
-    def test_bundled_4k_demo_is_a_library_asset_but_not_in_the_loop(self):
+    def test_bundled_4k_demo_is_a_library_asset_and_in_the_default_loop(self):
         (self.root / 'library.json').unlink()
         (self.app / 'media/demo-4k-hevc.mp4').write_bytes(b'video')
         details = {'video_duration': 10, 'poster': '/media/demo-4k-hevc.mp4.poster.jpg',
@@ -90,7 +88,7 @@ class ContentTests(unittest.TestCase):
         self.assertEqual((asset['name'], asset['kind'], asset['url']), ('4K HEVC demo', 'video', '/media/demo-4k-hevc.mp4'))
         self.assertEqual(asset['end_poster'], details['end_poster'])
         self.assertEqual((self.root / 'media/demo-4k-hevc.mp4').read_bytes(), b'video')
-        self.assertNotIn('demo-4k-hevc', [e['asset_id'] for e in state['entries']])
+        self.assertEqual([e['asset_id'] for e in state['entries']][-1], 'demo-4k-hevc')
         self.assertEqual(state['demo_catalog'], 3)
 
     def test_catalog_2_upgrade_appends_4k_asset_and_keeps_entries(self):
