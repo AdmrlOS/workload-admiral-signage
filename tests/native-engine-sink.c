@@ -37,6 +37,25 @@ static void finish(AdmiralPlaneSink *self, int peer)
     gst_object_unref(self);
 }
 
+
+typedef struct { AdmiralPlaneSink *self; GstBuffer *buffer; int x, y, w, h; } RaceArgs;
+static gpointer race_stream(gpointer data) { RaceArgs *a = data; admiral_plane_sink_show_frame(GST_VIDEO_SINK(a->self), a->buffer); return NULL; }
+static gpointer race_rect(gpointer data) { RaceArgs *a = data; gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(a->self), a->x, a->y, a->w, a->h); return NULL; }
+
+static GstBuffer *dmabuf_frame(AdmiralPlaneSink *self, GstAllocator *alloc, guint64 pts, guint32 fb)
+{
+    int fd = memfd_create("frame", 0); assert(fd >= 0 && ftruncate(fd, 64 * 32 * 3 / 2) == 0);
+    GstBuffer *b = gst_buffer_new(); gst_buffer_append_memory(b, gst_dmabuf_allocator_alloc(alloc, fd, 64 * 32 * 3 / 2));
+    GST_BUFFER_PTS(b) = pts; GST_BUFFER_DURATION(b) = 16666666;
+    struct stat st; assert(fstat(fd, &st) == 0);
+    GString *key = g_string_new(NULL);
+    for (guint p = 0; p < 2; p++)
+        g_string_append_printf(key, "%lu:%u:%u;", (unsigned long)st.st_ino, (guint)GST_VIDEO_INFO_PLANE_OFFSET(&self->info, p), (guint)GST_VIDEO_INFO_PLANE_STRIDE(&self->info, p));
+    g_string_append_printf(key, "%dx%d", GST_VIDEO_INFO_WIDTH(&self->info), GST_VIDEO_INFO_HEIGHT(&self->info));
+    g_mutex_lock(&self->lock); g_hash_table_insert(self->framebuffers, g_string_free(key, FALSE), GUINT_TO_POINTER(fb)); g_mutex_unlock(&self->lock);
+    return b;
+}
+
 int main(int argc, char **argv)
 {
     gst_init(&argc, &argv);
@@ -247,6 +266,48 @@ int main(int argc, char **argv)
         for (int i = 0; i < 3; i++) gst_buffer_unref(frames[i]);
         gst_object_unref(alloc);
         gst_element_set_bus(GST_ELEMENT(self), NULL); gst_object_unref(bus);
+        finish(self, s[1]);
+    }
+
+    /* 10. Race: a rectangle refresh of frame A blocks for a credit (lock released) while the
+     *     streaming thread also waits to SHOW the newer frame B. Whichever wakes first, the
+     *     older frame A must never be put back on screen after B (hardware: duplicate/backward
+     *     PTS at every rectangle change), and B must be SHOWn exactly once. */
+    for (int iteration = 0; iteration < 40; iteration++) {
+        AdmiralPlaneSink *self = new_sink(s, TRUE);
+        GstAllocator *alloc = gst_dmabuf_allocator_new();
+        GstBuffer *a = dmabuf_frame(self, alloc, 0, 100), *b = dmabuf_frame(self, alloc, 16666666, 101);
+        GstVideoOverlay *overlay = GST_VIDEO_OVERLAY(self);
+        gst_video_overlay_set_render_rectangle(overlay, 0, 0, 3840, 2160);
+        assert(admiral_plane_sink_show_frame(GST_VIDEO_SINK(self), a) == GST_FLOW_OK);
+        gst_video_overlay_set_render_rectangle(overlay, 2400, 100, 1200, 675); /* credits now full: 2 unpresented */
+        RaceArgs sa = { self, b, 0, 0, 0, 0 }, ra = { self, NULL, 0, 0, 3840, 2160 };
+        GThread *ts = g_thread_new("stream", race_stream, &sa);
+        if (iteration & 1) g_usleep(20000);
+        GThread *tr = g_thread_new("rect", race_rect, &ra);
+        g_usleep(60000);
+        SignageVideoMessage m; guint32 serials[2];
+        for (int i = 0; i < 2; i++) { assert(readable(s[1], 500)); assert(recv(s[1], &m, sizeof m, MSG_WAITALL) == sizeof m && m.type == SIGNAGE_VIDEO_SHOW); serials[i] = m.serial; }
+        for (int i = 0; i < 2; i++) { SignageVideoMessage pm = { .type = SIGNAGE_VIDEO_PRESENTED, .fb = 100, .serial = serials[i] }; assert(send(s[1], &pm, sizeof pm, 0) == sizeof pm); }
+        g_thread_join(ts); g_thread_join(tr);
+        int seen_b = 0, b_shows = 0;
+        while (readable(s[1], 80)) {
+            assert(recv(s[1], &m, sizeof m, MSG_WAITALL) == sizeof m);
+            if (m.type != SIGNAGE_VIDEO_SHOW) continue;
+            if (m.fb == 101) { seen_b = 1; b_shows++; }
+            else assert(!seen_b && "older frame A re-shown after newer frame B");
+        }
+        assert(b_shows >= 1);
+        g_mutex_lock(&self->lock); assert(self->last == b); g_mutex_unlock(&self->lock);
+        gst_buffer_unref(a); gst_buffer_unref(b); gst_object_unref(alloc);
+        finish(self, s[1]);
+    }
+    /* 9. An engine sink never drops late frames and never asks the decoder to (no QoS); an
+     *    HTML sink keeps the default late-frame behaviour. */
+    for (int engine = 0; engine < 2; engine++) {
+        AdmiralPlaneSink *self = new_sink(s, engine);
+        assert(gst_base_sink_is_qos_enabled(GST_BASE_SINK(self)) == !engine);
+        assert((gst_base_sink_get_max_lateness(GST_BASE_SINK(self)) == -1) == !!engine);
         finish(self, s[1]);
     }
     g_print("native-engine-sink: OK\n");

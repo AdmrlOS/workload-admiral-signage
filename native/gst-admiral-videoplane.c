@@ -405,7 +405,24 @@ static GstFlowReturn wait_credit(AdmiralPlaneSink *self, guint limit)
 
 /* Lock held. */
 static GstFlowReturn
-show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
+show_locked(AdmiralPlaneSink *self, GstBuffer *buffer, gboolean reshow_call);
+
+/* Geometry/visibility refresh of the frame currently on screen (rectangle change, expose,
+ * visibility restore). wait_credit() drops the lock, so the streaming thread can SHOW a newer
+ * frame meanwhile: show_locked() then abandons this stale refresh instead of putting the older
+ * frame back on screen. The caller's `last` pointer may also be replaced during that wait, so
+ * the refresh owns a reference. Lock held. */
+static GstFlowReturn
+reshow_last_locked(AdmiralPlaneSink *self)
+{
+    GstBuffer *buffer = gst_buffer_ref(self->last);
+    GstFlowReturn result = show_locked(self, buffer, TRUE);
+    gst_buffer_unref(buffer);
+    return result;
+}
+
+static GstFlowReturn
+show_locked(AdmiralPlaneSink *self, GstBuffer *buffer, gboolean reshow_call)
 {
     admiral_plane_sink_record(GST_ELEMENT(self), 1, GST_BUFFER_PTS(buffer), g_hash_table_size(self->unpresented));
     if (self->disconnected) {
@@ -433,6 +450,7 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     }
     GstFlowReturn credit = wait_credit(self, 1);
     if (credit != GST_FLOW_OK) return credit;
+    if (reshow_call && buffer != self->last) return GST_FLOW_OK; /* a newer frame won the race */
     guint32 fb = framebuffer_for(self, buffer, &error);
     if (!fb) {
         GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("%s", error->message), (NULL));
@@ -511,7 +529,7 @@ admiral_plane_sink_show_frame(GstVideoSink *video_sink, GstBuffer *buffer)
         return GST_FLOW_OK;
     }
     gint64 start = g_get_monotonic_time();
-    GstFlowReturn result = self->have_info && self->fd >= 0 && self->socket >= 0 ? show_locked(self, buffer) : GST_FLOW_NOT_NEGOTIATED;
+    GstFlowReturn result = self->have_info && self->fd >= 0 && self->socket >= 0 ? show_locked(self, buffer, FALSE) : GST_FLOW_NOT_NEGOTIATED;
     if (self->stats) {
         gint64 now = g_get_monotonic_time();
         self->render_us += now - start;
@@ -865,7 +883,7 @@ admiral_plane_sink_set_render_rectangle(GstVideoOverlay *overlay, gint x, gint y
     if (self->render.x != x || self->render.y != y || self->render.w != width || self->render.h != height) {
         self->render = (GstVideoRectangle){ x, y, width, height };
         GST_DEBUG_OBJECT(self, "Render rectangle %d,%d %dx%d", x, y, width, height);
-        if (self->last && self->have_info && self->socket >= 0 && !self->disconnected) show_locked(self, self->last);
+        if (self->last && self->have_info && self->socket >= 0 && !self->disconnected) reshow_last_locked(self);
     }
     g_mutex_unlock(&self->lock);
 }
@@ -875,7 +893,7 @@ admiral_plane_sink_expose(GstVideoOverlay *overlay)
 {
     AdmiralPlaneSink *self = (AdmiralPlaneSink *)overlay;
     g_mutex_lock(&self->lock);
-    if (self->last && self->have_info && self->socket >= 0 && !self->disconnected) show_locked(self, self->last);
+    if (self->last && self->have_info && self->socket >= 0 && !self->disconnected) reshow_last_locked(self);
     g_mutex_unlock(&self->lock);
 }
 
@@ -908,6 +926,12 @@ void admiral_plane_sink_set_engine(GstElement *element, gboolean engine)
     self->engine = engine;
     if (engine && !self->notify) self->notify = g_array_new(FALSE, FALSE, sizeof(PresentedNote));
     g_mutex_unlock(&self->lock);
+    /* The engine owns pacing (credits + appsrc timing) and promises every decoded frame is
+     * presented exactly once, in order. A late frame (rectangle change / commit stall) must
+     * therefore never be dropped by BaseSink's lateness check or made to drop decoder frames
+     * through upstream QoS. Hardware: rect changes lost 3-4 PTS per clip without this. */
+    gst_base_sink_set_qos_enabled(GST_BASE_SINK(self), !engine && g_strcmp0(g_getenv("SIGNAGE_VIDEO_QOS"), "0") != 0);
+    if (engine) gst_base_sink_set_max_lateness(GST_BASE_SINK(self), -1);
 }
 
 /* Engine visibility. Hiding removes the plane once (HIDE); the browser then retires the
@@ -929,7 +953,7 @@ void admiral_plane_sink_set_visible(GstElement *element, gboolean visible)
     } else if (visible && self->invisible) {
         self->invisible = FALSE;
         if (self->restore_on_visible && self->last && self->have_info && self->socket >= 0 && !self->disconnected)
-            show_locked(self, self->last);
+            reshow_last_locked(self);
         self->restore_on_visible = FALSE;
     }
     g_mutex_unlock(&self->lock);
