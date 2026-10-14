@@ -89,3 +89,36 @@ single-engine gates re-run before any acceptance claim). **Open:** scaled/PiP vi
 side), iframe+video commit rate (~37/s), welcome-page UI (19 commits/s), later native embed integration of UI iframes.
 Assets must be native 4K at the playlist rate with a common header contract (no 4K50 asset presented as 60).
 No full-screen restriction is part of this branch.
+
+
+## Late-frame accounting and real-time cadence (6b27a4d)
+
+**QoS is never disabled for acceptance.** 3efdc7e set the engine sink's QoS off and `max-lateness` to -1 and then
+reported "0 QoS drops"; that number measured nothing. The sink keeps the GStreamer defaults (QoS on, 5 ms), and the
+engine `status` now carries the policy and the evidence: `qos_enabled`, `max_lateness_ns`, `qos_events` /
+`qos_late_events` (upstream QoS events leaving the sink, > 5 ms late), `qos_messages`, `qos_dropped`,
+`qos_max_jitter_ns`. A claim of "no late frames" is only valid when `qos_enabled` is true and the counters are read.
+
+PTS increments do not prove 60 fps. `cadence.py LEDGER` compares each PRESENTED frame's PTS with the wall clock of its
+page-flip acknowledgement (offset drift per clip, fitted rate, flip intervals) and cross-checks missing PTS slots
+against `qos_dropped`.
+
+Root causes found on hardware (exact image, QoS on):
+
+| symptom | cause | fix |
+|---|---|---|
+| engine abort -5 / "browser stopped accepting video frames" at a clip cut (min 48 of the mixed soak), CMA 37 -> 2 MB afterwards | FLUSH_START cleared the sink's SHOW credits while the browser still owned those frames (one in flight, one queued). The first post-flush SHOW was a 3rd outstanding frame, the browser's two-slot FIFO overflowed and it dropped the channel | an engine sink keeps its credits across a flush and waits in `wait_credit()` (real backpressure); HTML sinks still HIDE and forget |
+| every rectangle change cost a display slot, lateness never recovered (blank page, 60 -> 60 fps: p50 +76 ms, 454 late-QoS events, 7 dropped per 10 s in the unit model; +16.7 ms x 2 steps per change on the board) | a geometry-only re-SHOW is its own commit; at source rate == refresh rate there is no slack to win the vblank back | geometry refreshes are folded into the next frame's SHOW while frames flow; an idle stream is refreshed by the receiver thread after 2.5 frame intervals |
+| disconnects were unattributable | the browser only said "disconnected" | `video_disconnect_traced()` logs the reason, slot occupancy and the last 48 events of a 256-entry ring; the broker logs ack-queue overflow (64) and send failures. The bound is unchanged: overflow is an explicit, notified disconnect, never a silent discard |
+
+Still physical, still counted: on the A523 a plane commit that changes the destination size/position completes its flip
+after 2 vblanks (`Commits: ... submit->flip max 33 ms`), so 1-2 display slots are lost per geometry change and 60 -> 60
+fps cannot win them back. With QoS on this shows as bounded added latency (PTS->flip moves by whole vblanks, band
+<= 55 ms) and, beyond the sink's budget, counted drops (`qos_dropped` equals the missing PTS slots exactly). A dynamic
+PiP that changes size 2.5 times a second therefore drops ~3.5 frames/s; static layouts do not.
+
+Tests: `native-engine-sink` 9 (QoS/lateness defaults), 11 (flush keeps credits; RED when `unpresented` is cleared),
+12 (geometry refresh folding); `native-engine-broker` 6 (ack queue bound + notified drop); `native-engine-realtime`
+(600 frames / 10 s through a real pipeline against a 60 Hz two-slot browser model; structural checks always, wall-clock
+checks with `SIGNAGE_RT_STRICT=1` on a quiet host, plus a 2-vblank display-stall phase asserting that no loss is
+hidden). The per-rect-change SHOW was RED (454 late events, 7 drops) before the fold and is 0/0 after.
