@@ -118,3 +118,27 @@ test('the page is transparent only while the engine video is the current surface
   assert.equal(h.events.filter((e) => e.startsWith('root:engine-live')).at(-1), 'root:engine-live:false',
     'an HTML entry gets the normal opaque page again');
 });
+
+// A playlist holding only the built-in menuboard has no engine-capable video asset, yet the page
+// creates videos through the engine adapter. It must still get the engine controller and the
+// image's /native-builtin copy (the stale /content seed has no adapter and opens a plain WebKit
+// <video>, i.e. a second v4l2 decoder created before the broker can refuse the sink).
+test('HTML-only playlist with the built-in menuboard loads the engine-adapter copy and sets up the engine', async () => {
+  const menuboard = {id: 'menuboard-pip', duration: 5, enabled: true,
+    asset: {id: 'menuboard-pip', kind: 'html', name: 'menuboard-pip', builtin: true, url: '/content/menuboard/index.html?scene=C'}};
+  const h = await harness([menuboard]);
+  assert.ok(h.events.includes('engine:attach'), 'engine controller exists for a menuboard-only playlist');
+  await h.ready();
+  const frame = h.nodes.find((n) => n.tagName === 'IFRAME');
+  assert.ok(frame, 'menuboard iframe created');
+  assert.match(frame.src, /^\/native-builtin\/menuboard\/index\.html\?scene=C|\/native-builtin\/menuboard\/index\.html\?scene=C$/);
+  assert.equal(h.nodes.some((n) => n.tagName === 'VIDEO'), false);
+});
+
+test('a third-party HTML page is not rewritten and does not by itself start the engine', async () => {
+  const page = {id: 'p', duration: 5, enabled: true, asset: {id: 'p', kind: 'html', name: 'p', url: '/content/p/index.html'}};
+  const h = await harness([page]);
+  assert.equal(h.events.includes('engine:attach'), false);
+  await h.settle();
+  assert.equal(h.nodes.find((n) => n.tagName === 'IFRAME')?.src, '/content/p/index.html');
+});

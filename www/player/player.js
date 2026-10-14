@@ -40,8 +40,12 @@
   let engine=null, engineBox=null, engineState='off', engineNext=null, engineHost=null;
   const engineRecent=[], engineWaiters=new Map();
   const engineCapable=entry=>!!(entry && entry.asset.kind==='video' && entry.asset.engine && engineState!=='failed');
+  // The built-in menuboard creates its videos through the engine adapter, so it needs the engine
+  // controller even when no playlist item is itself an engine video.
+  const engineBuiltinPage=entry=>!!(entry && entry.asset.kind==='html' && entry.asset.builtin &&
+    new URL(entry.asset.url,location.href).pathname==='/content/menuboard/index.html');
   function engineSetup() {
-    if(engine || !window.SignageVideo || !playlist.some(engineCapable)) return engine;
+    if(engine || !window.SignageVideo || !playlist.some(entry=>engineCapable(entry)||engineBuiltinPage(entry))) return engine;
     engineBox=document.createElement('div'); engineBox.className='surface engine'; engineBox.style.zIndex='0';
     stage.appendChild(engineBox);
     engine=window.SignageVideo.attach(engineBox); engineState='starting';

@@ -57,6 +57,7 @@ typedef struct {
     GHashTable *framebuffers; /* "inode:offsets:strides" -> fb */
     GHashTable *held;         /* fb -> HeldFrame, until the browser releases it */
     GstBuffer *last;          /* re-shown when the rectangle changes */
+    gboolean last_presented;  /* `last` already produced a PRESENTED identity: re-shows are geometry only */
     guint32 last_fb, serial;
     guint32 last_presented_serial;
     gboolean presentation_failed; /* cancellation is not successful EOS */
@@ -214,7 +215,8 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
                         g_hash_table_add(self->presented_pts, copy);
                     }
                 }
-                if (pts) note_presented(self, *pts, message.serial, message.fb); /* before pts is freed */
+                if (pts && *pts != GST_CLOCK_TIME_NONE) note_presented(self, *pts, message.serial, message.fb); /* before pts is freed */
+                if (message.serial == self->serial) self->last_presented = TRUE;
                 g_hash_table_remove(self->identities, GUINT_TO_POINTER(message.serial));
                 self->awaiting_fb = self->awaiting_serial = 0;
                 self->last_presented_serial = message.serial;
@@ -436,7 +438,10 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
         g_clear_error(&error);
         return GST_FLOW_ERROR;
     }
-    if (buffer != self->last) gst_buffer_replace(&self->last, buffer);
+    /* Re-SHOWing the frame already on screen (rectangle change, expose, visibility restore)
+     * moves/refreshes the plane; it must not report a second PRESENTED identity for that PTS. */
+    gboolean reshow = self->engine && buffer == self->last && self->last_presented;
+    if (buffer != self->last) { gst_buffer_replace(&self->last, buffer); self->last_presented = FALSE; }
     self->last_fb = fb;
     GstClockTime interval = GST_BUFFER_DURATION(buffer);
     if (!GST_CLOCK_TIME_IS_VALID(interval) || !interval) interval = GST_VIDEO_INFO_FPS_N(&self->info) > 0 ?
@@ -470,7 +475,7 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     self->awaiting_fb = message.fb;
     self->awaiting_serial = message.serial;
     g_hash_table_insert(self->unpresented, GUINT_TO_POINTER(message.serial), GUINT_TO_POINTER(message.fb));
-    guint64 *pts = g_new(guint64, 1); *pts = GST_BUFFER_PTS(buffer);
+    guint64 *pts = g_new(guint64, 1); *pts = reshow ? GST_CLOCK_TIME_NONE : GST_BUFFER_PTS(buffer);
     if (message.serial <= 5) g_message("Video identity: serial=%u pts=%" G_GUINT64_FORMAT " duration=%" G_GUINT64_FORMAT, message.serial, *pts, GST_BUFFER_DURATION(buffer));
     g_hash_table_insert(self->identities, GUINT_TO_POINTER(message.serial), pts);
     if (!send_message(self, &message)) return GST_FLOW_ERROR;

@@ -149,6 +149,35 @@ int main(int argc, char **argv)
         gst_buffer_unref(buffer);
         finish(self, s[1]);
     }
+    /* 7. A geometry-only re-SHOW of the frame already on screen (rectangle change / expose /
+     *    visibility restore) carries no PTS identity: its PRESENTED must not be reported as a
+     *    new presented frame, while the original and a genuinely new frame still are. */
+    {
+        AdmiralPlaneSink *self = new_sink(s, TRUE);
+        GstBus *bus = gst_bus_new();
+        gst_element_set_bus(GST_ELEMENT(self), bus);
+        g_mutex_lock(&self->lock);
+        g_hash_table_insert(self->unpresented, GUINT_TO_POINTER(1), GUINT_TO_POINTER(4));
+        g_hash_table_insert(self->unpresented, GUINT_TO_POINTER(2), GUINT_TO_POINTER(4));
+        g_hash_table_insert(self->unpresented, GUINT_TO_POINTER(3), GUINT_TO_POINTER(5));
+        guint64 *p1 = g_new(guint64, 1); *p1 = 50000000; g_hash_table_insert(self->identities, GUINT_TO_POINTER(1), p1);
+        guint64 *p2 = g_new(guint64, 1); *p2 = GST_CLOCK_TIME_NONE; g_hash_table_insert(self->identities, GUINT_TO_POINTER(2), p2);
+        guint64 *p3 = g_new(guint64, 1); *p3 = 66666666; g_hash_table_insert(self->identities, GUINT_TO_POINTER(3), p3);
+        self->serial = 3;
+        g_mutex_unlock(&self->lock);
+        for (guint32 serial = 1; serial <= 3; serial++) {
+            SignageVideoMessage presented = { .type = SIGNAGE_VIDEO_PRESENTED, .fb = serial == 3 ? 5 : 4, .serial = serial };
+            assert(send(s[1], &presented, sizeof presented, 0) == sizeof presented);
+        }
+        guint64 seen[3]; int n = 0;
+        for (GstMessage *m; n < 3 && (m = gst_bus_timed_pop_filtered(bus, 300 * GST_MSECOND, GST_MESSAGE_ELEMENT)); ) {
+            guint64 pts = 0; assert(gst_structure_get_uint64(gst_message_get_structure(m), "pts", &pts)); seen[n++] = pts; gst_message_unref(m);
+        }
+        assert(n == 2 && seen[0] == 50000000 && seen[1] == 66666666);
+        g_mutex_lock(&self->lock); assert(self->last_presented); g_mutex_unlock(&self->lock);
+        gst_element_set_bus(GST_ELEMENT(self), NULL); gst_object_unref(bus);
+        finish(self, s[1]);
+    }
     g_print("native-engine-sink: OK\n");
     return 0;
 }
