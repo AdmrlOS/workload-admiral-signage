@@ -393,6 +393,20 @@
   const boot = async () => {
     if (Q.has('native_stage')) {
       console.log('[native-menu] boot');
+      if (only === 'A') {
+        // Explicit UI-only lifecycle: scene A owns no media. Readiness is fonts +
+        // decoded images + paused animations; the browser still requires a
+        // subsequent fence-complete export and real KMS TEST_ONLY before PREPARED.
+        curtain.style.display='none'; show('A');
+        if (document.querySelector('video,audio')) { log('native-next-not-ready'); return; }
+        if (document.fonts) await document.fonts.ready;
+        await Promise.all(Array.from(document.images,image=>image.decode ? image.decode().catch(()=>{}):Promise.resolve()));
+        document.getAnimations().forEach(a=>a.pause());
+        window.addEventListener('signage-activated',()=>document.getAnimations().forEach(a=>a.play()),{once:true});
+        console.log('[native-menu] ui-ready ui-only', !!window.signageNative);
+        window.signageNative?.send({type:'ui-ready',ui_only:true});
+        return;
+      }
       const name=/^[BC]$/.test(only) ? only:'C';
       curtain.style.display='none'; show(name);
       const {ctx,stop,R}=await runScene(name);

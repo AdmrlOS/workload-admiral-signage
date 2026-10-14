@@ -418,3 +418,81 @@ test('lost native readiness notice is bounded: waits then serial fallback',async
   assert.equal(h.events.includes('play:/b'),false,'still waiting inside the bound');
   assert.ok(h.timers.size>0);
 });
+
+// ---- UI-only native lifecycle (built-in media-free pages) ----
+const builtin=(id,url,duration=18)=>({id,asset_id:id,duration,enabled:true,start:null,end:null,asset:{id,kind:'html',name:id,url,builtin:true,size:0}});
+const MENU_A='/content/menuboard/index.html?scene=A&freeze=1';
+
+test('startup first built-in menu is prepared UI-only and activated natively (no ordinary iframe)',async()=>{
+  const h=await harness([builtin('menu',MENU_A),entry('b','video')],{native:true});
+  const stage=h.events.find(e=>e.type==='native-stage');
+  assert.ok(stage,'first HTML entry must stage natively with no outgoing surface');
+  assert.equal(stage.ui_only,true);
+  assert.equal(new URL(stage.uri).pathname,'/native-builtin/menuboard/index.html');
+  assert.equal(new URL(stage.uri).searchParams.get('scene'),'A');
+  assert.equal(new URL(stage.uri).searchParams.get('native_stage'),'1');
+  assert.equal(h.nodes.some(n=>n.tagName==='IFRAME'),false);
+  h.native({event:'prepared',request:stage.request,generation:'5'}); await h.run(100);
+  const activate=h.events.find(e=>e.type==='native-activate');
+  assert.deepEqual({g:activate.generation,e:activate.endpoint},{g:'5',e:false},'startup has no outgoing endpoint');
+  h.native({event:'activated',request:stage.request,generation:'4'}); await h.settle();
+  assert.equal(h.events.filter(e=>e.type==='native-stage').length,1,'stale generation cannot activate');
+  h.native({event:'activated',request:stage.request,generation:'5'}); await h.settle();
+  assert.equal(h.nodes.some(n=>n.tagName==='IFRAME'),false,'native path never falls back to the 40 fps iframe');
+  const next=h.events.filter(e=>e.type==='native-stage')[1];
+  assert.ok(next && !next.ui_only && next.uri.includes('native_surface'),'HTML -> video prepares a decoder context');
+  assert.ok(Array.from(h.timers.values()).some(t=>t.ms===18000));
+});
+
+test('startup UI-only not-ready falls back to the ordinary iframe on the image-owned route',async()=>{
+  const h=await harness([builtin('menu',MENU_A),entry('b','video')],{native:true});
+  const stage=h.events.find(e=>e.type==='native-stage');
+  h.native({event:'not-ready',request:stage.request,generation:'0'}); await h.run(100);
+  const frame=h.nodes.find(n=>n.tagName==='IFRAME'); assert.ok(frame,'serial fallback, never parked');
+  assert.equal(frame.src,'/native-builtin/menuboard/index.html?scene=A&freeze=1');
+  assert.equal(h.events.some(e=>e.type==='native-activate'),false);
+});
+
+test('HTML -> HTML: welcome then menu are both prepared UI-only and swapped at a flip',async()=>{
+  const h=await harness([builtin('welcome','/content/welcome/index.html',12),builtin('menu',MENU_A)],{native:true});
+  const first=h.events.find(e=>e.type==='native-stage');
+  assert.ok(first.ui_only && first.uri.includes('/native-builtin/welcome/index.html'));
+  h.native({event:'prepared',request:first.request,generation:'5'}); await h.run(100);
+  h.native({event:'activated',request:first.request,generation:'5'}); await h.settle();
+  const second=h.events.filter(e=>e.type==='native-stage')[1];
+  assert.ok(second && second.ui_only && second.uri.includes('/native-builtin/menuboard/index.html'));
+  h.native({event:'prepared',request:second.request,generation:'6'}); await h.settle();
+  await h.run(12000);
+  const activate=h.events.filter(e=>e.type==='native-activate')[1];
+  assert.deepEqual({g:activate.generation,e:activate.endpoint},{g:'6',e:false});
+  assert.equal(h.events.some(e=>e.type==='native-reset'),false,'no serial reset on a prepared swap');
+  assert.equal(h.nodes.some(n=>n.tagName==='IFRAME'),false);
+});
+
+test('video -> HTML at EOS waits for the outgoing endpoint; failed activation degrades to serial',async()=>{
+  const h=await harness([entry('a','video'),builtin('menu',MENU_A)],{native:true});
+  const stage=h.events.find(e=>e.type==='native-stage');
+  assert.ok(stage && stage.ui_only,'UI-only next is prepared while the video plays');
+  assert.equal(h.nodes.filter(n=>n.tagName==='VIDEO').length,1,'no second sink');
+  h.native({event:'prepared',request:stage.request,generation:'3'});
+  const old=h.nodes.find(n=>n.tagName==='VIDEO'); old._ended=true; old.onended(); await h.settle();
+  const activate=h.events.find(e=>e.type==='native-activate');
+  assert.deepEqual({g:activate.generation,e:activate.endpoint},{g:'3',e:true});
+  assert.equal(h.events.includes('release:VIDEO'),false,'outgoing retained until ACK');
+  h.native({event:'failed',request:stage.request,generation:'3'}); await h.settle();
+  assert.ok(h.events.some(e=>e.type==='native-cancel'),'failed stage is cancelled, not parked');
+  assert.ok(h.nodes.some(n=>n.tagName==='IFRAME'),'explicit serial fallback');
+});
+
+test('arbitrary third-party HTML gets no UI-only native promise at startup',async()=>{
+  const page=entry('page','html');
+  const h=await harness([page,entry('b','video')],{native:true});
+  assert.equal(h.events.some(e=>e.type==='native-stage'),false);
+  assert.ok(h.nodes.some(n=>n.tagName==='IFRAME'));
+});
+
+test('menu scenes with video keep the decoder lifecycle (not UI-only)',async()=>{
+  const h=await harness([entry('a','video'),builtin('pip','/content/menuboard/index.html?scene=C',20)],{native:true});
+  const stage=h.events.find(e=>e.type==='native-stage');
+  assert.ok(stage && !stage.ui_only);
+});

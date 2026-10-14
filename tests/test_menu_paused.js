@@ -33,3 +33,13 @@ test('native menu keeps poster precomposited away from media plane',()=>{
  const css=fs.readFileSync('www/menuboard/menuboard.css','utf8');
  assert.match(css,/\.poster\{[^}]*will-change:opacity/);
 });
+
+test('native scene A is an explicit UI-only lifecycle: no video sink, ui_only declaration',()=>{
+ const source=fs.readFileSync('www/menuboard/menuboard.js','utf8');
+ const start=source.indexOf("if (only === 'A') {"); assert.ok(start>0);
+ const block=source.slice(start,source.indexOf('return;\n      }',start));
+ assert.doesNotMatch(block,/makeVideo|runScene|loadVideo/);
+ assert.match(block,/document\.fonts\.ready/);
+ assert.match(block,/send\(\{type:'ui-ready',ui_only:true\}\)/);
+ assert.ok(block.indexOf('a.pause()')<block.indexOf("ui_only:true"));
+});

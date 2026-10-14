@@ -74,6 +74,7 @@ static gboolean test_standby(Browser *browser, Frame *ui, const VideoState *next
     drmModeAtomicReq *request=drmModeAtomicAlloc();
     if (!request) return FALSE;
     gboolean valid=add_ui_state(browser,request,ui);
+    if (video->plane || next->fb) {
     ADD(video->plane,video->fb,next->fb);
     ADD(video->plane,video->crtc,next->fb ? browser->crtc : 0);
     ADD(video->plane,video->src_x,next->src_x); ADD(video->plane,video->src_y,next->src_y);
@@ -81,6 +82,7 @@ static gboolean test_standby(Browser *browser, Frame *ui, const VideoState *next
     ADD(video->plane,video->crtc_x,(uint64_t)(int64_t)next->crtc_x);
     ADD(video->plane,video->crtc_y,(uint64_t)(int64_t)next->crtc_y);
     ADD(video->plane,video->crtc_w,next->crtc_w); ADD(video->plane,video->crtc_h,next->crtc_h);
+    } /* no video plane: a UI-only state needs none */
     valid=valid && drmModeAtomicCommit(browser->fd,request,DRM_MODE_ATOMIC_TEST_ONLY,NULL)==0;
     drmModeAtomicFree(request); return valid;
 }
@@ -121,11 +123,35 @@ static void standby_progress(Browser *browser)
     if (retiring && g->phase==SIGNAGE_STANDBY_EMPTY &&
         (!browser->current || browser->current->owner!=retiring) &&
         (!browser->pending || browser->pending->owner!=retiring) &&
-        (!browser->queued || browser->queued->owner!=retiring) && !v->current.fb && !v->pending_valid) {
-        destroy_stage_view(retiring); browser->retiring_view=NULL;
+        (!browser->queued || browser->queued->owner!=retiring) &&
+        (browser->retiring_no_video || (!v->current.fb && !v->pending_valid))) {
+        /* A UI-only outgoing view owns no video scanout: only its UI frames
+         * must be off screen. It is recycled (never visible again). */
+        if (browser->retiring_no_video) { browser->retiring_no_video=FALSE; recycle_stage_view(browser,retiring); }
+        else destroy_stage_view(retiring);
+        browser->retiring_view=NULL;
+    }
+    if (browser->activation_requested && browser->activation_deadline &&
+        g_get_monotonic_time()>browser->activation_deadline &&
+        (g->phase==SIGNAGE_STANDBY_READY || g->phase==SIGNAGE_STANDBY_PREPARING)) {
+        /* Bounded: a missing outgoing endpoint, a stray video or a busy
+         * committer never parks the transition. Outgoing stays on screen. */
+        browser->activation_requested=FALSE; browser->activation_deadline=0;
+        native_notice(browser,"failed",g->standby);
+        return;
     }
     if (!stage || !stage->queued || !browser->stage_ui_ready || !frame_ready(stage->queued)) return;
-    if (g->phase==SIGNAGE_STANDBY_PREPARING && v->standby.fb &&
+    if (g->phase==SIGNAGE_STANDBY_PREPARING && g->ui_only) {
+        /* Actual TEST_ONLY of the exported, fence-complete incoming UI with
+         * the video plane disabled: the exact state activation will commit. */
+        static const VideoState hidden={0};
+        if (test_standby(browser,stage->queued,&hidden) &&
+            signage_standby_ready_ui(g,g->standby,stage->queued->fb,TRUE)) {
+            browser->stage_deadline=0;
+            browser->stage_ui_generation++;
+            native_notice(browser,"prepared",g->standby);
+        }
+    } else if (g->phase==SIGNAGE_STANDBY_PREPARING && v->standby.fb &&
         test_standby(browser,stage->queued,&v->standby) &&
         signage_standby_ready(g,v->standby.generation,v->standby.serial,v->standby.fb,TRUE)) {
         browser->stage_deadline=0;
@@ -135,13 +161,32 @@ static void standby_progress(Browser *browser)
     }
     if (!browser->activation_requested || browser->commit_pending || v->dirty ||
         !g_queue_is_empty(&v->waiting) || g->phase!=SIGNAGE_STANDBY_READY) return;
+    /* The outgoing stream must still be the one admitted at preparation; with
+     * none admitted, no video may be on screen at all (never hide a stray). */
+    if (signage_drm_broker_video_generation()!=g->active) return;
+    if (!g->active && (v->current.fb || v->pending_valid)) return;
+    if (g->ui_only) {
+        static const VideoState hidden={0};
+        if (!test_standby(browser,stage->queued,&hidden)) return;
+        if (!signage_standby_activate_ui(g,g->active,g->standby,browser->activation_endpoint,
+            g_get_monotonic_time(),browser->stage_ui_generation,TRUE)) return;
+        if (browser->queued) release_frame(browser,browser->queued);
+        browser->queued=stage->queued; stage->queued=NULL;
+        g->first_fb=browser->queued->fb;
+        browser->activation_frame=browser->queued;
+        /* Video HIDE only in this same atomic commit as the incoming UI. */
+        if (v->current.fb) { v->next=(VideoState){.generation=g->active}; v->dirty=TRUE; }
+        browser->activation_requested=FALSE; browser->activation_deadline=0;
+        submit_commit(browser);
+        return;
+    }
     if (!test_standby(browser,stage->queued,&v->standby)) return;
     if (!signage_standby_activate(g,g->active,g->final_serial,g->final_fb,g->standby,
         g_get_monotonic_time(),browser->stage_ui_generation,TRUE)) return;
     if (browser->queued) release_frame(browser,browser->queued);
     browser->queued=stage->queued; stage->queued=NULL;
     v->next=v->standby; v->standby=(VideoState){0}; v->dirty=TRUE;
-    browser->activation_requested=FALSE;
+    browser->activation_requested=FALSE; browser->activation_deadline=0;
     submit_commit(browser);
 }
 
@@ -229,7 +274,9 @@ static void native_command(WebKitUserContentManager *manager G_GNUC_UNUSED, JSCV
     g_message("Native bridge: command=%s stage=%d phase=%d",command,sender->root != NULL,browser->video.gate.phase);
     SignageStandby *gate=&browser->video.gate;
     if (sender->root) {
-        if (!strcmp(command,"ui-ready") && browser->staged_view==sender) {
+        if (!strcmp(command,"ui-ready") && browser->staged_view==sender &&
+            (!gate->ui_only || (json_object_has_member(obj,"ui_only") && json_object_get_boolean_member(obj,"ui_only")))) {
+            /* A UI-only stage is ready only on the page's explicit media-free declaration. */
             browser->stage_ui_ready=TRUE;
             if (sender->queued) { release_frame(sender,sender->queued); sender->queued=NULL; }
             webkit_web_view_evaluate_javascript(sender->view,
@@ -261,6 +308,10 @@ static void native_command(WebKitUserContentManager *manager G_GNUC_UNUSED, JSCV
     } else if (!strcmp(command,"native-stage")) {
         browser->stage_request=json_object_has_member(obj,"request") ? json_object_get_int_member(obj,"request"):0;
         const char *uri=json_object_has_member(obj,"uri") ? json_object_get_string_member(obj,"uri"):NULL;
+        /* Explicit UI-only lifecycle (built-in pages that declare no media):
+         * reserves a WebView + its UI scanout buffers only. No broker slot,
+         * producer, decoder or CMA video context, so no video can be faked. */
+        gboolean ui_only=json_object_has_member(obj,"ui_only") && json_object_get_boolean_member(obj,"ui_only");
         guint64 available=0,required=0; unsigned contexts=0;
         GError *error=NULL; GUri *target=uri ? g_uri_parse(uri,G_URI_FLAGS_NONE,&error):NULL;
         gboolean local=target && !g_strcmp0(g_uri_get_scheme(target),"http") &&
@@ -277,12 +328,18 @@ static void native_command(WebKitUserContentManager *manager G_GNUC_UNUSED, JSCV
             g_clear_error(&error);
             g_object_unref(parser); return;
         }
-        if (local && !browser->staged_view && !browser->retiring_view && gate->phase==SIGNAGE_STANDBY_EMPTY &&
-            browser->ui_width==3840 && browser->ui_height==2160 && browser->ui_scale==1 &&
-            mode_refresh(&browser->mode)==60 && standby_capacity(uri,&available,&required,&contexts))
+        gboolean admitted=local && !browser->staged_view && !browser->retiring_view && gate->phase==SIGNAGE_STANDBY_EMPTY &&
+            browser->ui_width==3840 && browser->ui_height==2160 && browser->ui_scale==1 && mode_refresh(&browser->mode)==60;
+        gboolean prepared=FALSE;
+        if (admitted && ui_only) {
+            generation=signage_drm_broker_ui_token();
+            prepared=generation && signage_standby_prepare_ui(gate,signage_drm_broker_video_generation(),generation);
+        } else if (admitted && standby_capacity(uri,&available,&required,&contexts)) {
             generation=signage_drm_broker_video_reserve();
-        if (!generation || !signage_standby_prepare(gate,signage_drm_broker_video_generation(),generation,contexts,available,required)) {
-            if (generation) signage_drm_broker_video_retired(generation);
+            prepared=generation && signage_standby_prepare(gate,signage_drm_broker_video_generation(),generation,contexts,available,required);
+            if (generation && !prepared) signage_drm_broker_video_retired(generation);
+        }
+        if (!prepared) {
             native_notice(browser,"not-ready",0);
         } else {
             VideoState *endpoint=&browser->video.endpoint;
@@ -303,6 +360,7 @@ static void native_command(WebKitUserContentManager *manager G_GNUC_UNUSED, JSCV
             } else { g_free((char *)stage->uri); stage->last_visible_export=0; }
             stage->uri=g_strdup_printf("%s%csignage_standby=%" G_GUINT64_FORMAT,uri,strchr(uri,'?') ? '&':'?',generation);
             browser->staged_view=stage; browser->stage_ui_ready=FALSE; browser->activation_requested=FALSE;
+            browser->activation_deadline=0; browser->activation_frame=NULL;
             browser->stage_deadline=g_get_monotonic_time()+15*G_USEC_PER_SEC;
             gint64 initialize_started=g_get_monotonic_time();
             gboolean initialized=TRUE;
@@ -315,7 +373,8 @@ static void native_command(WebKitUserContentManager *manager G_GNUC_UNUSED, JSCV
                 g_message("Transition initialize mono=%" G_GINT64_FORMAT " elapsed_us=%" G_GINT64_FORMAT,initialize_started,g_get_monotonic_time()-initialize_started);
             if (!initialized) {
                 destroy_stage_view(stage); browser->staged_view=NULL;
-                signage_standby_cancel(gate,generation); signage_drm_broker_video_retired(generation);
+                signage_standby_cancel(gate,generation);
+                if (!ui_only) signage_drm_broker_video_retired(generation);
                 native_notice(browser,"not-ready",generation);
             }
         }
@@ -324,6 +383,10 @@ static void native_command(WebKitUserContentManager *manager G_GNUC_UNUSED, JSCV
     } else if (!strcmp(command,"native-activate")) {
         guint64 generation=json_object_has_member(obj,"generation") ? g_ascii_strtoull(json_object_get_string_member(obj,"generation"),NULL,10):0;
         if (generation==gate->standby && gate->phase==SIGNAGE_STANDBY_READY) {
+            /* endpoint: outgoing video ended at EOS (UI-only waits for its
+             * final interval). Activation is bounded; see standby_progress. */
+            browser->activation_endpoint=json_object_has_member(obj,"endpoint") && json_object_get_boolean_member(obj,"endpoint");
+            browser->activation_deadline=g_get_monotonic_time()+2*G_USEC_PER_SEC;
             browser->activation_requested=TRUE; standby_progress(browser);
         } else native_notice(browser,"not-ready",generation);
     } else if (!strcmp(command,"native-reset")) {
@@ -335,6 +398,7 @@ static void native_command(WebKitUserContentManager *manager G_GNUC_UNUSED, JSCV
                 webkit_web_view_evaluate_javascript(visible->view,
                     "document.querySelectorAll('video,audio').forEach(v=>{v.pause();v.removeAttribute('src');v.load()})",-1,NULL,NULL,NULL,NULL,NULL);
                 browser->retiring_view=visible; browser->visible_view=NULL;
+                browser->retiring_no_video=FALSE; /* its video may still be on screen */
             }
             browser->orchestrator_hidden=FALSE;
         }

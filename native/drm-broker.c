@@ -546,8 +546,17 @@ void signage_drm_broker_video_retired(guint64 generation) {
     if (broker.reserved == generation) broker.reserved = 0;
 }
 void signage_drm_broker_video_activate(guint64 generation) { broker.active = generation; broker.reserved = 0; }
+/* After the exact UI-only activation flip: the outgoing stream stops being the
+ * active producer (its later SHOW/HIDE are cancelled, never displayed) while
+ * its slot stays occupied until exact retirement / EOF. */
+void signage_drm_broker_video_deactivate(guint64 generation) { if (generation && broker.active == generation) broker.active = 0; }
+/* A UI-only standby token: unique and monotonic with stream generations, but
+ * it owns no slot, so no producer can ever bind to it. */
+guint64 signage_drm_broker_ui_token(void) { return broker.generation == G_MAXUINT64 ? 0 : ++broker.generation; }
 guint64 signage_drm_broker_video_reserve(void) {
-    if (!broker.active || broker.reserved || broker.generation == G_MAXUINT64) return 0;
+    /* No active stream is allowed (UI-only outgoing); the reserved slot then
+     * becomes active only at its exact activation flip. */
+    if (broker.reserved || broker.generation == G_MAXUINT64) return 0;
     for (unsigned i = 0; i < 2; i++) if (!broker.clients[i].generation) {
         broker.reserved = ++broker.generation;
         broker.clients[i].generation = broker.reserved;

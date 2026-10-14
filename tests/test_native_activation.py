@@ -17,7 +17,7 @@ class NativeActivation(unittest.TestCase):
 #include "standby-protocol.h"
 '''+types+r'''
 typedef struct { uint32_t fb; gboolean ready; void *owner; } Frame;
-typedef struct { VideoPlane video; void *staged_view,*retiring_view; guint64 cancelled_generation,dead_generation,stage_ui_generation; int64_t stage_deadline; gboolean stage_ui_ready,activation_requested,commit_pending; Frame *queued,*current,*pending; int fd; uint32_t crtc; } Browser;
+typedef struct { VideoPlane video; void *staged_view,*retiring_view; guint64 cancelled_generation,dead_generation,stage_ui_generation; int64_t stage_deadline; gboolean stage_ui_ready,activation_requested,commit_pending,activation_endpoint,retiring_no_video; int64_t activation_deadline; Frame *activation_frame; Frame *queued,*current,*pending; int fd; uint32_t crtc; } Browser;
 typedef struct {unsigned properties;} drmModeAtomicReq;
 #define DRM_MODE_ATOMIC_TEST_ONLY 0x100
 static unsigned tests,commits,acks,notices;

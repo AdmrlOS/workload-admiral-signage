@@ -37,6 +37,32 @@ HTML without this lifecycle cannot report ready and fails/stalls explicitly;
 this does not certify all third-party HTML packages. Static media-free HTML keeps
 its existing browser staging path, which is not a physical-vblank guarantee.
 
+## UI-only native lifecycle (startup, HTML->HTML, video->HTML, HTML->video)
+
+Built-in media-free pages (welcome, menuboard scene A) declare an explicit
+UI-only lifecycle: `native-stage` carries `ui_only:true`, the gate takes a
+token from the broker generation counter that owns no slot (no producer,
+decoder or CMA video context can bind to it), and the page sends
+`{type:'ui-ready',ui_only:true}` after fonts, decoded images and paused
+animations. PREPARED then still requires a later fence-complete export of the
+staged 3840x2160/scale-1 view and an actual KMS TEST_ONLY of that UI with the
+video plane disabled. No PREPARED/ACTIVATED broker ACK is sent (there is no
+producer) and no video frame is fabricated.
+
+Activation commits the incoming UI in one atomic request; if outgoing video is
+on screen its HIDE is in that same request. At startup or from a UI-only page
+there is no outgoing endpoint and none is required; activation is refused if
+any untracked video is on screen. After an outgoing video EOS the player sends
+`endpoint:true` and the commit waits for the exact final frame interval.
+`activated` is routed only after the pageflip of that exact UI frame; then the
+outgoing stream is deactivated (its later SHOWs are CANCELLED, never queued)
+and retired only after exact RELEASED/EOF. A UI-only outgoing view is recycled
+into the one-view pool once its UI is off screen. HTML->video with no outgoing
+stream reserves a slot without an active one; that slot becomes active only at
+its own matching flip. Activation is bounded (2 s) and reports `failed`, which
+the player turns into cancel + explicit serial fallback, never a parked
+transition. Arbitrary third-party HTML gets no UI-only promise.
+
 ## Admission and explicit failure
 
 Admission fails closed when `SIGNAGE_STANDBY_CONTEXTS` (at least 2) and

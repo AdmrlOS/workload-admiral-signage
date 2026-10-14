@@ -47,6 +47,14 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(response.read(), b'new native lifecycle')
             self.assertEqual(response.headers['Cache-Control'], 'no-store')
 
+    def test_native_builtin_welcome_route_serves_image_copy_no_store(self):
+        folder = server.APP_ROOT / 'www/welcome'
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'index.html').write_text('image welcome')
+        with urlopen(self.base + '/native-builtin/welcome/index.html?native_stage=1') as response:
+            self.assertEqual(response.read(), b'image welcome')
+            self.assertEqual(response.headers['Cache-Control'], 'no-store')
+
     def test_media_range_and_suffix(self):
         for header, body, content_range in (("bytes=2-4", b"234", "bytes 2-4/10"),
                 ("bytes=-3", b"789", "bytes 7-9/10"), ("bytes=8-", b"89", "bytes 8-9/10")):

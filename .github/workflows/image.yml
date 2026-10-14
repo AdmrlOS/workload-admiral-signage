@@ -46,7 +46,7 @@ jobs:
           node --check www/studio/studio.js
           node --check www/player/player.js
           node --check www/player/bridge.js
-          node --test tests/test_player.js tests/test_display_status.js
+          node --test tests/test_player.js tests/test_display_status.js tests/test_welcome_lifecycle.js tests/test_menu_paused.js
       # Rootful Podman: tonistiigi/binfmt registers inside the container, not on the host,
       # so `docker run` of the arm64 image fails with Exec format error. Install the host
       # interpreter (F = fix-binary) so the registration survives and containers can use it.

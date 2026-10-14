@@ -76,6 +76,8 @@ void signage_drm_broker_video_retired(guint64 generation);
 gboolean signage_drm_broker_video_connected(guint64 generation);
 gboolean signage_drm_broker_video_tx_idle(guint64 generation);
 void signage_drm_broker_video_activate(guint64 generation);
+void signage_drm_broker_video_deactivate(guint64 generation);
+guint64 signage_drm_broker_ui_token(void);
 guint64 signage_drm_broker_video_reserve(void);
 guint64 signage_drm_broker_video_generation(void);
 void signage_drm_broker_video_disconnect(void);

@@ -33,10 +33,34 @@
     const count=nativeRefused.key===key ? nativeRefused.count+1 : 1;
     nativeRefused={key,count,until:Date.now()+Math.min(NATIVE_REFUSAL_MAX_MS,NATIVE_REFUSAL_MIN_MS*2**(count-1))};
   }
+  // Built-in seeds persist in /data from the first image and are never refreshed, and /content/
+  // subresources are cached for an hour. Built-in pages load the image's own copy (no-store).
+  const BUILTIN_ROUTES={'/content/menuboard/index.html':'/native-builtin/menuboard/index.html',
+    '/content/welcome/index.html':'/native-builtin/welcome/index.html'};
+  const builtinUrl=asset=>{
+    if(!asset.builtin) return asset.url;
+    const uri=new URL(asset.url,location.href), route=BUILTIN_ROUTES[uri.pathname];
+    return route ? route+uri.search : asset.url;
+  };
+  // Native lifecycle of the next entry: 'ui' = built-in page with an explicit media-free
+  // preparation lifecycle (no decoder/broker context); 'video' = needs a decoder context.
+  // Arbitrary third-party HTML gets no UI-only gapless promise.
+  function nativeMode(entry) {
+    const a=entry?.asset;
+    if(!a) return null;
+    if(a.kind==='video') return 'video';
+    if(a.kind!=='html') return null;
+    if(a.builtin) {
+      const uri=new URL(a.url,location.href);
+      if(uri.pathname==='/content/welcome/index.html') return 'ui';
+      if(uri.pathname==='/content/menuboard/index.html' && uri.searchParams.get('scene')==='A') return 'ui';
+    }
+    return 'video';
+  }
   function nativeSend(message) { window.signageNative?.send(message); }
   window.addEventListener('signage-native',event=>{
     const data=event.detail;
-    if(data.event==='ended' && current?.native && data.generation===nativeActiveGeneration) { advance(); return; }
+    if(data.event==='ended' && current?.native && data.generation===nativeActiveGeneration) { current.endedAtEos=true; advance(); return; }
     if(!nativeStage || data.request!==nativeStage.request) return;
     if(data.event==='prepared') { nativeRefused={key:null,until:0,count:0}; nativeStage.generation=data.generation; nativeStage.ready=true; nativeStage.prepared?.(true); }
     else if(data.event==='not-ready' || data.event==='cancelled' || data.event==='failed') {
@@ -88,22 +112,23 @@
     warm(next);
     if((staged && staged.key===signature(next)) || (nativeStage && !nativeStage.error && nativeStage.key===signature(next))) return;
     cancelStage();
-    if(window.signageNative && current && next && !nativeRefusedFor(signature(next)) &&
-        (next.asset.kind==='video' || next.asset.kind==='html') &&
-        (current.entry.asset.kind==='video' || current.native) &&
-        (next.asset.url!==current.entry.asset.url || current.native)) {
+    const mode=nativeMode(next);
+    // UI-only pages can be prepared from any outgoing surface, including none (startup).
+    // A decoder context still requires an outgoing video or native surface.
+    const outgoingOk=mode==='ui' ? (!current || current.native || next.asset.url!==current.entry.asset.url)
+      : current && (current.entry.asset.kind==='video' || current.native) && (next.asset.url!==current.entry.asset.url || current.native);
+    if(window.signageNative && next && mode && !nativeRefusedFor(signature(next)) && outgoingOk) {
       const uri=next.asset.kind==='video' ? new URL('/player/',location.href) : new URL(next.asset.url,location.href);
       if(next.asset.kind==='video') uri.searchParams.set('native_surface',new URL(next.asset.url,location.href).href);
       else {
         // Built-in seeds persist in /data and WebKit caches JS for an hour.
         // Stage the matching image's lifecycle without mutating published data.
-        if (next.asset.builtin && uri.pathname==='/content/menuboard/index.html')
-          uri.pathname='/native-builtin/menuboard/index.html';
+        if (next.asset.builtin && BUILTIN_ROUTES[uri.pathname]) uri.pathname=BUILTIN_ROUTES[uri.pathname];
         uri.searchParams.set('native_stage','1');
       }
-      const slot={key:signature(next),request:++nativeRequest,ready:false,generation:null};
+      const slot={key:signature(next),request:++nativeRequest,ready:false,generation:null,uiOnly:mode==='ui'};
       nativeStage=slot;
-      nativeSend({type:'native-stage',request:slot.request,uri:uri.href});
+      nativeSend({type:'native-stage',request:slot.request,uri:uri.href,...(slot.uiOnly ? {ui_only:true} : {})});
       return;
     }
     // Static opt-in packages are enforced media-free by response CSP. Arbitrary
@@ -245,7 +270,7 @@
       } else {
         // Append about:blank first so the handshake can bind to its WindowProxy before navigation.
         stage.appendChild(node); ready=handshake(node,'signage-ready',15000);
-        node.src=hidden ? a.url+(a.url.includes('?')?'&':'?')+'signage_stage=1' : a.url;
+        node.src=hidden ? a.url+(a.url.includes('?')?'&':'?')+'signage_stage=1' : builtinUrl(a);
       }
       await ready; if (a.kind !== 'video') await paint(); return item;
     } catch(error) { remove(item); throw error; }
@@ -257,7 +282,7 @@
     const active=() => item.generation===generation && current===item && !stopped && !item.fired;
     const finish=(reason='duration') => {
       if(!active()) return;
-      item.fired=true;
+      item.fired=true; item.endedAtEos=reason==='ended';
       if(debugOn) {
         const q=item.node.getVideoPlaybackQuality?.();
         dbg('end transition', {id:item.entry.asset.id, generation, reason, ct:item.node.currentTime,
@@ -337,7 +362,9 @@
           // fall through to the serial path below
         } else {
         const activated=new Promise(resolve=>{slot.resolve=resolve;});
-        nativeSend({type:'native-activate',generation:slot.generation});
+        // endpoint: the outgoing video reached EOS, so a UI-only incoming waits for its exact
+        // final frame interval. Otherwise (timed page, startup) outgoing video hides in the same flip.
+        nativeSend({type:'native-activate',generation:slot.generation,endpoint:!!current?.endedAtEos});
         if(await activated) {
           const old=current;
           // Native matching flip already switched UI+video. Teardown cannot precede it.

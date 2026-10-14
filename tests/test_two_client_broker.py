@@ -68,6 +68,13 @@ static void handler(const SignageVideoMessage *m,gpointer data) {
  signage_drm_broker_video_retired(10); broker.generation=11;
  assert(signage_drm_broker_video_reserve()==12);
  assert(signage_drm_broker_video_reserve()==0);
+ { guint64 t=signage_drm_broker_ui_token(); /* UI-only token owns no slot */
+   assert(t==13 && broker.reserved==12 && broker.clients[0].generation!=13 && broker.clients[1].generation!=13);
+   signage_drm_broker_video_deactivate(10); assert(broker.active==11);
+   signage_drm_broker_video_deactivate(11); assert(broker.active==0 && broker.clients[1].generation==11);
+   signage_drm_broker_video_retired(12); assert(!broker.reserved);
+   /* No active stream (UI-only outgoing): a slot is reserved, never made active early. */
+   assert(signage_drm_broker_video_reserve()==14 && broker.reserved==14 && !broker.active); }
  for(unsigned i=0;i<2;i++) { drop_client''')
   flags=subprocess.check_output(['pkg-config','--cflags','--libs','gio-2.0'],text=True).split()
   with tempfile.TemporaryDirectory() as d:

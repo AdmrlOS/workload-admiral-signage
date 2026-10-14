@@ -205,6 +205,10 @@ typedef struct {
     void *staged_view, *visible_view, *retiring_view, *spare_view;
     gint64 last_visible_export;
     gboolean stage_ui_ready, activation_requested, orchestrator_hidden;
+    gboolean activation_endpoint; /* UI-only: outgoing ended at EOS, wait for its final interval */
+    gboolean retiring_no_video;   /* retiring view was UI-only: owns no video scanout */
+    gint64 activation_deadline;
+    Frame *activation_frame;      /* exact incoming UI frame of a UI-only activation commit */
     guint64 stage_request, stage_ui_generation, dead_generation, cancelled_generation;
     guint stage_tick;
     gint64 stage_deadline;
@@ -880,12 +884,14 @@ static gboolean submit_commit(Browser *browser)
             signage_drm_broker_video_ack(video->next.generation, SIGNAGE_VIDEO_CANCELLED, rejected, video->next.serial);
             if (video->gate.phase == SIGNAGE_STANDBY_COMMITTING) {
                 /* A failed activation is NOT allowed to put incoming UI on the old video. */
-                guint64 failed = video->next.generation;
+                guint64 failed = video->gate.standby;
                 video->dirty=FALSE;
-                video->gate.phase = SIGNAGE_STANDBY_READY;
+                signage_standby_activation_failed(&video->gate, failed);
                 Browser *stage=browser->staged_view;
                 if (stage && browser->queued) { stage->queued=browser->queued; browser->queued=NULL; }
-                video->standby=video->next;
+                browser->activation_frame = NULL;
+                if (!video->gate.ui_only) video->standby=video->next;
+                else video->next=(VideoState){0};
                 native_notice(browser, "failed", failed);
                 return TRUE;
             }
@@ -1046,10 +1052,13 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
         video->pending_valid = FALSE;
         if (video->current.fb && !video->current.cancelled)
             signage_drm_broker_video_ack(video->current.generation, SIGNAGE_VIDEO_PRESENTED, video->current.fb, video->current.serial);
+        guint64 outgoing_before = video->gate.active;
         if (signage_standby_flipped(&video->gate, video->current.generation, video->current.serial, video->current.fb)) {
             signage_drm_broker_video_activate(video->current.generation);
             signage_drm_broker_video_ack(video->current.generation, SIGNAGE_VIDEO_ACTIVATED, video->current.fb, video->current.serial);
+            /* A UI-only outgoing view had no video: recycle it once its UI is off screen. */
             browser->retiring_view = browser->visible_view;
+            browser->retiring_no_video = browser->retiring_view && outgoing_before == 0;
             browser->visible_view = browser->staged_view; browser->staged_view = NULL;
             browser->orchestrator_hidden = TRUE;
             Browser *visible = browser->visible_view;
@@ -1077,6 +1086,26 @@ static void frame_presented(int fd, unsigned sequence, unsigned seconds, unsigne
         browser->pending = NULL;
         release_frame(browser, retired);
         browser->presented++;
+        /* UI-only activation: exactly this prepared UI frame (and the video
+         * HIDE committed with it) is now on screen. Only now ACK/route. */
+        if (browser->activation_frame && browser->activation_frame == browser->current) {
+            SignageStandby *gate = &video->gate;
+            guint64 token = gate->standby, outgoing = gate->active;
+            browser->activation_frame = NULL;
+            if (signage_standby_flipped_ui(gate, token, browser->current->fb)) {
+                /* Outgoing SHOW/HIDE can no longer reach the plane; its slot
+                 * is freed only after exact retirement / EOF. */
+                signage_drm_broker_video_deactivate(outgoing);
+                browser->retiring_view = browser->visible_view;
+                browser->retiring_no_video = browser->retiring_view && outgoing == 0;
+                browser->visible_view = browser->staged_view; browser->staged_view = NULL;
+                browser->orchestrator_hidden = TRUE;
+                Browser *visible = browser->visible_view;
+                webkit_web_view_evaluate_javascript(visible->view,
+                    "window.dispatchEvent(new CustomEvent('signage-native',{detail:{event:'play'}}))", -1, NULL, NULL, NULL, NULL, NULL);
+                native_notice(browser, "activated", token);
+            }
+        }
         if (browser->presented == 1) {
             if (browser->copy_mode)
                 g_message("First browser frame scanned out on plane %u via GPU copy into a contiguous KMS buffer; alpha preserved", browser->primary);
@@ -1137,6 +1166,17 @@ static void video_message(const SignageVideoMessage *message, gpointer data)
         signage_standby_cancel(&video->gate, generation);
         browser->cancelled_generation = generation;
         native_notice(browser, "cancelled", generation);
+        return;
+    }
+    if (video->gate.ui_only && generation == video->gate.active && generation &&
+        (video->gate.phase == SIGNAGE_STANDBY_COMMITTING || video->gate.phase == SIGNAGE_STANDBY_RETIRING) &&
+        message->type == SIGNAGE_VIDEO_SHOW) {
+        /* Outgoing frames after a UI-only activation commit never reach the
+         * plane: the same commit hid it. Credit returns as CANCELLED. */
+        VideoState state = { .fb=message->fb, .serial=message->serial, .generation=generation };
+        VideoState *owner = message->fb ? g_hash_table_lookup(video->serials, GUINT_TO_POINTER(message->fb)) : NULL;
+        signage_drm_broker_video_ack(generation, SIGNAGE_VIDEO_CANCELLED, message->fb, message->serial);
+        if (message->fb && (!owner || owner->generation == generation)) { remember_video(video, &state); video_release_if_unused(browser, message->fb); }
         return;
     }
     if (message->type == SIGNAGE_VIDEO_DISCONNECTED && !incoming && generation != signage_drm_broker_video_generation()) {
