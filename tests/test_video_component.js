@@ -222,3 +222,21 @@ test('re-acquiring after another page held the engine re-sends our unchanged rec
   assert.equal(env.posted.filter((p) => p.body?.cmd === 'play').length, 1);
   video.destroy();
 });
+
+test('rect inside a CSS-zoomed fixed canvas is scaled by the body zoom (WPE reports unzoomed rects)', () => {
+  const env = fakeEnv({dpr: 1});
+  const mkDoc = (probeWidth) => {
+    const doc = {
+      body: {appendChild() {}},
+      createElement: () => ({style: {}, getBoundingClientRect: () => ({width: probeWidth}), remove() {}}),
+    };
+    doc.defaultView = {getComputedStyle: () => ({zoom: String(2560 / 1920)})};
+    return doc;
+  };
+  const el = (doc) => ({ownerDocument: doc, getBoundingClientRect: () => ({left: 1280, top: 720, right: 1920, bottom: 1080})});
+  /* menuboard corner box 1280,720 640x360 on a 1920 canvas fitted to a 2560x1440 viewport */
+  assert.deepEqual(api.physicalRect(el(mkDoc(100)), env), {x: 1707, y: 960, w: 853, h: 480});
+  /* an engine that already returns zoomed coordinates is not scaled twice */
+  const zoomed = {ownerDocument: mkDoc(133.33), getBoundingClientRect: () => ({left: 1706.67, top: 960, right: 2560, bottom: 1440})};
+  assert.deepEqual(api.physicalRect(zoomed, env), {x: 1707, y: 960, w: 853, h: 480});
+});

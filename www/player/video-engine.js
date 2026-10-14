@@ -92,10 +92,29 @@
     }
   }
 
+  /* bridge.js fits fixed-canvas pages with CSS `zoom` on <body>. WPE's getBoundingClientRect
+   * reports coordinates inside a zoomed body unscaled, so the rect must be multiplied by the zoom;
+   * an engine that already reports zoomed coordinates is detected with a 100px probe. */
+  function bodyZoom(element) {
+    const doc = element.ownerDocument, win = doc?.defaultView;
+    if (!doc?.body || !win?.getComputedStyle) return 1;
+    const zoom = parseFloat(win.getComputedStyle(doc.body).zoom) || 1;
+    if (Math.abs(zoom - 1) < 1e-3) return 1;
+    if (doc.__signageZoom !== zoom) {
+      const probe = doc.createElement('div');
+      probe.style.cssText = 'position:absolute;left:0;top:0;width:100px;height:1px;visibility:hidden';
+      doc.body.appendChild(probe);
+      const width = probe.getBoundingClientRect().width;
+      probe.remove();
+      doc.__signageZoom = zoom;
+      doc.__signageRectScale = Math.abs(width - 100) < Math.abs(width - 100 * zoom) ? zoom : 1;
+    }
+    return doc.__signageRectScale;
+  }
   function physicalRect(element, env, offset = {x: 0, y: 0}) {
-    const r = element.getBoundingClientRect(), dpr = env.window.devicePixelRatio || 1;
-    const x = Math.round((r.left + offset.x) * dpr), y = Math.round((r.top + offset.y) * dpr);
-    return {x, y, w: Math.max(0, Math.round((r.right + offset.x) * dpr) - x), h: Math.max(0, Math.round((r.bottom + offset.y) * dpr) - y)};
+    const r = element.getBoundingClientRect(), dpr = env.window.devicePixelRatio || 1, s = bodyZoom(element);
+    const x = Math.round((r.left * s + offset.x) * dpr), y = Math.round((r.top * s + offset.y) * dpr);
+    return {x, y, w: Math.max(0, Math.round((r.right * s + offset.x) * dpr) - x), h: Math.max(0, Math.round((r.bottom * s + offset.y) * dpr) - y)};
   }
 
   /* One controller per page instance; only one independent video at a time. */
