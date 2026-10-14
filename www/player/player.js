@@ -34,6 +34,55 @@
     nativeRefused={key,count,until:Date.now()+Math.min(NATIVE_REFUSAL_MAX_MS,NATIVE_REFUSAL_MIN_MS*2**(count-1))};
   }
   function nativeSend(message) { window.signageNative?.send(message); }
+  // Persistent single-decoder engine: one native pipeline for every engine-prepared video.
+  // Engine videos never create a <video>/WebKit pipeline; handoffs between them are queued
+  // on the engine timeline (at:'boundary') and confirmed by the first PRESENTED frame.
+  let engine=null, engineBox=null, engineState='off', engineNext=null, engineHost=null;
+  const engineRecent=[], engineWaiters=new Map();
+  const engineCapable=entry=>!!(entry && entry.asset.kind==='video' && entry.asset.engine && engineState!=='failed');
+  function engineSetup() {
+    if(engine || !window.SignageVideo || !playlist.some(engineCapable)) return engine;
+    engineBox=document.createElement('div'); engineBox.className='surface engine'; engineBox.style.zIndex='0';
+    stage.appendChild(engineBox);
+    engine=window.SignageVideo.attach(engineBox); engineState='starting';
+    engine.ready.then(()=>{ engineState='ready'; dbg('engine ready'); })
+      .catch(error=>{ engineState='failed'; console.warn('Video engine unavailable; legacy <video> path:',error.message); });
+    engine.addEventListener('engine-disconnected',()=>{ if(engineState==='ready') engineState='starting'; });
+    engine.addEventListener('engine-ready',()=>{ if(engineState!=='failed') engineState='ready'; });
+    engine.addEventListener('started',event=>engineStarted(event.detail));
+    engine.addEventListener('ended',event=>engineEnded(event.detail));
+    engine.addEventListener('waiting',event=>dbg('engine waiting',{asset:event.detail.asset}));
+    return engine;
+  }
+  async function engineReady() {
+    engineSetup();
+    if(!engine) return false;
+    try { await engine.ready; } catch(_) { return false; }
+    if(engineState==='released') {
+      const back=new Promise(resolve=>{ const fn=()=>{ engine.removeEventListener('engine-ready',fn); resolve(); }; engine.addEventListener('engine-ready',fn); });
+      await engine.transport.command('acquire'); await back; engineState='ready';
+    }
+    return engineState==='ready';
+  }
+  async function engineRelease() {
+    // Legacy asset without a prepared variant: free the only decoder explicitly (non-gapless).
+    if(!engine || engineState!=='ready') return;
+    engineNext=null; await engine.release().catch(()=>{}); engineState='released';
+  }
+  function engineStarted(event) {
+    engineRecent.push(event.play_id); if(engineRecent.length>16) engineRecent.shift();
+    engineWaiters.get(event.play_id)?.(); engineWaiters.delete(event.play_id);
+    if(engineNext && event.play_id===engineNext.playId && current?.engine) {
+      // Gapless handoff already happened on the engine timeline; follow it.
+      const entry=engineNext.entry; engineNext=null;
+      current.entry=entry; current.playId=event.play_id; current.held=false;
+      notify(entry); arm(current); lookahead();
+    }
+  }
+  function engineEnded(event) {
+    if(!current?.engine || current.playId!==event.play_id) return;
+    if(event.reason==='complete' && !engineNext) current.finish?.('ended');
+  }
   window.addEventListener('signage-native',event=>{
     const data=event.detail;
     if(data.event==='ended' && current?.native && data.generation===nativeActiveGeneration) { advance(); return; }
@@ -86,9 +135,20 @@
       fetch('/api/preload',{method:'POST',headers:{'Content-Type':'application/json','X-Signage-Request':'player'},body:JSON.stringify({urls})}).then(response=>{if(!response.ok) cacheWindow='';}).catch(()=>{ cacheWindow=''; });
     }
     warm(next);
+    if(current?.engine) {
+      if(engineNext && engineNext.key!==signature(next)) { engine.cancel(engineNext.entry.asset.url); engineNext=null; }
+      if(!engineNext && engineCapable(next) && engineState==='ready') {
+        const slot={key:signature(next),entry:next,playId:null}; engineNext=slot;
+        engine.play(next.asset.url,{at:'boundary'}).then(ack=>{
+          if(engineNext!==slot) return;
+          if(ack.ok) slot.playId=ack.play_id; else { engineNext=null; console.warn('Engine refused next item:',ack.code); }
+        });
+      }
+      if(engineCapable(next)) return;
+    }
     if((staged && staged.key===signature(next)) || (nativeStage && !nativeStage.error && nativeStage.key===signature(next))) return;
     cancelStage();
-    if(window.signageNative && current && next && !nativeRefusedFor(signature(next)) &&
+    if(window.signageNative && !engine && current && next && !nativeRefusedFor(signature(next)) &&
         (next.asset.kind==='video' || next.asset.kind==='html') &&
         (current.entry.asset.kind==='video' || current.native) &&
         (next.asset.url!==current.entry.asset.url || current.native)) {
@@ -130,6 +190,12 @@
   }
   function remove(item) {
     if (!item) return;
+    if (item.engine) {
+      cancelProgress(item); clearTimeout(item.watchdog);
+      if(!item.keepEngine) engine?.hide();
+      return;
+    }
+    if (item.node.tagName === 'IFRAME') engineHost?.dropFrame(item.node);
     cancelProgress(item);
     clearTimeout(item.watchdog);
     if (item.node.tagName === 'VIDEO' && !item.released) { item.released = true; item.node.onended = item.node.onerror = item.node.ontimeupdate = null; item.node.pause(); item.node.removeAttribute('src'); item.node.load(); }
@@ -151,7 +217,7 @@
     });
   }
   async function hold(item, nextPoster) {
-    if (!item || item.held) return;
+    if (!item || item.held || item.engine) return;
     item.held = true;
     if (item.node.tagName === 'VIDEO') {
       dbg('hold start', {id:item.entry.asset.id});
@@ -177,8 +243,26 @@
       await held;
     }
   }
+  async function prepareEngine(entry) {
+    const item={entry,node:engineBox,engine:true,held:false,watchdog:0,poll:0,fired:false,playId:null};
+    const started=new Promise((resolve,reject)=>{
+      item.started=resolve;
+      item.watchdog=setTimeout(()=>reject(new Error('Engine video did not start')),15000);
+    });
+    const ack=await engine.transport.command('acquire').then(()=>engine.play(entry.asset.url,{at:current?.engine ? 'now' : 'boundary'}));
+    if(!ack.ok) { clearTimeout(item.watchdog); throw new Error('Engine refused video: '+ack.code); }
+    item.playId=ack.play_id;
+    if(engineRecent.includes(item.playId)) item.started(); else engineWaiters.set(item.playId,item.started);
+    try { await started; } finally { clearTimeout(item.watchdog); engineWaiters.delete(item.playId); }
+    if(current?.engine) current.keepEngine=true; // the box now shows the new instance
+    return item;
+  }
   async function prepare(entry, hidden=false, created=()=>{}) {
     const a = entry.asset;
+    if (!hidden && a.kind==='video') {
+      if (engineCapable(entry) && await engineReady()) return prepareEngine(entry);
+      await engineRelease();
+    }
     let node;
     if (a.kind === 'video') {
       node = document.createElement('video'); node.className='surface video'; node.muted=true; node.defaultMuted=true; node.playsInline=true; node.preload='auto'; node.setAttribute('muted',''); node.setAttribute('playsinline','');
@@ -211,7 +295,7 @@
           };
         });
         stage.appendChild(node); node.src=a.url; dbg('src set', {id:a.id});
-        if (!current && window.signageNative?.preflight && playlist.length>1) {
+        if (!current && !engine && window.signageNative?.preflight && playlist.length>1) {
           // Establish the outgoing PAUSED pipeline and broker generation before
           // staging. No media clock runs until actual next-context PREPARED.
           const preroll=new Promise((resolve,reject)=>{
@@ -245,7 +329,12 @@
       } else {
         // Append about:blank first so the handshake can bind to its WindowProxy before navigation.
         stage.appendChild(node); ready=handshake(node,'signage-ready',15000);
-        node.src=hidden ? a.url+(a.url.includes('?')?'&':'?')+'signage_stage=1' : a.url;
+        // Built-in pages always come from the image so their video lifecycle matches this
+        // engine/protocol version, never from a stale persisted /data seed copy.
+        let url=a.url;
+        if (engine && a.builtin && new URL(url,location.href).pathname==='/content/menuboard/index.html')
+          url=url.replace('/content/menuboard/','/native-builtin/menuboard/');
+        node.src=hidden ? url+(url.includes('?')?'&':'?')+'signage_stage=1' : url;
       }
       await ready; if (a.kind !== 'video') await paint(); return item;
     } catch(error) { remove(item); throw error; }
@@ -266,7 +355,12 @@
       }
       cancelProgress(item); advance();
     };
-    if (item.node.tagName === 'VIDEO') {
+    if (item.engine) {
+      item.finish=finish;
+      const length=item.entry.asset.engine?.duration_ms ? item.entry.asset.engine.duration_ms/1000 : duration;
+      const short=item.entry.duration && item.entry.duration < length;
+      timer=setTimeout(() => finish(short ? 'scheduled-cut' : 'watchdog'),(short ? item.entry.duration : length+5)*1000);
+    } else if (item.node.tagName === 'VIDEO') {
       const v=item.node;
       item.callbackCount=0; item.presentedFrames=null;
       // Only EOS ends a complete clip: currentTime nearing duration is NOT final-frame proof.
@@ -405,6 +499,8 @@
     try {
       const response=await fetch('/api/playlist',{cache:'no-store'}); if(!response.ok) throw new Error('Playlist unavailable');
       const data=await response.json(); playlist=data.entries; previousRevision=data.revision; lastPoll=Date.now();
+      engineSetup();
+      if(!engineHost && window.SignageVideo && engine) engineHost=window.SignageVideo.host();
       clearTimeout(boundaryTimer);
       if(data.next_change) boundaryTimer=setTimeout(poll,Math.max(20,Math.min(2147483647,(data.next_change-data.now)*1000+25)));
       // Expired items stop locally even if a subsequent network request fails.
@@ -422,6 +518,7 @@
   const showControls=() => { if(preview) return; document.body.classList.add('controls'); clearTimeout(controlsTimer); controlsTimer=setTimeout(() => document.body.classList.remove('controls'),2500); };
   document.addEventListener('pointermove',showControls); document.addEventListener('keydown',showControls);
   document.getElementById('fullscreen').onclick=() => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.();
-  window.addEventListener('pagehide',() => { nativeSend({type:'native-playback',running:false}); stopped=true; clearTimeout(timer); clearTimeout(pollTimer); clearTimeout(boundaryTimer); clearTimeout(clockTimer); cancelStage(); remove(current); });
+  window.addEventListener('pagehide',() => { engine?.destroy();
+    nativeSend({type:'native-playback',running:false}); stopped=true; clearTimeout(timer); clearTimeout(pollTimer); clearTimeout(boundaryTimer); clearTimeout(clockTimer); cancelStage(); remove(current); });
   poll();
 })();

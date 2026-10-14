@@ -8,6 +8,13 @@
  * overlay plane in its own atomic commits (see drm-broker.h). */
 GType admiral_plane_sink_get_type(void);
 void admiral_plane_sink_set_generation(GstElement *element, guint64 generation, gboolean standby);
+/* Persistent video engine client: posts "admiral-presented" element messages
+ * (pts, serial, fb, presented_total) only for SHOWs the browser reported PRESENTED
+ * after the matching flip, keeps the last frame through flushes and never re-SHOWs an
+ * already submitted buffer. */
+void admiral_plane_sink_set_engine(GstElement *element, gboolean engine);
+/* Engine only: FALSE consumes frames without SHOW (warm-up/hidden) and HIDEs once. */
+void admiral_plane_sink_set_visible(GstElement *element, gboolean visible);
 /* Diagnostic stages: 1 render, 2 SHOW, 3 PRESENTED, 4 decoder out,
  * 5 sink input, 6 upstream QoS timestamp/jitter. Disabled by default. */
 void admiral_plane_sink_record(GstElement *sink, guint stage, guint64 pts, guint64 value);

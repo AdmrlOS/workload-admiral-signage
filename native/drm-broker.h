@@ -6,6 +6,9 @@
 
 /* Broker socket and video-status.json; shared with the sandboxed web process. */
 #define SIGNAGE_VIDEO_RUNTIME_DIR "/run/admiral-signage/video"
+/* Handshake token of the persistent video engine (signage-video-engine). While the engine
+ * holds the active generation, HTML <video> sinks and standby reservations are refused. */
+#define SIGNAGE_BROKER_ENGINE_TOKEN G_MAXUINT64
 
 /* Unset SIGNAGE_VIDEO_MODE defaults to the strict holepunch path. */
 gboolean signage_drm_holepunch_enabled(void);

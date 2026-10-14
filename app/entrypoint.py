@@ -53,10 +53,29 @@ STANDBY_CMA_BY_PATH = '{"/native-builtin/menuboard/index.html":67108864,"/player
 
 
 def standby_defaults(environ):
-    """Return admission variables to add; explicit operator values always win."""
+    """Return admission variables to add; explicit operator values always win.
+
+    The persistent single-decoder engine (default) replaces the native second-decoder
+    standby, so no standby admission is defaulted while it is enabled."""
+    if environ.get("SIGNAGE_VIDEO_ENGINE", "1") == "1":
+        return {}
     defaults = {"SIGNAGE_STANDBY_CONTEXTS": STANDBY_CONTEXTS,
                 "SIGNAGE_STANDBY_CMA_BYTES": STANDBY_CMA_BYTES,
                 "SIGNAGE_STANDBY_CMA_BY_PATH": STANDBY_CMA_BY_PATH}
+    return {k: v for k, v in defaults.items() if k not in environ}
+
+
+def engine_environment(environ, app_root=APP_ROOT):
+    """Engine variables to add (explicit values win); empty when SIGNAGE_VIDEO_ENGINE=0."""
+    if environ.get("SIGNAGE_VIDEO_ENGINE", "1") != "1":
+        return {}
+    defaults = {"SIGNAGE_VIDEO_ENGINE": "1",
+                "SIGNAGE_ENGINE_SOCKET": "/run/admiral-signage/video/engine.sock",
+                "SIGNAGE_ENGINE_ASSET_ROOTS": f"{app_root}/media/engine:{environ.get('SIGNAGE_DATA_DIR', '/data')}/engine",
+                "SIGNAGE_ENGINE_CACHE_MB": "160"}
+    warm = Path(app_root) / "media/engine/promo-a.engine.json"
+    if warm.is_file():
+        defaults["SIGNAGE_ENGINE_WARMUP"] = str(warm)
     return {k: v for k, v in defaults.items() if k not in environ}
 
 
@@ -133,6 +152,7 @@ def configure():
     os.environ.setdefault("GST_PLUGIN_FEATURE_RANK", ranks)
     os.environ["SIGNAGE_URL"] = start_url(os.environ)
     os.environ.update(standby_defaults(os.environ))
+    os.environ.update(engine_environment(os.environ))
     return data
 
 
@@ -167,11 +187,13 @@ def main():
     (data / "logs" / "startup.json").write_text(json.dumps(snapshot(), indent=2))
     processes = []
     stopping = False
+    engine = None
+    engine_starts = []
 
     def shutdown(signum=None, frame=None):
         nonlocal stopping
         stopping = True
-        for process in processes:
+        for process in processes + ([engine] if engine is not None else []):
             if process.poll() is None:
                 process.terminate()
 
@@ -189,8 +211,26 @@ def main():
         print("HTTP server readiness failed; refusing browser launch. Admiral should retry workload.", flush=True)
         code = 1
         shutdown()
+    def start_engine():
+        # One persistent decoder for the whole presentation; it waits for the browser's
+        # broker itself. A crashed engine is restarted (bounded) without the browser.
+        nonlocal engine
+        engine_starts.append(time.monotonic())
+        engine = subprocess.Popen(["/usr/local/bin/signage-video-engine"])
+
+    if code == 0 and os.environ.get("SIGNAGE_VIDEO_ENGINE") == "1" and os.path.exists("/usr/local/bin/signage-video-engine"):
+        start_engine()
     try:
         while not stopping:
+            if engine is not None and engine.poll() is not None and not stopping:
+                recent = [t for t in engine_starts if time.monotonic() - t < 60]
+                print(f"Video engine exited ({engine.returncode}); restarts in the last minute: {len(recent)}", flush=True)
+                if len(recent) >= 5:
+                    code = engine.returncode or 1
+                    shutdown()
+                    break
+                time.sleep(1)
+                start_engine()
             for process in processes:
                 if process.poll() is not None:
                     print(f"Required service exited ({process.returncode}); Admiral should restart workload.", flush=True)
@@ -201,7 +241,7 @@ def main():
     finally:
         shutdown()
         deadline = time.monotonic() + 5
-        for process in processes:
+        for process in processes + ([engine] if engine is not None else []):
             try:
                 process.wait(timeout=max(0.1, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:

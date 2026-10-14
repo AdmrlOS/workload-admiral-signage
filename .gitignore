@@ -6,3 +6,4 @@ browser/signage-browser
 output/
 *.oci.tar
 *.env
+native/signage-video-engine

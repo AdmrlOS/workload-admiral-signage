@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -33,14 +34,27 @@ class DecoderConfigTests(unittest.TestCase):
 
 
 class StandbyAdmissionTests(unittest.TestCase):
+    def test_engine_default_disables_second_decoder_standby(self):
+        self.assertEqual(entrypoint.standby_defaults({}), {})
+        env = entrypoint.engine_environment({}, Path('/nonexistent-app'))
+        self.assertEqual(env['SIGNAGE_VIDEO_ENGINE'], '1')
+        self.assertEqual(env['SIGNAGE_ENGINE_SOCKET'], '/run/admiral-signage/video/engine.sock')
+        self.assertNotIn('SIGNAGE_ENGINE_WARMUP', env, 'no warm-up asset in this app root')
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / 'media/engine').mkdir(parents=True)
+            (Path(temp) / 'media/engine/promo-a.engine.json').write_text('{}')
+            env = entrypoint.engine_environment({}, Path(temp))
+            self.assertTrue(env['SIGNAGE_ENGINE_WARMUP'].endswith('media/engine/promo-a.engine.json'))
+        self.assertEqual(entrypoint.engine_environment({'SIGNAGE_VIDEO_ENGINE': '0'}, Path('/x')), {})
+
     def test_managed_environment_is_admitted_by_default(self):
-        env = entrypoint.standby_defaults({})
+        env = entrypoint.standby_defaults({'SIGNAGE_VIDEO_ENGINE': '0'})
         self.assertEqual(env["SIGNAGE_STANDBY_CONTEXTS"], "2")
         self.assertGreater(int(env["SIGNAGE_STANDBY_CMA_BYTES"]), 0)
         self.assertIn("/player/", env["SIGNAGE_STANDBY_CMA_BY_PATH"])
 
     def test_operator_values_win(self):
-        env = entrypoint.standby_defaults({"SIGNAGE_STANDBY_CMA_BYTES": "1", "SIGNAGE_STANDBY_CONTEXTS": "3"})
+        env = entrypoint.standby_defaults({"SIGNAGE_STANDBY_CMA_BYTES": "1", "SIGNAGE_STANDBY_CONTEXTS": "3", "SIGNAGE_VIDEO_ENGINE": "0"})
         self.assertEqual(list(env), ["SIGNAGE_STANDBY_CMA_BY_PATH"])
 
 

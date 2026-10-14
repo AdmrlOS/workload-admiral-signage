@@ -2,7 +2,10 @@
 import json
 import mimetypes
 import os
+import queue
 import re
+import select
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import content
+import video_engine
 from ram_cache import RamCache
 
 from diagnostics import APP_ROOT, snapshot
@@ -25,6 +29,9 @@ PRELOADER = None
 PRELOAD_ACTIVE = False
 PRELOAD_LOCK = threading.Lock()
 PRELOAD_PENDING = None
+# Persistent single-decoder video engine relay (None when SIGNAGE_VIDEO_ENGINE=0).
+ENGINE = None
+VIDEO_COMMANDS = {'acquire', 'prepare', 'play', 'pause', 'resume', 'seek', 'show', 'hide', 'rect', 'stop', 'cancel', 'status', 'release'}
 
 
 def resolve_asset(url):
@@ -39,6 +46,44 @@ def resolve_asset(url):
     else:
         return None
     return next((found for root in roots if (found := safe_file(root, name))), None)
+
+
+def engine_asset(asset):
+    """Resolve a page's {url} to a prepared engine variant; pages never name files."""
+    url = asset.get('url') if isinstance(asset, dict) else None
+    if not isinstance(url, str) or not urlsplit(url).path.startswith('/media/'):
+        return None, 'invalid-asset'
+    return video_engine.find_variant(resolve_asset(url), DATA_ROOT, APP_ROOT)
+
+
+def player_request(handler):
+    origin = handler.headers.get('Origin')
+    return (handler.headers.get('X-Signage-Request') == 'player'
+            and handler.headers.get('Sec-Fetch-Site') != 'cross-site'
+            and not (origin and urlsplit(origin).netloc != handler.headers.get('Host')))
+
+
+def video_command(body):
+    """Validate and forward one page command; returns (status, ack)."""
+    if not isinstance(body, dict):
+        return 400, {'ok': False, 'code': 'invalid'}
+    client, cmd = body.get('client'), body.get('cmd')
+    if not isinstance(client, str) or not 0 < len(client) <= 80 or cmd not in VIDEO_COMMANDS:
+        return 400, {'ok': False, 'code': 'invalid', 'message': 'client and a supported cmd are required'}
+    if ENGINE is None:
+        return 503, {'ok': False, 'code': 'engine-disabled'}
+    fields = {}
+    for key, kind in (('at', str), ('loop', bool), ('show', bool), ('play_id', int), ('position_ms', int),
+                      ('x', int), ('y', int), ('w', int), ('h', int)):
+        if key in body and isinstance(body[key], kind) and not (kind is int and isinstance(body[key], bool)):
+            fields[key] = body[key]
+    if cmd in ('prepare', 'play', 'cancel'):
+        variant, why = engine_asset(body.get('asset'))
+        if variant is None:
+            return 409, {'ok': False, 'code': why, 'message': 'asset has no engine-compatible prepared variant'}
+        fields['asset'] = {'id': variant['id'], 'manifest': variant['manifest']}
+    ack = ENGINE.command(client, cmd, **fields)
+    return (200 if ack.get('ok') else 409), ack
 
 
 def preload_window(urls):
@@ -178,6 +223,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.connection.settimeout(120)
         try:
+            if urlsplit(self.path).path == '/api/video/command':
+                if self.command != 'POST' or not player_request(self):
+                    raise content.ContentError('Player origin required.', 403)
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 4096 or self.headers.get('Transfer-Encoding'):
+                    raise content.ContentError('Invalid video command.')
+                status, ack = video_command(json.loads(self.rfile.read(length)))
+                return self.json_response(ack, status=status)
             if urlsplit(self.path).path == '/api/preload':
                 origin = self.headers.get('Origin')
                 if (self.command != 'POST' or self.headers.get('X-Signage-Request') != 'player'
@@ -225,9 +278,22 @@ class Handler(BaseHTTPRequestHandler):
                             with file.open('rb') as stream:
                                 markup = stream.read(1024 * 1024)
                             asset['preload_static'] = bool(re.search(br'<meta\s+name=[\"\']signage-preload[\"\']\s+content=[\"\']static[\"\']\s*/?>', markup, re.I))
+                    if ENGINE is not None:
+                        for entry in state['entries']:
+                            asset = entry['asset']
+                            if asset['kind'] == 'video':
+                                variant, _ = engine_asset(asset)
+                                if variant:
+                                    asset['engine'] = {k: variant[k] for k in ('id', 'frames', 'duration_ms')}
                 return self.json_response(state, head)
             except (OSError, ValueError, content.ContentError):
                 return self.json_response({'error': 'The content library could not be opened. Check the data volume.'}, head, status=500)
+        if path == '/api/video/events':
+            return self.video_events()
+        if path == '/api/video/status':
+            ready = ENGINE.ready if ENGINE else None
+            return self.json_response({'enabled': ENGINE is not None, 'connected': bool(ENGINE and ENGINE.connected),
+                                       'ready': ready}, head)
         if path == "/healthz":
             return self.json_response({"ok": True}, head)
         if path == "/api/config":
@@ -278,6 +344,43 @@ class Handler(BaseHTTPRequestHandler):
         with RAM_CACHE.acquire(file) as cached:
             return self.file_response(file, html_body, cached, head, path, package_html, size, start, end, ranged)
 
+    def video_events(self):
+        """Server-sent engine events for one page instance; closing it releases ownership."""
+        client = parse_qs(urlsplit(self.path).query).get('client', [''])[0]
+        if ENGINE is None or not player_request(self) or not 0 < len(client) <= 80:
+            return self.json_response({'error': 'Video engine stream unavailable.'}, status=403 if ENGINE else 503)
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        q = ENGINE.subscribe(client)
+        self.connection.settimeout(5)
+        try:
+            self.wfile.write(b': engine\n\n')
+            self.wfile.flush()
+            idle = 0.0
+            while True:
+                try:
+                    event = q.get(timeout=0.25)
+                    payload = b'data: ' + json.dumps(event, separators=(',', ':')).encode() + b'\n\n'
+                    idle = 0.0
+                except queue.Empty:
+                    # Notice a closed page (pagehide/navigation/crash) within ~250 ms.
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                    if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                        break
+                    idle += 0.25
+                    if idle < 10:
+                        continue
+                    payload, idle = b': keepalive\n\n', 0.0
+                self.wfile.write(payload)
+                self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            ENGINE.unsubscribe(client, q)
+
     def file_response(self, file, html_body, cached, head, path, package_html, size, start, end, ranged):
         self.send_response(206 if ranged else 200)
         self.send_header('X-Signage-Cache', 'ram' if cached is not None else 'disk')
@@ -322,7 +425,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global ENGINE
     content.read(DATA_ROOT, APP_ROOT)
+    if os.environ.get('SIGNAGE_VIDEO_ENGINE', '1') == '1':
+        ENGINE = video_engine.EngineRelay().start()
     threading.Thread(target=refresh_status, daemon=True).start()
     host = os.environ.get("SIGNAGE_HTTP_HOST", "127.0.0.1")
     server = ThreadingHTTPServer((host, PORT), Handler)

@@ -239,7 +239,10 @@
   // Create the one live <video>. Resolves with {ready:boolean}. Caller starts playback via start().
   function makeVideo(host, src, { before } = {}) {
     killVideo();
-    const v = document.createElement('video');
+    // With the persistent engine the one decoder belongs to the engine: use its explicit
+    // video adapter (a plain <video> would be refused by the broker, never a 2nd decoder).
+    const useEngine = window.SignageVideo && !Q.has('native_stage') && Q.get('engine') !== '0';
+    const v = useEngine ? window.SignageVideo.createVideo(document) : document.createElement('video');
     v.muted = true; v.defaultMuted = true; v.playsInline = true; v.controls = false; v.loop = false;
     v.preload = 'auto'; v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
     v.disablePictureInPicture = true;

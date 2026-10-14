@@ -66,6 +66,11 @@ typedef struct {
     GHashTable *unpresented; /* serial -> fb, bounded two-frame pipeline */
     GHashTable *identities, *presented_pts; /* serial -> PTS; unique decoded PTS per seek */
     guint64 presented_total;
+    /* Persistent video engine client: report PRESENTED identities on the bus, keep the
+     * last frame through flushes, never re-SHOW an already submitted buffer, and support
+     * explicit invisibility (warm-up/hidden) without holding decoder buffers. */
+    gboolean engine, invisible, restore_on_visible;
+    GArray *notify; /* PresentedNote, posted outside the lock by the receiver */
     guint8 incoming[sizeof(SignageVideoMessage)];
     gsize incoming_length;
     /* Per-second render diagnostics (SIGNAGE_VIDEO_STATS=1). */
@@ -77,6 +82,7 @@ typedef struct {
 } AdmiralPlaneSink;
 
 typedef struct { GstVideoSinkClass parent_class; } AdmiralPlaneSinkClass;
+typedef struct { guint64 pts; guint32 serial, fb; } PresentedNote;
 
 static void admiral_plane_sink_overlay_init(GstVideoOverlayInterface *iface);
 G_DEFINE_TYPE_WITH_CODE(AdmiralPlaneSink, admiral_plane_sink, GST_TYPE_VIDEO_SINK,
@@ -114,6 +120,35 @@ send_message(AdmiralPlaneSink *self, const SignageVideoMessage *message)
         sent += (gsize)part;
     }
     return TRUE;
+}
+
+/* Engine sinks: remember a successful PRESENTED identity (lock held). */
+static void
+note_presented(AdmiralPlaneSink *self, guint64 pts, guint32 serial, guint32 fb)
+{
+    if (!self->engine || !self->notify || self->notify->len >= 256) return;
+    PresentedNote note = { pts, serial, fb };
+    g_array_append_val(self->notify, note);
+}
+
+/* Post remembered identities as element messages without holding the lock (bus sync
+ * handlers may call back into the sink). Called with the lock held; returns with it. */
+static void
+post_presented_unlocked(AdmiralPlaneSink *self)
+{
+    if (!self->engine || !self->notify || !self->notify->len) return;
+    GArray *notes = self->notify;
+    self->notify = g_array_new(FALSE, FALSE, sizeof(PresentedNote));
+    guint64 total = self->presented_total;
+    g_mutex_unlock(&self->lock);
+    for (guint i = 0; i < notes->len; i++) {
+        const PresentedNote *n = &g_array_index(notes, PresentedNote, i);
+        GstStructure *s = gst_structure_new("admiral-presented", "pts", G_TYPE_UINT64, n->pts,
+            "serial", G_TYPE_UINT, n->serial, "fb", G_TYPE_UINT, n->fb, "presented_total", G_TYPE_UINT64, total, NULL);
+        gst_element_post_message(GST_ELEMENT(self), gst_message_new_element(GST_OBJECT(self), s));
+    }
+    g_array_unref(notes);
+    g_mutex_lock(&self->lock);
 }
 
 /* Reads RELEASED messages; waits up to timeout_ms for the first one. Lock held. */
@@ -179,6 +214,7 @@ drain_releases(AdmiralPlaneSink *self, gint timeout_ms)
                         g_hash_table_add(self->presented_pts, copy);
                     }
                 }
+                if (pts) note_presented(self, *pts, message.serial, message.fb); /* before pts is freed */
                 g_hash_table_remove(self->identities, GUINT_TO_POINTER(message.serial));
                 self->awaiting_fb = self->awaiting_serial = 0;
                 self->last_presented_serial = message.serial;
@@ -204,6 +240,8 @@ static gpointer release_receiver(gpointer data)
     g_mutex_lock(&self->lock);
     while (!self->receiver_stop) {
         drain_releases(self, 0);
+        post_presented_unlocked(self);
+        if (self->receiver_stop) break;
         g_cond_wait_until(&self->receiver_wake, &self->lock,
                           g_get_monotonic_time() + 5000);
     }
@@ -373,6 +411,9 @@ show_locked(AdmiralPlaneSink *self, GstBuffer *buffer)
     }
     drain_releases(self, 0);
     GError *error = NULL;
+    /* Invisible engine sink (startup warm-up or hidden component): consume the frame
+     * without a SHOW, without holding the decoder buffer and without making it `last`. */
+    if (self->engine && self->invisible) return GST_FLOW_OK;
     /* A PAUSED preroll sends exactly one retained frame. Never spend a second
      * credit, advance decoder playback or re-SHOW it before native activation. */
     if (self->standby && self->serial) {
@@ -454,6 +495,14 @@ admiral_plane_sink_show_frame(GstVideoSink *video_sink, GstBuffer *buffer)
 {
     AdmiralPlaneSink *self = (AdmiralPlaneSink *)video_sink;
     g_mutex_lock(&self->lock);
+    /* BaseSink renders the prerolled buffer again on PAUSED->PLAYING. For the engine that
+     * frame was already submitted (seek/pause preview); re-SHOWing it would duplicate its
+     * PRESENTED identity. `last` holds a reference, so the pointer cannot be a recycled
+     * pool buffer carrying a different frame. */
+    if (self->engine && buffer == self->last && self->serial && !self->hidden) {
+        g_mutex_unlock(&self->lock);
+        return GST_FLOW_OK;
+    }
     gint64 start = g_get_monotonic_time();
     GstFlowReturn result = self->have_info && self->fd >= 0 && self->socket >= 0 ? show_locked(self, buffer) : GST_FLOW_NOT_NEGOTIATED;
     if (self->stats) {
@@ -609,7 +658,9 @@ static gboolean admiral_plane_sink_event(GstBaseSink *base, GstEvent *event)
         g_mutex_lock(&self->lock);
         self->flushing = TRUE;
         SignageVideoMessage hide = { .type = SIGNAGE_VIDEO_HIDE };
-        if (self->socket >= 0 && !self->disconnected) send_message(self, &hide);
+        /* The engine flushes for seeks and immediate switches inside one presentation:
+         * keep the last frame on the plane until the next SHOW replaces it. */
+        if (!self->engine && self->socket >= 0 && !self->disconnected) send_message(self, &hide);
         /* Serial is never reset: late outcomes cannot alias post-seek SHOWs.
          * Keep held references until independent RELEASED retirement. */
         g_hash_table_remove_all(self->unpresented);
@@ -843,6 +894,40 @@ void admiral_plane_sink_set_generation(GstElement *element, guint64 generation, 
     g_mutex_unlock(&self->lock);
 }
 
+void admiral_plane_sink_set_engine(GstElement *element, gboolean engine)
+{
+    AdmiralPlaneSink *self = (AdmiralPlaneSink *)element;
+    g_mutex_lock(&self->lock);
+    self->engine = engine;
+    if (engine && !self->notify) self->notify = g_array_new(FALSE, FALSE, sizeof(PresentedNote));
+    g_mutex_unlock(&self->lock);
+}
+
+/* Engine visibility. Hiding removes the plane once (HIDE); the browser then retires the
+ * held framebuffers through the normal RELEASED path. A frame that was on screen when
+ * hidden (e.g. paused) is presented again when shown; frames consumed while invisible are
+ * never shown later. */
+void admiral_plane_sink_set_visible(GstElement *element, gboolean visible)
+{
+    AdmiralPlaneSink *self = (AdmiralPlaneSink *)element;
+    g_mutex_lock(&self->lock);
+    if (!visible && !self->invisible) {
+        self->invisible = TRUE;
+        self->restore_on_visible = self->last != NULL && !self->hidden;
+        if (!self->hidden && self->socket >= 0 && !self->disconnected) {
+            SignageVideoMessage hide = { .type = SIGNAGE_VIDEO_HIDE };
+            send_message(self, &hide);
+        }
+        self->hidden = TRUE;
+    } else if (visible && self->invisible) {
+        self->invisible = FALSE;
+        if (self->restore_on_visible && self->last && self->have_info && self->socket >= 0 && !self->disconnected)
+            show_locked(self, self->last);
+        self->restore_on_visible = FALSE;
+    }
+    g_mutex_unlock(&self->lock);
+}
+
 void
 admiral_plane_sink_configure(GstElement *element, gint drm_fd, gint socket_fd, gint mode_width, gint mode_height)
 {
@@ -874,6 +959,7 @@ admiral_plane_sink_finalize(GObject *object)
     g_hash_table_unref(self->identities);
     g_hash_table_unref(self->presented_pts);
     g_hash_table_unref(self->framebuffers);
+    if (self->notify) g_array_unref(self->notify);
     g_free(self->ledger);
     g_mutex_clear(&self->ledger_lock);
     gst_buffer_replace(&self->last, NULL);

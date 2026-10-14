@@ -55,6 +55,7 @@ typedef struct {
     gint render_x, render_y, render_width, render_height;
     gboolean blend_configured, failed, decoder_verified, dmabuf_seen;
     gboolean immediate_output;
+    gboolean engine, visible; /* client-role=engine: persistent video engine pipeline */
     gfloat zorder;
     guint res_usage;
     guint64 decoded_frames, input_frames, decoder_dropped;
@@ -66,7 +67,7 @@ typedef struct {
 typedef struct { GstBinClass parent_class; } AdmiralSinkClass;
 G_DEFINE_TYPE(AdmiralSink, admiral_sink, GST_TYPE_BIN)
 
-enum { PROP_0, PROP_RECTANGLE, PROP_ZORDER, PROP_RES_USAGE, PROP_IMMEDIATE_OUTPUT, PROP_STATS };
+enum { PROP_0, PROP_RECTANGLE, PROP_ZORDER, PROP_RES_USAGE, PROP_IMMEDIATE_OUTPUT, PROP_STATS, PROP_CLIENT_ROLE, PROP_VISIBLE };
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE("sink",
     GST_PAD_SINK, GST_PAD_ALWAYS,
     GST_STATIC_CAPS("video/x-raw, format=(string){ NV12, I420, YV12, BGRA, RGBA, BGRx, RGBx }; "
@@ -171,8 +172,8 @@ get_drm_fd(AdmiralSink *self, gboolean keep_socket)
         close(sock); return FALSE;
     }
     /* The URI token is allocated by the native UI bridge, never by connection order. */
-    guint64 requested = 0;
-    if (self->pipeline && g_object_class_find_property(G_OBJECT_GET_CLASS(self->pipeline), "uri")) {
+    guint64 requested = self->engine ? SIGNAGE_BROKER_ENGINE_TOKEN : 0;
+    if (!self->engine && self->pipeline && g_object_class_find_property(G_OBJECT_GET_CLASS(self->pipeline), "uri")) {
         gchar *uri = NULL; g_object_get(self->pipeline, "uri", &uri, NULL);
         const gchar *token = uri ? strstr(uri, "signage_standby=") : NULL;
         if (token) {
@@ -678,6 +679,10 @@ admiral_sink_change_state(GstElement *element, GstStateChange transition)
             gint mode_height = self->mode_height > 0 ? self->mode_height : self->crtc_height;
             admiral_plane_sink_configure(self->kms, self->fd, self->broker_socket, mode_width, mode_height);
             admiral_plane_sink_set_generation(self->kms, self->generation, self->standby);
+            if (self->engine) {
+                admiral_plane_sink_set_engine(self->kms, TRUE);
+                admiral_plane_sink_set_visible(self->kms, self->visible);
+            }
             g_message("Holepunch video frames are committed by the browser with the UI on plane %d", self->video_plane_id);
         } else {
             g_object_set(self->kms, "fd", self->fd, "connector-id", self->connector_id,
@@ -746,6 +751,14 @@ admiral_sink_set_property(GObject *object, guint property, const GValue *value, 
     } else if (property == PROP_ZORDER) self->zorder = g_value_get_float(value);
     else if (property == PROP_RES_USAGE) self->res_usage = g_value_get_uint(value);
     else if (property == PROP_IMMEDIATE_OUTPUT) self->immediate_output = g_value_get_boolean(value);
+    else if (property == PROP_CLIENT_ROLE) {
+        const gchar *role = g_value_get_string(value);
+        self->engine = g_strcmp0(role, "engine") == 0;
+        if (role && !self->engine && g_strcmp0(role, "html") != 0) fail_sink(self, "client-role must be html or engine");
+    } else if (property == PROP_VISIBLE) {
+        self->visible = g_value_get_boolean(value);
+        if (self->engine && self->browser_commits && self->kms) admiral_plane_sink_set_visible(self->kms, self->visible);
+    }
     else G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property, spec);
 }
 
@@ -760,6 +773,8 @@ admiral_sink_get_property(GObject *object, guint property, GValue *value, GParam
     } else if (property == PROP_ZORDER) g_value_set_float(value, self->zorder);
     else if (property == PROP_RES_USAGE) g_value_set_uint(value, self->res_usage);
     else if (property == PROP_IMMEDIATE_OUTPUT) g_value_set_boolean(value, self->immediate_output);
+    else if (property == PROP_CLIENT_ROLE) g_value_set_string(value, self->engine ? "engine" : "html");
+    else if (property == PROP_VISIBLE) g_value_set_boolean(value, self->visible);
     else if (property == PROP_STATS) {
         GstStructure *stats = NULL;
         if (self->kms) g_object_get(self->kms, "stats", &stats, NULL);
@@ -803,6 +818,12 @@ admiral_sink_class_init(AdmiralSinkClass *klass)
     g_object_class_install_property(object, PROP_STATS, g_param_spec_boxed("stats", "Statistics",
         "Underlying kmssink rendered/dropped frame statistics for WebKit playback quality",
         GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(object, PROP_CLIENT_ROLE, g_param_spec_string("client-role", "Client role",
+        "html (WebKit <video>, default) or engine (persistent signage-video-engine; set before READY)", "html",
+        G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(object, PROP_VISIBLE, g_param_spec_boolean("visible", "Visible",
+        "Engine only: FALSE consumes frames without showing them (warm-up/hidden component)", TRUE,
+        G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 }
 
 static void
@@ -811,6 +832,7 @@ admiral_sink_init(AdmiralSink *self)
     g_mutex_init(&self->lock);
     self->fd = self->lock_fd = -1;
     self->width = self->height = 1;
+    self->visible = TRUE;
     self->state = g_strdup("created");
     GST_OBJECT_FLAG_SET(self, GST_ELEMENT_FLAG_SINK);
     self->broker_socket = -1;

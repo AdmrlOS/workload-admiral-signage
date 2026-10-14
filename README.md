@@ -243,6 +243,68 @@ The [KMS sink](https://gstreamer.freedesktop.org/documentation/kms/index.html)
 accepts decoded DMA-BUF frames; format/modifier compatibility and zero-copy
 scanout must be established separately on the board.
 
+## Persistent video engine (default)
+
+One native process, `signage-video-engine`, owns the only hardware decoder for the whole
+presentation: `appsrc ! h265parse ! v4l2slh265dec ! westerossink client-role=engine`, built
+once at startup. Pages place video through the engine component
+(`/player/video-engine.js`); clips are fed into the same pipeline with continuous
+timestamps, so a handoff is the next IDR following the previous clip's last frame — no
+EOS, no teardown, no second decoder or hidden WebView. Design: [`DESIGN.md`](DESIGN.md);
+hardware gates: [`tests/VIDEO_ENGINE_VALIDATION.md`](tests/VIDEO_ENGINE_VALIDATION.md).
+
+```js
+const video = SignageVideo.attach(document.querySelector('#box')); // transparent box
+await video.ready;                                  // engine preflight done
+video.play('/media/promo-a.mp4', {loop: true});     // at: 'boundary' (default) | 'gop' | 'now'
+video.addEventListener('started', e => ...);        // first frame PRESENTED (browser flip)
+video.pause(); video.resume(); video.seek(5000); video.hide(); video.show();
+```
+
+* `at:'boundary'` queues after the current clip (gapless); `'gop'` switches at the next IDR
+  of the current clip (gapless); `'now'` is a flush switch in the same pipeline.
+* A next clip that is still loading never freezes the screen: the current clip continues
+  and a `waiting` event is emitted; the switch happens at the first boundary after `ready`.
+* Events: `engine-ready`, `ready`, `started`, `looped`, `ended` (`presented`/`frames`),
+  `waiting`, `cancelled`, `superseded`, `preempted`, `owner-gone`, `error`, `interrupted`.
+* One controlling page at a time (`acquire` preempts). When a page's event stream closes
+  (pagehide, navigation, crash) the engine hides and pauses and keeps the decoder.
+* `<video data-signage-engine src=… loop>` is an explicit opt-in adapter; bundled pages use
+  `SignageVideo.createVideo()`. A plain `<video>` while the engine owns the decoder is
+  refused by the broker (the page gets a media error); it can never open a second decoder.
+* Assets without a prepared variant (e.g. a customer H.264 upload) play on the legacy
+  `<video>` path after an explicit engine `release` (non-gapless); the engine re-acquires
+  with preflight for the next prepared asset. `SIGNAGE_VIDEO_ENGINE=0` restores the previous
+  behaviour entirely (native standby defaults then apply again).
+
+Environment (defaults set by the entrypoint): `SIGNAGE_ENGINE_CACHE_MB=160` (compressed
+RAM cache, LRU, current/queued pinned, over-budget refused), `SIGNAGE_ENGINE_FEED_MS=500`,
+`SIGNAGE_ENGINE_WARMUP` (first IDR decoded invisibly at startup to allocate the pool),
+`SIGNAGE_ENGINE_ASSET_ROOTS=/opt/signage/media/engine:/data/engine`.
+
+### Preparing assets
+
+```sh
+scripts/prepare-engine-asset.py SOURCE.mp4 --out-dir media/engine --name promo-a --reference
+scripts/prepare-engine-asset.py --validate-only media/engine/promo-a.hevc
+```
+
+Output: HEVC Main 8-bit 3840×2160 CFR 60 Annex-B (`NAME.hevc`), closed 1 s GOPs with an IDR
+and in-band VPS/SPS/PPS each, no B-frame reordering, BT.709 limited range, plus
+`NAME.engine.json` (per-AU index, `compat_key` = SPS hash, ES/source SHA-256, audio policy).
+Originals are never modified; existing outputs need `--force`. Audio is never invented or
+silently dropped (`--audio drop` is explicit). HEVC sources that already comply are
+remuxed bit-exactly (`--mode remux`); others are transcoded with local ffmpeg/libx265.
+A variant is used only while its `source_sha256` matches the current original, so a
+changed `/data/media` copy of a built-in falls back instead of showing stale content.
+Customer variants go to `/data/engine/<file stem>.engine.json`.
+
+Shipped variants (`media/engine/`, 48 MB): promo-a, promo-b and demo-4k-hevc, 600 frames
+each, one shared SPS. Transcode cost on an Apple M-series Mac: ~50 s wall / ~290 s CPU per
+10 s clip (preset medium, CRF 20, VBV 40 Mb/s). The demo-4k-hevc variant is a derivative of
+the CC BY-SA 4.0 clip below and is distributed under the same licence; promo-a/promo-b
+variants inherit the licence of those clips.
+
 ## Build and export
 
 Build the image for the board, including from an ARM64 Mac with Docker Desktop:

@@ -56,6 +56,8 @@ typedef struct {
     gpointer video_data;
     BrokerClient clients[2]; /* includes disconnected/retiring owners */
     guint64 generation, active, reserved;
+    guint64 engine;       /* generation held by the persistent video engine, or 0 */
+    guint64 refused_html; /* HTML sinks refused while the engine owned the decoder */
 } Broker;
 
 static Broker broker = { .fd = -1 };
@@ -348,6 +350,17 @@ accept_client(GSocketConnection *connection, uint64_t requested)
     }
     /* First record binds this connection to an explicitly reserved generation.
      * No second peer may claim active or displace a retiring owner. */
+    gboolean engine = requested == SIGNAGE_BROKER_ENGINE_TOKEN;
+    if (engine) requested = 0; /* the engine claims the ordinary active generation */
+    if (broker.engine && !requested) {
+        /* One engine owns the only hardware decoder for the whole presentation. An HTML
+         * <video> (or a second engine) is refused explicitly instead of opening another
+         * decoder; the page receives a media error. */
+        broker.refused_html += !engine;
+        g_message("Refused %s video sink: the persistent video engine (generation %" G_GUINT64_FORMAT ") owns the decoder",
+                  engine ? "second engine" : "HTML", broker.engine);
+        return TRUE;
+    }
     BrokerClient *client = NULL;
     for (unsigned i = 0; i < 2; i++) {
         if (requested && requested == broker.reserved && broker.clients[i].generation == requested && !broker.clients[i].client)
@@ -358,13 +371,14 @@ accept_client(GSocketConnection *connection, uint64_t requested)
     }
     if (!client) return TRUE;
     if (!requested) { client->generation = ++broker.generation; broker.active = client->generation; }
+    if (engine) broker.engine = client->generation;
     int fd_copy = fcntl(broker.fd, F_DUPFD_CLOEXEC, 3);
     if (fd_copy < 0) {
-        if (!requested) { client->generation=0; broker.active=0; }
+        if (!requested) { client->generation=0; broker.active=0; broker.engine=0; }
         return TRUE;
     }
-    g_autofree char *metadata = g_strdup_printf("%s,\"protocol\":2,\"generation\":%" G_GUINT64_FORMAT ",\"standby\":%s,\"video_frames\":%s}\n", broker.metadata,
-        client->generation, requested ? "true" : "false", broker.video_handler ? "true" : "false");
+    g_autofree char *metadata = g_strdup_printf("%s,\"protocol\":2,\"generation\":%" G_GUINT64_FORMAT ",\"standby\":%s,\"video_frames\":%s,\"role\":\"%s\"}\n", broker.metadata,
+        client->generation, requested ? "true" : "false", broker.video_handler ? "true" : "false", engine ? "engine" : "html");
     struct iovec payload = { .iov_base = metadata, .iov_len = strlen(metadata) };
     union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control = { 0 };
     struct msghdr message = {
@@ -380,11 +394,11 @@ accept_client(GSocketConnection *connection, uint64_t requested)
     close(fd_copy);
     if (sent != (ssize_t) payload.iov_len) {
         g_warning("DRM broker metadata transfer failed: %s", g_strerror(errno));
-        if (!requested) { client->generation=0; broker.active=0; }
+        if (!requested) { client->generation=0; broker.active=0; broker.engine=0; }
         return TRUE;
     }
     if (!broker.video_handler) {
-        client->generation=0; broker.active=0;
+        client->generation=0; broker.active=0; broker.engine=0;
         return TRUE; /* legacy kmssink keeps its exclusive file lock */
     }
     GSocket *socket = g_socket_connection_get_socket(connection);
@@ -544,10 +558,11 @@ void signage_drm_broker_video_retired(guint64 generation) {
     }
     if (broker.active == generation) broker.active = 0;
     if (broker.reserved == generation) broker.reserved = 0;
+    if (broker.engine == generation) broker.engine = 0;
 }
 void signage_drm_broker_video_activate(guint64 generation) { broker.active = generation; broker.reserved = 0; }
 guint64 signage_drm_broker_video_reserve(void) {
-    if (!broker.active || broker.reserved || broker.generation == G_MAXUINT64) return 0;
+    if (!broker.active || broker.engine || broker.reserved || broker.generation == G_MAXUINT64) return 0;
     for (unsigned i = 0; i < 2; i++) if (!broker.clients[i].generation) {
         broker.reserved = ++broker.generation;
         broker.clients[i].generation = broker.reserved;
