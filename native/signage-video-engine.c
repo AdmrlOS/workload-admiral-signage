@@ -432,10 +432,18 @@ static Asset *asset_get(Engine *e, const gchar *id, const gchar *manifest, gbool
 static guint64 now_pts(Engine *e)
 {
     if (!e->pipeline) return 0;
-    GstState state = GST_STATE(e->pipeline);
+    /* A PLAYING->PAUSED request does not complete while the sink holds no preroll sample (an idle
+     * timeline that already consumed its last frame): the current state keeps reading PLAYING
+     * with PAUSED pending, yet the pipeline already froze its running time at the pause point
+     * (start time). Reading the clock then would add every second spent hidden/paused to the
+     * next clip's PTS and park its frames that far in the future (first frame shown, then a
+     * frozen picture until the running time catches up). The pending state decides. */
+    GstState state = GST_STATE_VOID_PENDING, pending = GST_STATE_VOID_PENDING;
+    gst_element_get_state(e->pipeline, &state, &pending, 0);
+    gboolean running_clock = state == GST_STATE_PLAYING && (pending == GST_STATE_VOID_PENDING || pending == GST_STATE_PLAYING);
     /* Paused: the running time resumes from the pipeline start time. */
-    GstClockTime running = state == GST_STATE_PLAYING ? gst_element_get_current_running_time(e->pipeline)
-                                                      : gst_element_get_start_time(e->pipeline);
+    GstClockTime running = running_clock ? gst_element_get_current_running_time(e->pipeline)
+                                         : gst_element_get_start_time(e->pipeline);
     return GST_CLOCK_TIME_IS_VALID(running) ? e->segment_start + running : 0;
 }
 
@@ -483,6 +491,7 @@ static void start_queued_locked(Engine *e)
     Pending q = e->queued;
     memset(&e->queued, 0, sizeof e->queued);
     start_instance_locked(e, q.asset, 0, q.play_id, q.client, q.loop, 0);
+    post_note(e, "activated", q.asset->id, q.play_id); /* queued request became the feeding clip */
     q.asset->pins--; /* the instance took its own pin */
     asset_unref(q.asset); g_free(q.at); g_free(q.client);
 }
@@ -988,6 +997,7 @@ static gboolean bus_message(GstBus *bus, GstMessage *message, gpointer data)
         const gchar *type = gst_structure_get_string(s, "type"), *asset = gst_structure_get_string(s, "asset");
         guint64 play_id = 0; gst_structure_get_uint64(s, "play_id", &play_id);
         if (!g_strcmp0(type, "waiting")) emit_simple(e, "waiting", asset, "loading", "next asset not ready; continuing the current clip", play_id);
+        else if (!g_strcmp0(type, "activated")) emit_simple(e, "activated", asset, NULL, "queued request is now the feeding clip", play_id);
         else if (!g_strcmp0(type, "queued-failed")) emit_simple(e, "error", asset, "load-failed", "queued asset failed; continuing", play_id);
         break;
     }
@@ -1083,7 +1093,10 @@ static void emit_status(Engine *e, gint64 seq)
     }
     g_mutex_lock(&e->lock);
     if (e->cur) { ADD_STR(b, "feeding", e->cur->asset->id); ADD_BOOL(b, "idle", e->idle); }
-    if (e->queued.active) { ADD_STR(b, "queued", e->queued.asset->id); ADD_STR(b, "queued_at", e->queued.at); }
+    if (e->queued.active) {
+        ADD_STR(b, "queued", e->queued.asset->id); ADD_STR(b, "queued_at", e->queued.at);
+        ADD_INT(b, "queued_play_id", e->queued.play_id); if (e->queued.client) ADD_STR(b, "queued_client", e->queued.client);
+    }
     for (GList *l = e->fed.tail; l; l = l->prev) {
         Instance *i = l->data;
         if (i->started && !i->flushed && !i->warm) {
@@ -1178,10 +1191,13 @@ static void switch_now(Engine *e)
     Pending q = e->queued;
     memset(&e->queued, 0, sizeof e->queued);
     Instance *i = new_flush_instance(e, q.asset, 0, q.play_id, q.client, q.loop, 0);
+    gchar *asset_id = g_strdup(q.asset->id);
     q.asset->pins--; asset_unref(q.asset); g_free(q.at); g_free(q.client);
-    guint64 target = i->base;
+    guint64 target = i->base, i_play_id = i->play_id;
     g_mutex_unlock(&e->lock);
     if (!flush_to(e, i, target)) emit_simple(e, "error", NULL, "seek", "flush switch refused by the pipeline", 0);
+    else emit_simple(e, "activated", asset_id, NULL, "flush switch installed the requested clip", i_play_id);
+    g_free(asset_id);
 }
 
 static const gchar *member_string(JsonObject *o, const gchar *name)
@@ -1282,15 +1298,19 @@ static void handle_command(Engine *e, const gchar *line)
         if (!play_id) play_id = ++play_counter + (1ULL << 40);
         const gchar *at = member_string(o, "at");
         if (!at || (strcmp(at, "boundary") && strcmp(at, "gop") && strcmp(at, "now"))) at = "boundary";
-        gboolean loop = member_bool(o, "loop", FALSE), flush = FALSE;
+        gboolean loop = member_bool(o, "loop", FALSE), flush = FALSE, started_now = FALSE;
         g_mutex_lock(&e->lock);
         if ((!e->cur || e->idle) && a->state == ASSET_READY) {
             pending_clear(&e->queued);
             start_instance_locked(e, a, 0, play_id, client, loop, 0);
+            started_now = TRUE;
         } else {
             if (e->queued.active) {
                 JsonBuilder *b = event_begin("superseded"); ADD_STR(b, "asset", e->queued.asset->id);
-                ADD_INT(b, "play_id", e->queued.play_id); event_end(e, b);
+                ADD_INT(b, "play_id", e->queued.play_id); ADD_INT(b, "by_play_id", play_id);
+                ADD_STR(b, "by_asset", a->id); if (client) ADD_STR(b, "by_client", client);
+                if (e->queued.client) ADD_STR(b, "client", e->queued.client);
+                event_end(e, b);
             }
             pending_clear(&e->queued);
             e->queued = (Pending){ .active = TRUE, .loop = loop, .asset = asset_ref(a), .at = g_strdup(at),
@@ -1306,7 +1326,9 @@ static void handle_command(Engine *e, const gchar *line)
         if (member_bool(o, "show", TRUE)) e->visible = TRUE;
         apply_visibility(e);
         apply_state(e);
-        emit_ack(e, seq, cmd, client, TRUE, NULL, a->state == ASSET_READY ? NULL : "loading", play_id);
+        /* The acknowledgement says what became of the request: "started" (feeding now), "queued"
+         * (ready, waiting for its boundary / flush) or "loading" (asset not resident yet). */
+        emit_ack(e, seq, cmd, client, TRUE, NULL, started_now ? "started" : a->state == ASSET_READY ? (flush ? "switching" : "queued") : "loading", play_id);
         if (a->state == ASSET_LOADING) emit_simple(e, "waiting", a->id, "loading", "asset loading; current presentation continues", play_id);
         if (flush) switch_now(e);
         kick(e);

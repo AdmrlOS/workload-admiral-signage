@@ -320,6 +320,46 @@ class VideoEngineTests(EngineCase):
         self.assertEqual(seq, (self.assets.ref_a * 4)[:n])
 
     # ------------------------------------------------------------------ ownership / lifecycle
+    def test_play_after_hidden_idle_period_presents_every_frame(self):
+        """Owner gone (hidden, paused) while idle, then a new clip: the PLAYING->PAUSED request stays
+        pending (no preroll sample), and the next PTS must not absorb the hidden seconds. It used to
+        show frame 1 and then freeze until the running time caught up (a 40 s stall on hardware)."""
+        e = self.engine
+        self.assertTrue(e.send('prepare', client='page-2', asset=asset(self.assets.b, 'b'))['ok']); e.event('ready', asset='b')
+        self.assertTrue(e.send('acquire', client='page-2')['ok'])
+        self.assertTrue(e.send('play', client='page-2', asset=asset(self.assets.a, 'a'))['ok'])
+        e.event('ended', timeout=15, reason='complete')
+        before = len(e.hashes())
+        e.send('client-gone', client='page-2'); e.event('owner-gone')
+        time.sleep(3)
+        self.assertTrue(e.send('acquire', client='page-1')['ok'])
+        ack = e.send('play', client='page-1', asset=asset(self.assets.b, 'b'), at='now', play_id=77)
+        self.assertEqual(ack['message'], 'started')
+        e.event('started', play_id=77, timeout=10)
+        e.event('ended', play_id=77, timeout=5, reason='complete')   # 120 frames = 2 s; a stall would blow this
+        shown = e.hashes()[before:]
+        self.assertEqual(len(shown), 120)
+        self.assertLess((int(shown[0][0]) - int(e.hashes()[before - 1][0])) / 1e9, 0.5, 'no hidden time in the PTS')
+
+    def test_ack_says_what_became_of_the_request(self):
+        e = self.engine
+        e.send('prepare', client='page-1', asset=asset(self.assets.b, 'b')); e.event('ready', asset='b')
+        self.assertEqual(self.play('a', play_id=1)['message'], 'started')
+        e.event('started', play_id=1)
+        self.assertEqual(self.play('b', play_id=2)['message'], 'queued')
+        e.event('activated', play_id=2, timeout=10)
+        self.assertEqual(self.play('a', play_id=3, at='now')['message'], 'switching')
+        e.event('activated', play_id=3)
+
+    def test_superseded_names_the_replacing_request(self):
+        e = self.engine
+        self.play('a', play_id=1); e.event('started', play_id=1)
+        self.play('b', play_id=2)
+        self.engine.send('acquire', client='page-2')
+        e.send('play', client='page-2', asset=asset(self.assets.a, 'a'), play_id=9)
+        sup = e.event('superseded', play_id=2)
+        self.assertEqual((sup['by_play_id'], sup['by_client'], sup['by_asset'], sup['client']), (9, 'page-2', 'a', 'page-1'))
+
     def test_preemption_and_page_gone(self):
         e = self.engine
         self.play('a', loop=True)
