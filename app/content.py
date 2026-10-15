@@ -3,6 +3,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import threading
@@ -28,25 +29,69 @@ class ContentError(Exception):
         self.status = status
 
 
-def video_details(file, url):
-    """Prepare stills independently of the board's single live decoder."""
+SCALE = "scale='min(3840,iw)':'min(2160,ih)':force_original_aspect_ratio=decrease"
+
+
+def run_bounded(args, timeout):
+    """Run a helper at low priority in its own process group; on timeout or any error the whole
+    group is killed and reaped, so a slow ffmpeg can never outlive its caller's deadline."""
+    if shutil.which('nice'):
+        args = ['nice', '-n', '19', *args]
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-            '-show_entries', 'format=duration', '-of', 'json', str(file)],
-            capture_output=True, text=True, check=True, timeout=30)
-        duration = float(json.loads(result.stdout)['format']['duration'])
+        out, err = process.communicate(timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+        process.wait()
+        raise
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, args, out, err)
+    return out
+
+
+def last_keyframe(file, duration):
+    """Presentation time of the final keyframe, read from packet headers only (no decoding)."""
+    out = run_bounded(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                       'packet=pts_time,flags', '-of', 'csv=p=0', str(file)], 30)
+    best = None
+    for line in out.splitlines():
+        fields = line.strip().split(',')
+        if len(fields) >= 2 and 'K' in fields[1]:
+            try:
+                value = float(fields[0])
+            except ValueError:
+                continue
+            if math.isfinite(value) and 0 <= value < duration and (best is None or value > best):
+                best = value
+    return best if best is not None else max(0.0, duration - 1)
+
+
+def make_still(file, still, label, duration):
+    """Decode a single keyframe (never a whole GOP) with one thread; -update 1 is an image2
+    *output* option, so it must follow -i (ffmpeg 7 rejects it before -i)."""
+    seek = '0' if label == 'poster' else '%.3f' % last_keyframe(file, duration)
+    run_bounded(['ffmpeg', '-v', 'error', '-y', '-nostdin', '-threads', '1', '-skip_frame', 'nokey',
+                 '-ss', seek, '-i', str(file), '-frames:v', '1', '-update', '1', '-vf', SCALE,
+                 '-q:v', '2', str(still)], 60)
+
+
+def video_details(file, url):
+    """Prepare stills independently of the board's single live decoder. Stills that already
+    exist (shipped with the image or made earlier) are reused, so no ffmpeg runs."""
+    try:
+        duration = float(json.loads(run_bounded(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'format=duration', '-of', 'json', str(file)], 30))['format']['duration'])
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError()
         details = {'video_duration': duration}
-        # Stills keep up to the panel's 4K size and never upscale. The end poster seeks to the
-        # container's final second (-sseof -1). -update 1 is an image2 *output* option: before -i,
-        # ffmpeg 7 rejects it ("Option update not found") and the library never starts.
-        scale = "scale='min(3840,iw)':'min(2160,ih)':force_original_aspect_ratio=decrease"
-        for label, seek in (('poster', ['-ss', '0']), ('end_poster', ['-sseof', '-1'])):
+        for label in ('poster', 'end_poster'):
             still = file.with_name(file.name + '.' + label + '.jpg')
-            subprocess.run(['ffmpeg', '-v', 'error', '-y', *seek, '-i', str(file),
-                '-frames:v', '1', '-update', '1', '-vf', scale,
-                '-q:v', '2', str(still)], capture_output=True, check=True, timeout=60)
+            if not (still.is_file() and still.stat().st_size and still.stat().st_mtime >= file.stat().st_mtime):
+                make_still(file, still, label, duration)
             if not still.is_file() or not still.stat().st_size:
                 raise ValueError()
             details[label] = url + '.' + label + '.jpg'
@@ -54,6 +99,16 @@ def video_details(file, url):
     except (OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
         raise ContentError('The video could not be prepared. Use a playable MP4 (H.264 recommended), WebM or MOV.') from exc
 
+
+def seed_media(source, file):
+    """Copy a bundled clip and its build-time stills to the data volume once."""
+    if not file.exists():
+        shutil.copy2(source, file)
+    for label in ('poster', 'end_poster'):
+        still = source.with_name(source.name + '.' + label + '.jpg')
+        target = file.with_name(file.name + '.' + label + '.jpg')
+        if still.is_file() and still.stat().st_size and not target.exists():
+            shutil.copy2(still, target)
 
 
 PAGE_DEMOS = [
@@ -83,8 +138,7 @@ def builtin_4k_asset(root, app_root):
         return None
     file = root / 'media' / DEMO_4K_NAME
     file.parent.mkdir(parents=True, exist_ok=True)
-    if not file.exists():
-        shutil.copy2(source, file)
+    seed_media(source, file)
     url = '/media/' + DEMO_4K_NAME
     return {'id': DEMO_4K_ID, 'name': '4K HEVC demo', 'kind': 'video', 'url': url,
             'size': file.stat().st_size, 'builtin': True, **video_details(file, url)}
@@ -138,12 +192,18 @@ def initial_state(root, app_root):
         source = app_root / 'media' / name
         file = root / 'media' / name
         if source.is_file():
-            if not file.exists():
-                shutil.copy2(source, file)
+            seed_media(source, file)
+            try:
+                details = video_details(file, '/media/' + name)
+            except ContentError:
+                continue  # A bundled clip that cannot be prepared must not stop the library or UI.
             assets.append({'id': name[:-4], 'name': 'SUBSTATION · ' + ('Fresh daily' if 'a.' in name else 'Made your way'),
                            'kind': 'video', 'url': '/media/' + name, 'size': file.stat().st_size, 'builtin': True,
-                           **video_details(file, '/media/' + name)})
-    four_k = builtin_4k_asset(root, app_root)
+                           **details})
+    try:
+        four_k = builtin_4k_asset(root, app_root)
+    except ContentError:
+        four_k = None
     if four_k:
         assets.append(four_k)
     assets.extend(dict(a) for a in PAGE_DEMOS)

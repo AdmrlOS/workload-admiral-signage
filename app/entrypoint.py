@@ -166,7 +166,7 @@ def wait_for_server(url, alive, timeout=120):
                     return True
         except OSError:
             pass
-        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
     return False
 
 
@@ -237,7 +237,7 @@ def main():
                     code = process.returncode or 1
                     shutdown()
                     break
-            time.sleep(0.2)
+            time.sleep(0.5)
     finally:
         shutdown()
         deadline = time.monotonic() + 5

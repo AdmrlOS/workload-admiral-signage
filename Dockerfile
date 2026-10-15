@@ -50,6 +50,9 @@ RUN chmod +x /usr/local/bin/signage-* && \
     ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 \
       -t 12 -an -c:v libx264 -profile:v baseline -level 3.1 -pix_fmt yuv420p \
       -preset veryfast -crf 23 -g 60 -movflags +faststart /opt/signage/media/test-h264.mp4 && \
+    python3 -c "import sys,pathlib; sys.path.insert(0,'/opt/signage/app'); import content; \
+[content.video_details(f, '/media/'+f.name) for f in sorted(pathlib.Path('/opt/signage/media').glob('*.mp4'))]" && \
+    ls -la /opt/signage/media && \
     dpkg-query -W > /opt/signage/package-versions.txt
 ENV PYTHONUNBUFFERED=1 \
     GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \

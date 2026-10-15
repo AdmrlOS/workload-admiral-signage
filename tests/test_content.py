@@ -118,28 +118,78 @@ class ContentTests(unittest.TestCase):
         self.assertEqual(state['demo_catalog'], 2)
         self.assertNotIn('demo-4k-hevc', [a['id'] for a in state['assets']])
 
-    def test_video_stills_fit_4k_without_upscaling_and_end_poster_uses_last_frame(self):
+    def fake_bounded(self, calls, packets='0.0,K__\n1.0,___\n8.5,K__\n9.0,___\n'):
+        def fake(args, timeout):
+            tool = args[args.index('ffprobe') if 'ffprobe' in args else args.index('ffmpeg')]
+            if tool == 'ffprobe':
+                return packets if 'packet=pts_time,flags' in args else json.dumps({'format': {'duration': '10.0'}})
+            calls.append(args)
+            Path(args[-1]).write_bytes(b'jpg')
+            return ''
+        return fake
+
+    def test_video_stills_fit_4k_without_upscaling_and_end_poster_is_keyframe_only(self):
         file = self.app / 'media/clip.mp4'
         file.write_bytes(b'video')
         calls = []
-        def fake_run(args, **kwargs):
-            if args[0] == 'ffprobe':
-                return type('R', (), {'stdout': json.dumps({'format': {'duration': '10.0'}})})()
-            calls.append(args)
-            Path(args[-1]).write_bytes(b'jpg')
-            return type('R', (), {'stdout': ''})()
-        with patch.object(content.subprocess, 'run', side_effect=fake_run):
+        with patch.object(content, 'run_bounded', side_effect=self.fake_bounded(calls)):
             details = content.video_details(file, '/media/clip.mp4')
         self.assertEqual(details['end_poster'], '/media/clip.mp4.end_poster.jpg')
+        self.assertEqual(len(calls), 2)
         for args in calls:
             vf = args[args.index('-vf') + 1]
             self.assertEqual(vf, "scale='min(3840,iw)':'min(2160,ih)':force_original_aspect_ratio=decrease")
-            self.assertNotIn('1920', vf)
+            self.assertEqual(args[args.index('-skip_frame') + 1], 'nokey')
+            self.assertEqual(args[args.index('-threads') + 1], '1')
+            self.assertLess(args.index('-ss'), args.index('-i'))
+            # -update is an image2 output option; before -i, ffmpeg 7 fails the whole library start.
+            self.assertGreater(args.index('-update'), args.index('-i'))
         end = calls[1]
-        self.assertEqual(end[end.index('-sseof') + 1], '-1')
-        # -update is an image2 output option; before -i, ffmpeg 7 fails the whole library start.
-        self.assertGreater(end.index('-update'), end.index('-i'))
-        self.assertEqual(end[end.index('-update') + 1], '1')
+        self.assertEqual(end[end.index('-ss') + 1], '8.500')  # the last keyframe, not -sseof
+        self.assertNotIn('-sseof', end)
+
+    def test_video_details_reuses_existing_stills_without_ffmpeg(self):
+        file = self.app / 'media/clip.mp4'
+        file.write_bytes(b'video')
+        for label in ('poster', 'end_poster'):
+            file.with_name(file.name + '.' + label + '.jpg').write_bytes(b'jpg')
+        calls = []
+        with patch.object(content, 'run_bounded', side_effect=self.fake_bounded(calls)):
+            details = content.video_details(file, '/media/clip.mp4')
+        self.assertEqual(calls, [])
+        self.assertEqual(details['poster'], '/media/clip.mp4.poster.jpg')
+
+    def test_startup_copies_bundled_stills_and_runs_no_ffmpeg(self):
+        root = Path(self.temp.name) / 'fresh'
+        for name in ('promo-a.mp4', 'promo-b.mp4', 'demo-4k-hevc.mp4'):
+            (self.app / 'media' / name).write_bytes(b'video')
+            for label in ('poster', 'end_poster'):
+                (self.app / 'media' / (name + '.' + label + '.jpg')).write_bytes(b'jpg')
+        calls = []
+        with patch.object(content, 'run_bounded', side_effect=self.fake_bounded(calls)):
+            state = content.read(root, self.app)
+        self.assertEqual(calls, [])
+        self.assertIn('demo-4k-hevc', [a['id'] for a in state['assets']])
+        self.assertTrue((root / 'media/demo-4k-hevc.mp4.end_poster.jpg').is_file())
+
+    def test_unpreparable_bundled_clip_does_not_block_library(self):
+        root = Path(self.temp.name) / 'fresh'
+        (self.app / 'media/promo-a.mp4').write_bytes(b'not a video')
+        with patch.object(content, 'run_bounded', side_effect=OSError('boom')):
+            state = content.read(root, self.app)
+        self.assertNotIn('promo-a', [a['id'] for a in state['assets']])
+
+    def test_run_bounded_kills_the_whole_process_group_on_timeout(self):
+        import os, time, subprocess
+        marker = Path(self.temp.name) / 'pid'
+        start = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            content.run_bounded(['sh', '-c', 'sleep 30 & echo $! > %s; wait' % marker], 0.5)
+        self.assertLess(time.monotonic() - start, 10)
+        child = int(marker.read_text())
+        time.sleep(0.2)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child, 0)
 
     def test_schedule_inclusive_start_exclusive_end_and_timezone(self):
         item = self.state['entries'][0]
